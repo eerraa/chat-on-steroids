@@ -7708,8 +7708,11 @@
    */
   const OPENED_CONVERSATION = (() => {
     try {
-      const match = /^\/c\/([0-9a-f-]{8,64})/i.exec(location.pathname);
-      return match ? match[1] : null;
+      // Keep the opening-route proof on the exact same parser used everywhere else. In
+      // particular, Project workers reopen at `/g/<project>/c/<id>`; treating only `/c/<id>`
+      // as an app-opened conversation makes the revival look like a stale marker in an
+      // unrelated existing chat and returns before it can even defer/redeem the command.
+      return CLF_DOM.conversationId();
     } catch {
       return null;
     }

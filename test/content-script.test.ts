@@ -7652,6 +7652,51 @@ describe('the fresh chat the app opened', () => {
     ]);
   });
 
+  it('redeems a Project revival marker from the exact Project conversation route', async () => {
+    const chat = '31313131-4242-5353-6464-757575757575';
+    let redeems = 0;
+    let sends = 0;
+    live = await harness(
+      `https://chatgpt.com/g/g-p-project/c/${chat}?clf=cmd-project-revive#clf=cmd-project-revive`,
+      {
+        redeem: (message) => {
+          redeems++;
+          expect(message.conversationId).toBe(chat);
+          return {
+            ok: true,
+            command: {
+              id: 'cmd-project-revive',
+              type: 'worker',
+              text: 'Continue inside the same Project worker conversation.',
+              agent: 'worker-1',
+              conversationId: chat
+            }
+          };
+        },
+        ack: () => ({ ok: true })
+      },
+      (document) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          sends++;
+          document.querySelector('#prompt-textarea')!.textContent = '';
+        });
+      }
+    );
+
+    await settle(400);
+
+    expect(redeems).toBe(1);
+    expect(sends).toBe(1);
+    expect(live.sent.filter((message) => message.type === 'ack')).toContainEqual(
+      expect.objectContaining({
+        id: 'cmd-project-revive',
+        status: 'sent',
+        conversationId: chat,
+        agent: 'worker-1'
+      })
+    );
+  });
+
   it('acks a same-chat revival immediately after ChatGPT accepts the send, before any timer can be throttled', async () => {
     const chat = '22222222-3333-4444-5555-777777777777';
     let freezeTimers = false;

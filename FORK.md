@@ -38,6 +38,11 @@ worker also uses its recorded Project route. This allows ChatGPT to apply the Pr
 instructions and Project-scoped memory to worker chats rather than relying only on the explicit
 CoS `context` and worker task.
 
+Project revival uses the same exact conversation-route parser as ordinary recording and
+attribution. This matters for `/g/<project>/c/<conversation-id>`: treating only `/c/<id>` as an
+app-opened conversation leaves the revival command leased but unredeemed (`owner: null`) because
+the page incorrectly classifies its own Project worker chat as an unrelated existing chat.
+
 The fresh Project composer is addressed through `/g/<project>/project`. Opening the bare
 `/g/<project>` namespace is not equivalent in current ChatGPT: it can redirect to global New Chat,
 where a browser-restored draft can make a Project worker fail before its conversation exists.
