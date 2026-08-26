@@ -165,7 +165,7 @@ interface Reply {
 function request(
   method: string,
   path: string,
-  options: { body?: unknown; origin?: string | null; auth?: string | null; raw?: string } = {}
+  options: { body?: unknown; origin?: string | null; auth?: string | null; raw?: string; userAgent?: string } = {}
 ): Promise<Reply> {
   const url = new URL(path, base);
   const payload = options.raw ?? (options.body === undefined ? null : JSON.stringify(options.body));
@@ -182,6 +182,7 @@ function request(
   // `origin: null` means "send no Origin header", which is what Chrome does for an
   // extension fetch to a host it already holds permission for.
   if (options.origin !== null) headers['origin'] = options.origin ?? EXTENSION_ORIGIN;
+  if (options.userAgent) headers['user-agent'] = options.userAgent;
   const auth = options.auth === undefined ? token : options.auth;
   if (auth) headers['authorization'] = `Bearer ${auth}`;
 
@@ -292,6 +293,7 @@ beforeEach(async () => {
   resetRecorderForTests();
   writeDurableSoon('bridge-commands', null);
   writeDurableSoon('conversation-project-paths', null);
+  writeDurableSoon('conversation-browser-families', null);
   await flushDurable();
   await setSecret('bridgeToken', '');
   token = null;
@@ -698,12 +700,18 @@ describe('activity feed', () => {
     await pair();
     const conversationId = '18181818-4040-6262-8484-969696969696';
     const projectPath = '/g/g-p-6a86a24c609c819193e2bbb2fd52147d-webcodex';
+    const openedBrowsers: Array<string | null> = [];
+    setBrowserOpener(async (url, browserFamily) => {
+      opened.push(url);
+      openedBrowsers.push(browserFamily);
+    });
     const mapped = await request('POST', '/correlations', {
       body: {
         conversationId,
         projectPath,
         calls: [{ messageId: 'project-prime-call', tool: 'agents', requestId: 'wfr-project-worker-affinity' }]
-      }
+      },
+      userAgent: 'Mozilla/5.0 Chrome/152.0.0.0 Safari/537.36 Edg/152.0.0.0'
     });
     expect(mapped.status).toBe(200);
 
@@ -711,25 +719,53 @@ describe('activity feed', () => {
     await waitForOpened(1);
 
     expect(new URL(opened[0]!).pathname).toBe(projectPath);
+    expect(openedBrowsers).toEqual(['edge']);
+  });
+
+  it('opens a normal-chat worker in the same browser family as its prime', async () => {
+    await pair();
+    const conversationId = '20202020-4242-6464-8686-989898989898';
+    const openedBrowsers: Array<string | null> = [];
+    setBrowserOpener(async (url, browserFamily) => {
+      opened.push(url);
+      openedBrowsers.push(browserFamily);
+    });
+    const mapped = await request('POST', '/correlations', {
+      body: {
+        conversationId,
+        calls: [{ messageId: 'normal-edge-prime-call', tool: 'agents', requestId: 'wfr-normal-edge-affinity' }]
+      },
+      userAgent: 'Mozilla/5.0 Chrome/152.0.0.0 Safari/537.36 Edg/152.0.0.0'
+    });
+    expect(mapped.status).toBe(200);
+
+    spawn({ workers: [{ task: 'inherit only the browser, not a Project' }], caller: { conversationId } });
+    await waitForOpened(1);
+
+    expect(new URL(opened[0]!).pathname).toBe('/');
+    expect(openedBrowsers).toEqual(['edge']);
   });
 
   it('restores Project affinity before replaying a worker still owed after bridge restart', async () => {
     await pair();
     const conversationId = '19191919-4141-6363-8585-979797979797';
     const projectPath = '/g/g-p-6a86a24c609c819193e2bbb2fd52147d-webcodex';
+    const openedBrowsers: Array<string | null> = [];
     expect((await request('POST', '/correlations', {
       body: {
         conversationId,
         projectPath,
         calls: [{ messageId: 'project-prime-before-restart', requestId: 'wfr-project-route-restart' }]
-      }
+      },
+      userAgent: 'Mozilla/5.0 Chrome/152.0.0.0 Safari/537.36 Edg/152.0.0.0'
     })).status).toBe(200);
 
     await stopBridge();
     resetBridgeForTests();
     opened.length = 0;
-    setBrowserOpener(async (url) => {
+    setBrowserOpener(async (url, browserFamily) => {
       opened.push(url);
+      openedBrowsers.push(browserFamily);
     });
     spawn({ workers: [{ task: 'open after restart' }], caller: { conversationId } });
     expect(opened).toEqual([]);
@@ -739,6 +775,7 @@ describe('activity feed', () => {
     base = `http://127.0.0.1:${port}`;
     await waitForOpened(1);
     expect(new URL(opened[0]!).pathname).toBe(projectPath);
+    expect(openedBrowsers).toEqual(['edge']);
   });
   it('registers a request id the page could not yet name a tool for', async () => {
     await pair();
@@ -1937,12 +1974,18 @@ describe('delivering a bootstrap', () => {
     await pair();
     const projectPath = '/g/g-p-6a86a24c609c819193e2bbb2fd52147d-webcodex';
     const primeConversation = '21212121-4343-4545-8989-989898989898';
+    const openedBrowsers: Array<string | null> = [];
+    setBrowserOpener(async (url, browserFamily) => {
+      opened.push(url);
+      openedBrowsers.push(browserFamily);
+    });
     const primeMapped = await request('POST', '/correlations', {
       body: {
         conversationId: primeConversation,
         projectPath,
         calls: [{ messageId: 'project-prime-spawn', requestId: 'wfr-project-prime-spawn' }]
-      }
+      },
+      userAgent: 'Mozilla/5.0 Chrome/152.0.0.0 Safari/537.36 Edg/152.0.0.0'
     });
     expect(primeMapped.status).toBe(200);
     spawn({ workers: [{ task: 'write the Project audit' }], caller: { conversationId: primeConversation } });
@@ -1969,6 +2012,7 @@ describe('delivering a bootstrap', () => {
     await waitForOpened(2);
 
     expect(new URL(opened[1]!).pathname).toBe(`${projectPath}/c/${conversationId}`);
+    expect(openedBrowsers).toEqual(['edge', 'edge']);
   });
 
   it('keeps an unredeemed revival durable while the exact worker chat is still busy', async () => {

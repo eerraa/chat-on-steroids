@@ -13,6 +13,51 @@ describe('browser-backed ChatGPT commands', () => {
     expect(findPreferredBrowser('win32', env, 'C:\\Users\\example', (candidate) => candidate === wanted)).toBe(wanted);
   });
 
+  it('prefers Microsoft Edge on Windows when the calling ChatGPT conversation is in Edge', () => {
+    const env = {
+      LOCALAPPDATA: 'C:\\Users\\example\\AppData\\Local',
+      ProgramFiles: 'C:\\Program Files',
+      'ProgramFiles(x86)': 'C:\\Program Files (x86)'
+    };
+    const edge = path.win32.join(env['ProgramFiles(x86)'], 'Microsoft', 'Edge', 'Application', 'msedge.exe');
+    const chrome = path.win32.join(env.ProgramFiles, 'Google', 'Chrome', 'Application', 'chrome.exe');
+    const candidates = preferredBrowserCandidates('win32', env, 'C:\\Users\\example', 'edge');
+
+    expect(candidates[0]).toBe(edge);
+    expect(candidates).not.toContain(chrome);
+    expect(
+      findPreferredBrowser('win32', env, 'C:\\Users\\example', (candidate) => candidate === edge || candidate === chrome, 'edge')
+    ).toBe(edge);
+  });
+
+  it('passes only the worker URL to Edge and does not force a new tab or a new window', async () => {
+    const env = {
+      LOCALAPPDATA: 'C:\\Users\\example\\AppData\\Local',
+      ProgramFiles: 'C:\\Program Files',
+      'ProgramFiles(x86)': 'C:\\Program Files (x86)'
+    };
+    const edge = path.win32.join(env['ProgramFiles(x86)'], 'Microsoft', 'Edge', 'Application', 'msedge.exe');
+    const url = 'https://chatgpt.com/g/project/c/worker?clf=wake';
+    const calls: Array<{ command: string; args: readonly string[]; cwd: string }> = [];
+
+    const opened = await openInPreferredBrowser(url, {
+      platform: 'win32',
+      env,
+      home: 'C:\\Users\\example',
+      preferredFamily: 'edge',
+      usable: (candidate) => candidate === edge,
+      launch: async (command, args, cwd) => {
+        calls.push({ command, args, cwd });
+        return { pid: 321 };
+      }
+    });
+
+    expect(opened).toBe(edge);
+    expect(calls).toEqual([{ command: edge, args: [url], cwd: path.win32.dirname(edge) }]);
+    expect(calls[0]?.args).not.toContain('--new-window');
+    expect(calls[0]?.args).not.toContain('--new-tab');
+  });
+
   it('finds the standard Google Chrome app on macOS before Chromium fallbacks', () => {
     const candidates = preferredBrowserCandidates('darwin', { HOME: '/Users/example' }, '/Users/example');
     expect(candidates[0]).toBe('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');

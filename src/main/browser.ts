@@ -6,6 +6,8 @@ import { launchCommand } from './exec.js';
 type Exists = (candidate: string) => boolean;
 type Launch = typeof launchCommand;
 
+export type BrowserFamily = 'edge' | 'chrome';
+
 export interface PreferredBrowserOpenOptions {
   platform?: NodeJS.Platform;
   env?: NodeJS.ProcessEnv;
@@ -14,6 +16,8 @@ export interface PreferredBrowserOpenOptions {
   usable?: Exists;
   /** Test seam for launch failure/retry ordering. */
   launch?: Launch;
+  /** Browser family that owns the ChatGPT conversation which requested this orchestration. */
+  preferredFamily?: BrowserFamily | null;
 }
 
 function isExecutableBrowser(candidate: string, platform: NodeJS.Platform): boolean {
@@ -37,15 +41,25 @@ function isExecutableBrowser(candidate: string, platform: NodeJS.Platform): bool
 export function preferredBrowserCandidates(
   platform: NodeJS.Platform = process.platform,
   env: NodeJS.ProcessEnv = process.env,
-  home = env.HOME ?? env.USERPROFILE ?? os.homedir()
+  home = env.HOME ?? env.USERPROFILE ?? os.homedir(),
+  preferredFamily: BrowserFamily | null = null
 ): string[] {
   if (platform === 'win32') {
     const p = path.win32;
-    return [
+    const chrome = [
       env.LOCALAPPDATA && p.join(env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe'),
       env.ProgramFiles && p.join(env.ProgramFiles, 'Google', 'Chrome', 'Application', 'chrome.exe'),
       env['ProgramFiles(x86)'] && p.join(env['ProgramFiles(x86)'], 'Google', 'Chrome', 'Application', 'chrome.exe')
     ].filter((candidate): candidate is string => Boolean(candidate));
+    const edge = [
+      env['ProgramFiles(x86)'] && p.join(env['ProgramFiles(x86)'], 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+      env.ProgramFiles && p.join(env.ProgramFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+      env.LOCALAPPDATA && p.join(env.LOCALAPPDATA, 'Microsoft', 'Edge', 'Application', 'msedge.exe')
+    ].filter((candidate): candidate is string => Boolean(candidate));
+    // No affinity means preserve the historical Chrome-only preference before the system-default
+    // fallback. Once a conversation has proved its browser family, never silently cross into the
+    // other one: browser-local ChatGPT/MCP state is part of the worker's usable environment.
+    return preferredFamily === 'edge' ? edge : chrome;
   }
 
   if (platform === 'darwin') {
@@ -119,9 +133,10 @@ export function findPreferredBrowser(
   platform: NodeJS.Platform = process.platform,
   env: NodeJS.ProcessEnv = process.env,
   home?: string,
-  exists: Exists = (candidate) => isExecutableBrowser(candidate, platform)
+  exists: Exists = (candidate) => isExecutableBrowser(candidate, platform),
+  preferredFamily: BrowserFamily | null = null
 ): string | null {
-  for (const candidate of preferredBrowserCandidates(platform, env, home)) {
+  for (const candidate of preferredBrowserCandidates(platform, env, home, preferredFamily)) {
     if (exists(candidate)) return candidate;
   }
   return null;
@@ -145,7 +160,7 @@ export async function openInPreferredBrowser(
   const launch = options.launch ?? launchCommand;
   let lastError: unknown = null;
 
-  for (const browser of preferredBrowserCandidates(platform, env, options.home)) {
+  for (const browser of preferredBrowserCandidates(platform, env, options.home, options.preferredFamily ?? null)) {
     if (!usable(browser)) continue;
     try {
       await launch(browser, [url], path.dirname(browser));

@@ -51,6 +51,22 @@ Worker identity is unchanged: Project affinity chooses where a ChatGPT conversat
 the existing command lease, acknowledgement, and conversation binding remain the authority for
 which worker owns it.
 
+### Worker browser affinity on Windows
+
+Upstream's browser launcher prefers a discovered Google Chrome executable for every worker/resume
+URL. That can move a worker out of an Edge-hosted prime into a separate Chrome profile even while
+the Project route itself is correct. Browser-local ChatGPT state and custom MCP availability can
+then differ from the prime; in the live reproduction the worker opened in Chrome and could not see
+the `agents` tool that was available to the Edge prime.
+
+This fork records whether the request-correlation handshake came from Microsoft Edge or Google
+Chrome using the loopback request's browser User-Agent. New workers inherit that browser family
+from the prime, and the worker's successful bootstrap ACK durably attaches the same family to its
+conversation for later revivals. On Windows the launcher then targets the matching executable
+family instead of silently crossing from Edge to Chrome. The launcher still passes only the URL;
+whether an already-running browser presents it as a tab or has to create a new window remains the
+browser's own process/window behavior rather than an agent UI action.
+
 ## Validation
 
 The fork is validated with the repository's own gates:
@@ -62,8 +78,8 @@ npm run build
 ```
 
 Regression coverage includes normal/Project conversation parsing, Project request correlation,
-fresh worker Project affinity, worker revival affinity, and Project-affinity restoration across a
-bridge restart.
+fresh worker Project affinity, same-browser worker spawn/revival, and Project/browser-affinity
+restoration across a bridge restart.
 
 ## Remotes for contributors
 

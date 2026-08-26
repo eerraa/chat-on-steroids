@@ -250,16 +250,17 @@ void app.whenReady().then(async () => {
   // cases the old "wait for a ChatGPT tab to poll us" delivery could never handle. Wired
   // before any restored command is delivered, so a resume queued yesterday opens as soon
   // as the bridge starts rather than waiting for the user to visit ChatGPT.
-  setBrowserOpener(async (url) => {
+  setBrowserOpener(async (url, browserFamily) => {
     try {
-      const browser = await openInPreferredBrowser(url);
+      const browser = await openInPreferredBrowser(url, { preferredFamily: browserFamily });
       if (browser) return;
     } catch (error) {
       logWarn(`could not open ChatGPT in the preferred Chromium browser: ${(error as Error).message}`);
     }
     logWarn(
-      'Chrome/Chromium was not found for a browser-backed worker/resume command; falling back to the default browser. ' +
-        'If that browser does not have the Chat On Steroids extension loaded, open the generated ChatGPT URL in Chrome instead.'
+      `${browserFamily ? `${browserFamily} browser affinity could not be launched` : 'Chrome/Chromium was not found'} ` +
+        'for a browser-backed worker/resume command; falling back to the default browser. ' +
+        'If that browser does not have the Chat On Steroids extension loaded, open the generated ChatGPT URL in the browser that owns the prime chat.'
     );
     await shell.openExternal(url);
   });

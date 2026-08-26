@@ -24,6 +24,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
 import type { BridgeStatus } from '../shared/types.js';
 import type { SessionOrigin } from '../shared/session.js';
+import type { BrowserFamily } from './browser.js';
 import { getConfig, updateConfig } from './config.js';
 import { getSecret, secureStorageStatus, setSecret } from './secrets.js';
 import {
@@ -170,6 +171,10 @@ const COMMANDS_STATE = 'bridge-commands';
 const PROJECT_PATHS_STATE = 'conversation-project-paths';
 const PROJECT_PATHS_STATE_VERSION = 1;
 const MAX_PROJECT_PATHS = 10_000;
+/** Durable browser family for the ChatGPT conversation which proved each request. */
+const BROWSER_FAMILIES_STATE = 'conversation-browser-families';
+const BROWSER_FAMILIES_STATE_VERSION = 1;
+const MAX_BROWSER_FAMILIES = 10_000;
 /**
  * Durable explicit-disconnect marker stored in the bridge credential slot itself.
  *
@@ -255,7 +260,14 @@ function boundBrief(text: string): string {
  * worker's inbox holds at hand-out time. Building both there is what keeps that true.
  */
 type CommandSpec =
-  | { type: 'worker'; agent: string; task: string; runId: string; projectPath: string | null }
+  | {
+      type: 'worker';
+      agent: string;
+      task: string;
+      runId: string;
+      projectPath: string | null;
+      browserFamily: BrowserFamily | null;
+    }
   /**
    * Waking a sleeping worker in the chat it already has.
    *
@@ -788,6 +800,17 @@ function projectPath(value: unknown): string | null {
   return /^\/g\/[^/?#]{1,512}$/.test(trimmed) ? trimmed : null;
 }
 
+function browserFamily(value: unknown): BrowserFamily | null {
+  return value === 'edge' || value === 'chrome' ? value : null;
+}
+
+function browserFamilyFromUserAgent(value: unknown): BrowserFamily | null {
+  const ua = typeof value === 'string' ? value : Array.isArray(value) ? value.join(' ') : '';
+  if (/\bEdg\//i.test(ua)) return 'edge';
+  if (/\bChrome\//i.test(ua)) return 'chrome';
+  return null;
+}
+
 interface ProjectPathSnapshot {
   version: 1;
   entries: Array<{ conversationId: string; projectPath: string }>;
@@ -801,6 +824,13 @@ interface ProjectPathSnapshot {
  * and retry its spawn only after the app comes back.
  */
 let conversationProjectPaths = new Map<string, string>();
+
+interface BrowserFamilySnapshot {
+  version: 1;
+  entries: Array<{ conversationId: string; browserFamily: BrowserFamily }>;
+}
+
+let conversationBrowserFamilies = new Map<string, BrowserFamily>();
 
 function projectPathSnapshot(source = conversationProjectPaths): ProjectPathSnapshot {
   return {
@@ -844,6 +874,45 @@ async function restoreConversationProjectPaths(): Promise<void> {
     }
   }
   conversationProjectPaths = next;
+}
+
+function browserFamilySnapshot(source = conversationBrowserFamilies): BrowserFamilySnapshot {
+  return {
+    version: BROWSER_FAMILIES_STATE_VERSION,
+    entries: [...source].slice(-MAX_BROWSER_FAMILIES).map(([conversationId, family]) => ({
+      conversationId,
+      browserFamily: family
+    }))
+  };
+}
+
+async function noteConversationBrowserFamily(id: string, family: BrowserFamily): Promise<void> {
+  if (conversationBrowserFamilies.get(id) === family) return;
+  const next = new Map(conversationBrowserFamilies);
+  next.delete(id);
+  next.set(id, family);
+  while (next.size > MAX_BROWSER_FAMILIES) {
+    const oldest = next.keys().next().value as string | undefined;
+    if (!oldest) break;
+    next.delete(oldest);
+  }
+  await writeDurableNow(BROWSER_FAMILIES_STATE, browserFamilySnapshot(next));
+  conversationBrowserFamilies = next;
+}
+
+async function restoreConversationBrowserFamilies(): Promise<void> {
+  const saved = await readDurable<BrowserFamilySnapshot>(BROWSER_FAMILIES_STATE);
+  const next = new Map<string, BrowserFamily>();
+  if (saved?.version === BROWSER_FAMILIES_STATE_VERSION && Array.isArray(saved.entries)) {
+    for (const entry of saved.entries.slice(-MAX_BROWSER_FAMILIES)) {
+      const id = conversationId(entry?.conversationId);
+      const family = browserFamily(entry?.browserFamily);
+      if (!id || !family) continue;
+      next.delete(id);
+      next.set(id, family);
+    }
+  }
+  conversationBrowserFamilies = next;
 }
 
 /**
@@ -1037,6 +1106,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       reportedProjectPath = parsed;
     }
     if (hasProjectPath) await noteConversationProjectPath(id, reportedProjectPath);
+    const reportedBrowserFamily = browserFamilyFromUserAgent(req.headers['user-agent']);
+    if (reportedBrowserFamily) await noteConversationBrowserFamily(id, reportedBrowserFamily);
 
     // This is the live-turn ownership handshake, deliberately separate from transcript
     // delivery. A fresh ChatGPT conversation can expose metadata.request_id before its
@@ -2395,23 +2466,36 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (
       command.spec.type === 'worker' &&
       receipt.committed &&
-      conversation &&
-      command.spec.projectPath
+      conversation
     ) {
-      // A Project-scoped bootstrap already knows where ChatGPT was told to create the fresh
-      // chat. The ACK above is the first authoritative moment that route can be attached to a
-      // concrete conversation id. Persist it before retiring the command, otherwise an
-      // immediately-finished worker can sleep before any later page correlation observes the
-      // SPA's `/g/<project>/c/<id>` route and its first revival falls back to global `/c/<id>`.
-      try {
-        await noteConversationProjectPath(conversation, command.spec.projectPath);
-      } catch (err) {
-        logWarn(
-          `bridge: Project route for ${specKey(command.spec)} is not durable yet — ${
-            err instanceof Error ? err.message : String(err)
-          }`
-        );
-        return json(res, 503, { error: 'worker_project_path_not_durable', retryable: true }, origin);
+      // A fresh worker bootstrap can already know the Project namespace and browser family it
+      // inherited from its prime. The ACK above is the first authoritative moment those facts can
+      // be attached to the worker's concrete conversation id. Persist them before retiring the
+      // command: an immediately-finished worker may sleep before any later page correlation runs,
+      // and its first revival must not fall back to another route or browser merely because of it.
+      if (command.spec.projectPath) {
+        try {
+          await noteConversationProjectPath(conversation, command.spec.projectPath);
+        } catch (err) {
+          logWarn(
+            `bridge: Project route for ${specKey(command.spec)} is not durable yet — ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+          return json(res, 503, { error: 'worker_project_path_not_durable', retryable: true }, origin);
+        }
+      }
+      if (command.spec.browserFamily) {
+        try {
+          await noteConversationBrowserFamily(conversation, command.spec.browserFamily);
+        } catch (err) {
+          logWarn(
+            `bridge: browser affinity for ${specKey(command.spec)} is not durable yet — ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+          return json(res, 503, { error: 'worker_browser_affinity_not_durable', retryable: true }, origin);
+        }
       }
     }
 
@@ -2740,6 +2824,7 @@ async function startBridgeOnce(epoch: number): Promise<number | null> {
       // the restored command for the same worker rather than opening a second tab.
       try {
         await restoreConversationProjectPaths();
+        await restoreConversationBrowserFamilies();
         await restoreCommands();
       } catch (err) {
         // Recovery is part of opening the bridge, not best-effort work after it. In particular,
@@ -3368,7 +3453,15 @@ export function queueWorkerBootstrap(agent: string, task: string): BridgeCommand
   if (!runId) return null;
   const prime = primeConversation();
   const inheritedProjectPath = prime ? conversationProjectPaths.get(prime) ?? null : null;
-  const command = queue({ type: 'worker', agent, task, runId, projectPath: inheritedProjectPath });
+  const inheritedBrowserFamily = prime ? conversationBrowserFamilies.get(prime) ?? null : null;
+  const command = queue({
+    type: 'worker',
+    agent,
+    task,
+    runId,
+    projectPath: inheritedProjectPath,
+    browserFamily: inheritedBrowserFamily
+  });
   deliver();
   return describe(command, null);
 }
@@ -3420,9 +3513,9 @@ function queueResumeCommand(sessionId: string, token: string): Command {
  * a build with no window (or a test) simply falls back to the polling path instead of
  * having a browser-launching side effect nobody asked for.
  */
-let openInBrowser: ((url: string) => Promise<void>) | null = null;
+let openInBrowser: ((url: string, browserFamily: BrowserFamily | null) => Promise<void>) | null = null;
 
-export function setBrowserOpener(open: ((url: string) => Promise<void>) | null): void {
+export function setBrowserOpener(open: ((url: string, browserFamily: BrowserFamily | null) => Promise<void>) | null): void {
   openInBrowser = open;
 }
 
@@ -3494,6 +3587,11 @@ async function deliverOne(): Promise<void> {
     : targetConversation
       ? conversationProjectPaths.get(targetConversation) ?? null
       : null;
+  const targetBrowserFamily = command.spec.type === 'worker'
+    ? command.spec.browserFamily
+    : targetConversation
+      ? conversationBrowserFamilies.get(targetConversation) ?? null
+      : null;
   const url = commandUrl(command.id, targetConversation, targetProject);
   // The recorder can see a brand-new ChatGPT conversation before that page's content script has
   // redeemed this command. Arm the session-transfer gate before the browser gets any chance to
@@ -3507,7 +3605,7 @@ async function deliverOne(): Promise<void> {
       : `bridge: opening a fresh ChatGPT chat for ${specKey(command.spec)}`
   );
   try {
-    await openInBrowser(url);
+    await openInBrowser(url, targetBrowserFamily);
   } catch (err) {
     // One command is one browser-open attempt. A rejected opener can never produce an ACK,
     // so leaving the row unleased merely blocks everything behind it until some unrelated
@@ -3968,15 +4066,18 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
     const workerState = swarmState().agents.find((entry) => entry.id === worker.agent && entry.role === 'worker')?.state;
     if (workerState !== 'invited' && workerState !== 'active') return null;
     const restoredProjectPath = worker.projectPath == null ? null : projectPath(worker.projectPath);
+    const restoredBrowserFamily = worker.browserFamily == null ? null : browserFamily(worker.browserFamily);
     // Older durable rows have no affinity field and remain ordinary chats. A present but invalid
     // route is corrupted state, not permission to silently open the worker somewhere else.
     if (worker.projectPath != null && !restoredProjectPath) return null;
+    if (worker.browserFamily != null && !restoredBrowserFamily) return null;
     return {
       type: 'worker',
       agent: worker.agent,
       task: worker.task.slice(0, 512 * 1024),
       runId: worker.runId,
-      projectPath: restoredProjectPath
+      projectPath: restoredProjectPath,
+      browserFamily: restoredBrowserFamily
     };
   }
   if (
@@ -4238,6 +4339,7 @@ export function resetBridgeForTests(): void {
   commandLeaseWrites.clear();
   commandRedeems.clear();
   conversationProjectPaths = new Map();
+  conversationBrowserFamilies = new Map();
   bridgeRecovering = false;
   bridgeShutdownRequested = false;
   resetContinuationsForTests();
