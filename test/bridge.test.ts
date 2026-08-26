@@ -1936,31 +1936,36 @@ describe('delivering a bootstrap', () => {
   it('reopens a Project worker inside the same Project when it is woken later', async () => {
     await pair();
     const projectPath = '/g/g-p-6a86a24c609c819193e2bbb2fd52147d-webcodex';
-    await request('POST', '/correlations', {
+    const primeConversation = '21212121-4343-4545-8989-989898989898';
+    const primeMapped = await request('POST', '/correlations', {
       body: {
-        conversationId: PRIME_CHAT,
+        conversationId: primeConversation,
         projectPath,
         calls: [{ messageId: 'project-prime-spawn', requestId: 'wfr-project-prime-spawn' }]
       }
     });
-    spawn({ workers: [{ task: 'write the Project audit' }], caller: { conversationId: PRIME_CHAT } });
+    expect(primeMapped.status).toBe(200);
+    spawn({ workers: [{ task: 'write the Project audit' }], caller: { conversationId: primeConversation } });
     const bootstrap = await redeem();
+    expect(new URL(opened[0]!).pathname).toBe(projectPath);
     const conversationId = 'dadadada-7654-3210-fedc-ba9876543210';
     await request('POST', '/commands/ack', {
       body: { id: bootstrap.id, status: 'sent', conversationId, agent: 'worker-1' }
     });
-    // The worker's own authenticated call establishes that this concrete worker chat also lives
-    // in the Project. Revival must preserve that route rather than reopening `/c/<id>` globally.
-    await request('POST', '/correlations', {
-      body: {
-        conversationId,
-        projectPath,
-        calls: [{ messageId: 'project-worker-finish', requestId: 'wfr-project-worker-finish' }]
-      }
+    // The bootstrap ACK is the first authoritative moment the app knows which concrete
+    // conversation its Project-scoped fresh-chat command became. That alone must persist the
+    // worker's Project affinity; requiring a later worker tool call leaves a worker that finishes
+    // immediately (or whose first request races the SPA route update) with no route to revive in.
+    expect(await readDurable('conversation-project-paths')).toMatchObject({
+      entries: expect.arrayContaining([{ conversationId, projectPath }])
     });
     finishAgent({ conversationId }, 'first Project task done');
 
-    wake([{ to: 'worker-1', text: 'continue in the same Project' }]);
+    const stagedWake = stageMessages({ conversationId: primeConversation }, [
+      { to: 'worker-1', text: 'continue in the same Project' }
+    ]);
+    stagedWake.commit();
+    expect(requestWorkerRevivals(stagedWake.waking)).toBe(1);
     await waitForOpened(2);
 
     expect(new URL(opened[1]!).pathname).toBe(`${projectPath}/c/${conversationId}`);

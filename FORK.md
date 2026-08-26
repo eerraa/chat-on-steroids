@@ -41,8 +41,11 @@ CoS `context` and worker task.
 Project affinity is not inferred from titles, DOM text, the active tab, or timing. The extension
 derives `/g/<project>` from Chrome's `MessageSender.url` on the same acknowledged request
 correlation handshake that proves conversation ownership. The app validates and durably stores
-that mapping before acknowledging it, so a spawn retried after an app restart does not silently
-fall back to global New Chat.
+that prime mapping before acknowledging it, so a spawn retried after an app restart does not
+silently fall back to global New Chat. When a Project-scoped worker bootstrap is acknowledged, the
+same route is also durably attached to the concrete worker conversation before the bootstrap
+command is retired; a worker can therefore finish immediately and still be reopened inside the
+same Project later, even if no subsequent worker tool call ever observes the settled SPA route.
 
 Worker identity is unchanged: Project affinity chooses where a ChatGPT conversation is created;
 the existing command lease, acknowledgement, and conversation binding remain the authority for

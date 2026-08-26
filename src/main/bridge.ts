@@ -2392,6 +2392,29 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       }
     }
 
+    if (
+      command.spec.type === 'worker' &&
+      receipt.committed &&
+      conversation &&
+      command.spec.projectPath
+    ) {
+      // A Project-scoped bootstrap already knows where ChatGPT was told to create the fresh
+      // chat. The ACK above is the first authoritative moment that route can be attached to a
+      // concrete conversation id. Persist it before retiring the command, otherwise an
+      // immediately-finished worker can sleep before any later page correlation observes the
+      // SPA's `/g/<project>/c/<id>` route and its first revival falls back to global `/c/<id>`.
+      try {
+        await noteConversationProjectPath(conversation, command.spec.projectPath);
+      } catch (err) {
+        logWarn(
+          `bridge: Project route for ${specKey(command.spec)} is not durable yet — ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+        return json(res, 503, { error: 'worker_project_path_not_durable', retryable: true }, origin);
+      }
+    }
+
     if (!(await finalizeCommand(command, receipt))) {
       // The semantic operation may already be committed. 5xx is intentional: old browser
       // code only settles successful HTTP responses, so it must retry until the app can prove
