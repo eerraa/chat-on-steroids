@@ -38,6 +38,10 @@ worker also uses its recorded Project route. This allows ChatGPT to apply the Pr
 instructions and Project-scoped memory to worker chats rather than relying only on the explicit
 CoS `context` and worker task.
 
+The fresh Project composer is addressed through `/g/<project>/project`. Opening the bare
+`/g/<project>` namespace is not equivalent in current ChatGPT: it can redirect to global New Chat,
+where a browser-restored draft can make a Project worker fail before its conversation exists.
+
 Project affinity is not inferred from titles, DOM text, the active tab, or timing. The extension
 derives `/g/<project>` from Chrome's `MessageSender.url` on the same acknowledged request
 correlation handshake that proves conversation ownership. The app validates and durably stores
@@ -67,6 +71,14 @@ family instead of silently crossing from Edge to Chrome. The launcher still pass
 whether an already-running browser presents it as a tab or has to create a new window remains the
 browser's own process/window behavior rather than an agent UI action.
 
+### Current ChatGPT composer compatibility
+
+Current ChatGPT builds expose the submit control as `#composer-submit-button`; its accessible label
+is localized (for example, `프롬프트 보내기`). The companion recognizes that stable control id in
+addition to the older `data-testid="send-button"` / English-label shapes, so a successfully inserted
+worker bootstrap is submitted by ChatGPT's real button rather than falling through to a synthetic
+Enter key that React may ignore.
+
 ## Validation
 
 The fork is validated with the repository's own gates:
@@ -78,8 +90,8 @@ npm run build
 ```
 
 Regression coverage includes normal/Project conversation parsing, Project request correlation,
-fresh worker Project affinity, same-browser worker spawn/revival, and Project/browser-affinity
-restoration across a bridge restart.
+fresh worker Project affinity, the current Project New Chat and submit-button shapes, same-browser
+worker spawn/revival, and Project/browser-affinity restoration across a bridge restart.
 
 ## Remotes for contributors
 

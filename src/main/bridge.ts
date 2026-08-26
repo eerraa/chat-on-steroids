@@ -3535,7 +3535,7 @@ export function commandUrl(id: string, conversationId?: string | null, projectPa
       ? `https://chatgpt.com${project}/c/${encodeURIComponent(conversationId)}`
       : `https://chatgpt.com/c/${encodeURIComponent(conversationId)}`
     : project
-      ? `https://chatgpt.com${project}`
+      ? `https://chatgpt.com${project}/project`
       : 'https://chatgpt.com/';
   return `${base}?${marker}#${marker}`;
 }

@@ -718,7 +718,7 @@ describe('activity feed', () => {
     spawn({ workers: [{ task: 'inherit the Project context' }], caller: { conversationId } });
     await waitForOpened(1);
 
-    expect(new URL(opened[0]!).pathname).toBe(projectPath);
+    expect(new URL(opened[0]!).pathname).toBe(`${projectPath}/project`);
     expect(openedBrowsers).toEqual(['edge']);
   });
 
@@ -774,7 +774,7 @@ describe('activity feed', () => {
     expect(port).not.toBeNull();
     base = `http://127.0.0.1:${port}`;
     await waitForOpened(1);
-    expect(new URL(opened[0]!).pathname).toBe(projectPath);
+    expect(new URL(opened[0]!).pathname).toBe(`${projectPath}/project`);
     expect(openedBrowsers).toEqual(['edge']);
   });
   it('registers a request id the page could not yet name a tool for', async () => {
@@ -1990,7 +1990,7 @@ describe('delivering a bootstrap', () => {
     expect(primeMapped.status).toBe(200);
     spawn({ workers: [{ task: 'write the Project audit' }], caller: { conversationId: primeConversation } });
     const bootstrap = await redeem();
-    expect(new URL(opened[0]!).pathname).toBe(projectPath);
+    expect(new URL(opened[0]!).pathname).toBe(`${projectPath}/project`);
     const conversationId = 'dadadada-7654-3210-fedc-ba9876543210';
     await request('POST', '/commands/ack', {
       body: { id: bootstrap.id, status: 'sent', conversationId, agent: 'worker-1' }

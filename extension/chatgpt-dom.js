@@ -49,7 +49,8 @@ var CLF_DOM = (() => {
   const STOP =
     'button[data-testid="stop-button"], button[data-testid="composer-stop-button"], ' +
     'button[aria-label="Stop streaming"], button[aria-label="Stop generating"]';
-  const SEND = 'button[data-testid="send-button"], form button[aria-label^="Send" i]';
+  const SEND =
+    'button#composer-submit-button, button[data-testid="send-button"], form button[aria-label^="Send" i]';
   /** The composer's own trailing controls, where the send and dictation buttons live. */
   const TRAILING =
     '[data-testid="composer-trailing-actions"], [data-testid="composer-footer-actions"], ' +

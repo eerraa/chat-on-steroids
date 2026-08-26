@@ -7614,6 +7614,44 @@ describe('the fresh chat the app opened', () => {
     ]);
   });
 
+  it('submits through ChatGPT\'s current localized composer submit button', async () => {
+    live = await harness(
+      'https://chatgpt.com/g/g-p-project/project?clf=cmd-current-submit',
+      {
+        redeem: () => ({
+          ok: true,
+          command: {
+            id: 'cmd-current-submit',
+            type: 'worker',
+            text: 'Verify the current Project composer submit control.',
+            agent: 'worker-1'
+          }
+        }),
+        ack: () => ({ ok: true })
+      },
+      (document, dom) => {
+        const send = document.querySelector('[data-testid="send-button"]') as HTMLButtonElement;
+        send.removeAttribute('data-testid');
+        send.id = 'composer-submit-button';
+        send.setAttribute('aria-label', '프롬프트 보내기');
+        send.addEventListener('click', () => {
+          dom.reconfigure({ url: 'https://chatgpt.com/g/g-p-project/c/33333333-4444-5555-6666-777777777777' });
+        });
+      }
+    );
+
+    await settle(400);
+
+    expect(live.sent.filter((message) => message.type === 'ack')).toEqual([
+      expect.objectContaining({
+        id: 'cmd-current-submit',
+        status: 'sent',
+        conversationId: '33333333-4444-5555-6666-777777777777',
+        agent: 'worker-1'
+      })
+    ]);
+  });
+
   it('acks a same-chat revival immediately after ChatGPT accepts the send, before any timer can be throttled', async () => {
     const chat = '22222222-3333-4444-5555-777777777777';
     let freezeTimers = false;
