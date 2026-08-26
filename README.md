@@ -21,6 +21,8 @@
 
 Chat On Steroids is a Windows, macOS and Linux desktop app that exposes only the folders and capabilities you configure through a local MCP server. You keep using ChatGPT in the browser. The app is the permission boundary and local executor; the companion Chrome extension adds browser-side chat attribution, session capture, richer tool rows, Compact & Resume, and experimental multi-agent coordination. Screen/mouse/keyboard/clipboard automation remains Windows-only and is omitted from the macOS/Linux product surface.
 
+> **Fork note:** this fork adds ChatGPT Project conversation attribution and keeps newly spawned/revived worker chats in the prime's ChatGPT Project. See [`FORK.md`](FORK.md) for the exact upstream base, trust boundary, tests, and maintenance notes.
+
 ## Download
 
 | Platform | x64 | ARM64 |

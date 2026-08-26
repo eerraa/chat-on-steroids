@@ -202,6 +202,7 @@ function toolBlock(label = 'Called tool'): FakeNode {
 }
 
 interface DomApi {
+  conversationId(): string | null;
   turns(): Array<{ node: FakeNode; nodes: FakeNode[]; id: string | null; role: string | null }>;
   messages(): Array<{ id: string; role: string; text: string; turnId: string | null }>;
   progressLine(turn: unknown): string | null;
@@ -212,12 +213,15 @@ interface DomApi {
   errors(): string[];
 }
 
-function loadDom(sections: FakeNode[]): DomApi {
+function loadDom(
+  sections: FakeNode[],
+  pathname = '/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+): DomApi {
   const document = {
     querySelectorAll: (selector: string) => (selector === TURN_SELECTOR ? sections : []),
     querySelector: () => null
   };
-  const context = vm.createContext({ document, location: { pathname: '/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' } });
+  const context = vm.createContext({ document, location: { pathname } });
   vm.runInContext(domSource, context, { filename: 'chatgpt-dom.js' });
   return (context as unknown as { CLF_DOM: DomApi }).CLF_DOM;
 }
@@ -227,6 +231,13 @@ function turn(role: 'user' | 'assistant', id: string): FakeNode {
 }
 
 describe('ChatGPT DOM adapter', () => {
+  it('recognises conversation identity in both normal and Project chat routes', () => {
+    const chat = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+
+    expect(loadDom([], `/c/${chat}`).conversationId()).toBe(chat);
+    expect(loadDom([], `/g/g-p-6a86a24c609c819193e2bbb2fd52147d-webcodex/c/${chat}`).conversationId()).toBe(chat);
+    expect(loadDom([], `/share/public/c/${chat}`).conversationId()).toBeNull();
+  });
   it('groups split assistant sections that share one data-turn-id before counting tool blocks', () => {
     const user = turn('user', 'user-1');
     const a1 = turn('assistant', 'request-1').with(TOOL_SELECTOR, [toolBlock(), toolBlock()]);
@@ -406,7 +417,7 @@ class FakeStorageArea {
 }
 
 interface WorkerHarness {
-  send(message: Record<string, unknown>, tabId?: number, documentId?: string): Promise<any>;
+  send(message: Record<string, unknown>, tabId?: number, documentId?: string, senderUrl?: string): Promise<any>;
   /** Fires Chrome's real tab-close lifecycle event. */
   closeTab(tabId: number): Promise<void>;
   /** Fires only Chrome's navigation-start signal, without inventing a replacement document. */
@@ -618,10 +629,14 @@ function loadWorker(options: {
         });
       }
     },
-    send(message, tabId = 1, documentId = documentFor(tabId)) {
+    send(message, tabId = 1, documentId = documentFor(tabId), senderUrl) {
       return new Promise((resolve, reject) => {
         try {
-          const keep = listener!(message, { tab: { id: tabId }, documentId, frameId: 0 }, resolve);
+          const keep = listener!(
+            message,
+            { tab: { id: tabId }, documentId, frameId: 0, ...(senderUrl ? { url: senderUrl } : {}) },
+            resolve
+          );
           if (keep !== true) reject(new Error('listener did not keep the response channel open'));
         } catch (err) {
           reject(err);
@@ -690,6 +705,25 @@ describe('worker settings authority', () => {
  */
 describe('extension command delivery', () => {
   const paired = { port: 8765, token: 'paired-token' };
+
+  it('reports the conversation id from a Project chat URL when the page has not bound yet', async () => {
+    const local = new FakeStorageArea(paired);
+    const session = new FakeStorageArea();
+    const worker = loadWorker({ local, session });
+    const chat = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const projectUrl = `https://chatgpt.com/g/g-p-6a86a24c609c819193e2bbb2fd52147d-webcodex/c/${chat}`;
+
+    worker.tabsQuery.mockImplementation(async (query: any) =>
+      query && query.active === true ? [{ id: 73, url: projectUrl }] : []
+    );
+    worker.tabsSendMessage.mockResolvedValue({ ok: true, conversationId: null });
+
+    expect(await worker.send({ type: 'tabStatus' })).toMatchObject({
+      isChat: true,
+      conversationId: chat,
+      url: projectUrl
+    });
+  });
 
   it('redeems only the command id the page was opened for', async () => {
     const local = new FakeStorageArea(paired);
@@ -2433,6 +2467,40 @@ describe('extension connection', () => {
       status: 200,
       data: { conversationId, confirmed: [requestId], complete: true }
     });
+  });
+
+  it('forwards Project affinity from Chrome-owned sender identity with the correlation handshake', async () => {
+    const conversationId = 'abababab-cdcd-efef-1212-343434343434';
+    const requestId = 'wfr_project_affinity';
+    const projectPath = '/g/g-p-6a86a24c609c819193e2bbb2fd52147d-webcodex';
+    let body: any = null;
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/correlations') {
+        body = JSON.parse(String(init.body));
+        return response(200, { ok: true, conversationId, confirmed: [requestId], complete: true });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(),
+      fetch
+    });
+
+    await worker.send(
+      {
+        type: 'correlate',
+        conversationId,
+        calls: [{ messageId: 'project-request', tool: 'agents', order: 0, answered: false, requestId }]
+      },
+      73,
+      'document-73-0',
+      `https://chatgpt.com${projectPath}/c/${conversationId}`
+    );
+
+    expect(body).toMatchObject({ conversationId, projectPath });
   });
 
   it('does not re-ask where the app is before every single request', async () => {

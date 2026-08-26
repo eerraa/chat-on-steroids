@@ -291,6 +291,7 @@ beforeEach(async () => {
   });
   resetRecorderForTests();
   writeDurableSoon('bridge-commands', null);
+  writeDurableSoon('conversation-project-paths', null);
   await flushDurable();
   await setSecret('bridgeToken', '');
   token = null;
@@ -691,6 +692,53 @@ describe('activity feed', () => {
       attribution: 'request_id',
       attributionMethod: 'request_id'
     });
+  });
+
+  it('opens new workers inside the same ChatGPT Project as the prime', async () => {
+    await pair();
+    const conversationId = '18181818-4040-6262-8484-969696969696';
+    const projectPath = '/g/g-p-6a86a24c609c819193e2bbb2fd52147d-webcodex';
+    const mapped = await request('POST', '/correlations', {
+      body: {
+        conversationId,
+        projectPath,
+        calls: [{ messageId: 'project-prime-call', tool: 'agents', requestId: 'wfr-project-worker-affinity' }]
+      }
+    });
+    expect(mapped.status).toBe(200);
+
+    spawn({ workers: [{ task: 'inherit the Project context' }], caller: { conversationId } });
+    await waitForOpened(1);
+
+    expect(new URL(opened[0]!).pathname).toBe(projectPath);
+  });
+
+  it('restores Project affinity before replaying a worker still owed after bridge restart', async () => {
+    await pair();
+    const conversationId = '19191919-4141-6363-8585-979797979797';
+    const projectPath = '/g/g-p-6a86a24c609c819193e2bbb2fd52147d-webcodex';
+    expect((await request('POST', '/correlations', {
+      body: {
+        conversationId,
+        projectPath,
+        calls: [{ messageId: 'project-prime-before-restart', requestId: 'wfr-project-route-restart' }]
+      }
+    })).status).toBe(200);
+
+    await stopBridge();
+    resetBridgeForTests();
+    opened.length = 0;
+    setBrowserOpener(async (url) => {
+      opened.push(url);
+    });
+    spawn({ workers: [{ task: 'open after restart' }], caller: { conversationId } });
+    expect(opened).toEqual([]);
+
+    const port = await startBridge();
+    expect(port).not.toBeNull();
+    base = `http://127.0.0.1:${port}`;
+    await waitForOpened(1);
+    expect(new URL(opened[0]!).pathname).toBe(projectPath);
   });
   it('registers a request id the page could not yet name a tool for', async () => {
     await pair();
@@ -1883,6 +1931,39 @@ describe('delivering a bootstrap', () => {
     // Typed is not read. The words are in its chat; its own next authenticated call is what
     // takes them out of its inbox.
     expect(worker.pending).toBe(1);
+  });
+
+  it('reopens a Project worker inside the same Project when it is woken later', async () => {
+    await pair();
+    const projectPath = '/g/g-p-6a86a24c609c819193e2bbb2fd52147d-webcodex';
+    await request('POST', '/correlations', {
+      body: {
+        conversationId: PRIME_CHAT,
+        projectPath,
+        calls: [{ messageId: 'project-prime-spawn', requestId: 'wfr-project-prime-spawn' }]
+      }
+    });
+    spawn({ workers: [{ task: 'write the Project audit' }], caller: { conversationId: PRIME_CHAT } });
+    const bootstrap = await redeem();
+    const conversationId = 'dadadada-7654-3210-fedc-ba9876543210';
+    await request('POST', '/commands/ack', {
+      body: { id: bootstrap.id, status: 'sent', conversationId, agent: 'worker-1' }
+    });
+    // The worker's own authenticated call establishes that this concrete worker chat also lives
+    // in the Project. Revival must preserve that route rather than reopening `/c/<id>` globally.
+    await request('POST', '/correlations', {
+      body: {
+        conversationId,
+        projectPath,
+        calls: [{ messageId: 'project-worker-finish', requestId: 'wfr-project-worker-finish' }]
+      }
+    });
+    finishAgent({ conversationId }, 'first Project task done');
+
+    wake([{ to: 'worker-1', text: 'continue in the same Project' }]);
+    await waitForOpened(2);
+
+    expect(new URL(opened[1]!).pathname).toBe(`${projectPath}/c/${conversationId}`);
   });
 
   it('keeps an unredeemed revival durable while the exact worker chat is still busy', async () => {

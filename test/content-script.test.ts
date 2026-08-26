@@ -5186,6 +5186,45 @@ describe('evidence from the page context', () => {
 
   const reply = replyFiber;
 
+  it('keeps Project-chat route identity through the request-id ownership handshake', async () => {
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const requestId = 'wfr_project_route';
+    live = await harness(
+      `https://chatgpt.com/g/g-p-6a86a24c609c819193e2bbb2fd52147d-webcodex/c/${conversationId}`
+    );
+    live.reply.set('correlate', () => ({
+      ok: true,
+      data: { conversationId, confirmed: [requestId], complete: true }
+    }));
+
+    expect(await live.runtimeMessage({ type: 'clf-page-status' })).toMatchObject({
+      ok: true,
+      conversationId
+    });
+
+    await replyFiber([], [{
+      turnId: 'project-turn',
+      conversationId,
+      calls: [{
+        messageId: 'project-call',
+        tool: 'exec_command',
+        order: 0,
+        answered: true,
+        requestId,
+        createTime: 1_700_000_001
+      }],
+      messages: []
+    }]);
+    await settle();
+
+    expect(live.sent.filter((message) => message.type === 'correlate')).toContainEqual(
+      expect.objectContaining({
+        conversationId,
+        calls: [expect.objectContaining({ requestId, messageId: 'project-call' })]
+      })
+    );
+  });
+
   it('reads a well-formed descriptor', async () => {
     live = await harness();
     expect(live.hook.readDescriptor(GOOD)).toMatchObject({

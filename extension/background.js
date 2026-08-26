@@ -1600,8 +1600,21 @@ function conversationFromUrl(value) {
   try {
     const url = new URL(String(value || ''));
     if (url.protocol !== 'https:' || (url.hostname !== 'chatgpt.com' && url.hostname !== 'chat.openai.com')) return null;
-    const match = /^\/c\/([0-9a-f-]{8,64})/i.exec(url.pathname);
+    const match = /^\/(?:c|g\/[^/]+\/c)\/([0-9a-f-]{8,64})(?:\/|$)/i.exec(url.pathname);
     return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Project namespace for one concrete conversation URL, or null for an ordinary chat. */
+function projectPathFromUrl(value, expectedConversationId) {
+  try {
+    const url = new URL(String(value || ''));
+    if (url.protocol !== 'https:' || (url.hostname !== 'chatgpt.com' && url.hostname !== 'chat.openai.com')) return null;
+    const match = /^\/g\/([^/]+)\/c\/([0-9a-f-]{8,64})(?:\/|$)/i.exec(url.pathname);
+    if (!match || match[2].toLowerCase() !== String(expectedConversationId || '').toLowerCase()) return null;
+    return `/g/${match[1]}`;
   } catch {
     return null;
   }
@@ -1863,7 +1876,7 @@ const HANDLERS = {
    * later Fiber scan, so a sleeping worker/app can delay attribution but cannot silently turn a
    * known request into a permanent Unattributed call.
    */
-  async correlate(message, _sender, source) {
+  async correlate(message, sender, source) {
     await load();
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
     const conversationId = cleanConversationId(message.conversationId);
@@ -1872,9 +1885,12 @@ const HANDLERS = {
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
     const calls = Array.isArray(message.calls) ? message.calls : [];
     if (calls.length === 0) return { ok: false, error: 'bad_request_evidence' };
+    // Project affinity comes from Chrome's exact sending document and rides the same
+    // acknowledged identity handshake as request ownership.
+    const projectPath = projectPathFromUrl(sender && sender.url, conversationId);
     const result = await call('/correlations', {
       method: 'POST',
-      body: JSON.stringify({ conversationId, calls })
+      body: JSON.stringify({ conversationId, calls, projectPath })
     });
     return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
   },

@@ -76,6 +76,7 @@ import {
   onSwarmEnd,
   pendingWorkerRevivals,
   pendingWorkerSpawns,
+  primeConversation,
   primeConversationGone,
   requestWorkerRevivals,
   rollbackWorkerRevivalClaim,
@@ -165,6 +166,10 @@ const COMMAND_TTL_MS = 30 * 60_000;
 const MAX_COMMANDS = 20;
 const MAX_COMMAND_RECEIPTS = 64;
 const COMMANDS_STATE = 'bridge-commands';
+/** Durable ChatGPT Project namespace for conversations that have one. */
+const PROJECT_PATHS_STATE = 'conversation-project-paths';
+const PROJECT_PATHS_STATE_VERSION = 1;
+const MAX_PROJECT_PATHS = 10_000;
 /**
  * Durable explicit-disconnect marker stored in the bridge credential slot itself.
  *
@@ -250,7 +255,7 @@ function boundBrief(text: string): string {
  * worker's inbox holds at hand-out time. Building both there is what keeps that true.
  */
 type CommandSpec =
-  | { type: 'worker'; agent: string; task: string; runId: string }
+  | { type: 'worker'; agent: string; task: string; runId: string; projectPath: string | null }
   /**
    * Waking a sleeping worker in the chat it already has.
    *
@@ -776,6 +781,71 @@ function conversationId(value: unknown): string | null {
   return /^[0-9a-f-]{8,64}$/i.test(value) ? value : null;
 }
 
+/** A concrete ChatGPT Project namespace, without a conversation suffix. */
+function projectPath(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return /^\/g\/[^/?#]{1,512}$/.test(trimmed) ? trimmed : null;
+}
+
+interface ProjectPathSnapshot {
+  version: 1;
+  entries: Array<{ conversationId: string; projectPath: string }>;
+}
+
+/**
+ * Conversation -> ChatGPT Project namespace, proved by the extension's Chrome-owned sender URL.
+ *
+ * Only Project chats are stored; absence means the ordinary ChatGPT namespace. This fact must
+ * survive an app restart independently of worker commands because the prime can correlate first
+ * and retry its spawn only after the app comes back.
+ */
+let conversationProjectPaths = new Map<string, string>();
+
+function projectPathSnapshot(source = conversationProjectPaths): ProjectPathSnapshot {
+  return {
+    version: PROJECT_PATHS_STATE_VERSION,
+    entries: [...source].slice(-MAX_PROJECT_PATHS).map(([conversationId, projectPath]) => ({
+      conversationId,
+      projectPath
+    }))
+  };
+}
+
+async function noteConversationProjectPath(id: string, value: string | null): Promise<void> {
+  const current = conversationProjectPaths.get(id) ?? null;
+  if (current === value) return;
+
+  const next = new Map(conversationProjectPaths);
+  next.delete(id);
+  if (value) next.set(id, value);
+  while (next.size > MAX_PROJECT_PATHS) {
+    const oldest = next.keys().next().value as string | undefined;
+    if (!oldest) break;
+    next.delete(oldest);
+  }
+
+  // Publish only after the route fact is durable. A spawn can follow this ACK immediately;
+  // crashing between those two operations must not replay that worker into global New Chat.
+  await writeDurableNow(PROJECT_PATHS_STATE, projectPathSnapshot(next));
+  conversationProjectPaths = next;
+}
+
+async function restoreConversationProjectPaths(): Promise<void> {
+  const saved = await readDurable<ProjectPathSnapshot>(PROJECT_PATHS_STATE);
+  const next = new Map<string, string>();
+  if (saved?.version === PROJECT_PATHS_STATE_VERSION && Array.isArray(saved.entries)) {
+    for (const entry of saved.entries.slice(-MAX_PROJECT_PATHS)) {
+      const id = conversationId(entry?.conversationId);
+      const path = projectPath(entry?.projectPath);
+      if (!id || !path) continue;
+      next.delete(id);
+      next.set(id, path);
+    }
+  }
+  conversationProjectPaths = next;
+}
+
 /**
  * May the goal loop write the next message in this chat?
  *
@@ -959,6 +1029,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
     const calls = parseCallEvidence(body['calls'], true).filter((call) => call.requestId !== null);
     if (calls.length === 0) return json(res, 400, { error: 'bad_request_evidence' }, origin);
+    const hasProjectPath = Object.prototype.hasOwnProperty.call(body, 'projectPath');
+    let reportedProjectPath: string | null = null;
+    if (hasProjectPath && body['projectPath'] !== null) {
+      const parsed = projectPath(body['projectPath']);
+      if (!parsed) return json(res, 400, { error: 'bad_project_path' }, origin);
+      reportedProjectPath = parsed;
+    }
+    if (hasProjectPath) await noteConversationProjectPath(id, reportedProjectPath);
 
     // This is the live-turn ownership handshake, deliberately separate from transcript
     // delivery. A fresh ChatGPT conversation can expose metadata.request_id before its
@@ -2638,6 +2716,7 @@ async function startBridgeOnce(epoch: number): Promise<number | null> {
       // has nobody to ask until this moment — and queue() folds a replayed worker into
       // the restored command for the same worker rather than opening a second tab.
       try {
+        await restoreConversationProjectPaths();
         await restoreCommands();
       } catch (err) {
         // Recovery is part of opening the bridge, not best-effort work after it. In particular,
@@ -3254,9 +3333,9 @@ export async function cancelResumeNow(sessionId: string): Promise<boolean> {
 /**
  * Queues the bootstrap for a worker chat.
  *
- * Called by the broker through onSpawnRequest. Nothing about identity is passed in or
- * stored: the chat this opens is bound to the slot by the extension's report, and the
- * recovery key exists only if the user asks the app for one after that has failed.
+ * Worker identity is still established only after the extension reports the new conversation.
+ * The inherited Project route chooses only the ChatGPT namespace where that fresh conversation
+ * is created, so ChatGPT applies the prime's Project instructions and Project-scoped memory.
  */
 export function queueWorkerBootstrap(agent: string, task: string): BridgeCommand | null {
   const runId = currentRunId();
@@ -3264,7 +3343,9 @@ export function queueWorkerBootstrap(agent: string, task: string): BridgeCommand
   // meaning for one outside a run, and manufacturing an unscoped command here is exactly how
   // stale durable work later becomes somebody else's `worker-1`.
   if (!runId) return null;
-  const command = queue({ type: 'worker', agent, task, runId });
+  const prime = primeConversation();
+  const inheritedProjectPath = prime ? conversationProjectPaths.get(prime) ?? null : null;
+  const command = queue({ type: 'worker', agent, task, runId, projectPath: inheritedProjectPath });
   deliver();
   return describe(command, null);
 }
@@ -3323,16 +3404,23 @@ export function setBrowserOpener(open: ((url: string) => Promise<void>) | null):
 }
 
 /** Where the app sends the browser. The marker is an id, not a credential. */
-export function commandUrl(id: string, conversationId?: string | null): string {
+export function commandUrl(id: string, conversationId?: string | null, projectPathValue?: string | null): string {
   // Both a query and a fragment: ChatGPT is a single-page app that rewrites its own URL
   // during boot, and which of the two survives has changed between builds. The content
   // script accepts either, and redeeming still requires the extension's bearer token —
   // so a copied link, a history entry or a synced tab is worth nothing on its own.
   const marker = `clf=${encodeURIComponent(id)}`;
-  // A continuation opens the worker's own conversation rather than a new one. The page
+  // A revival opens the worker's own conversation rather than a new one. The page
   // still has to redeem the marker, and the command it gets back names this same
   // conversation, so the two have to agree before anything is typed.
-  const base = conversationId ? `https://chatgpt.com/c/${encodeURIComponent(conversationId)}` : 'https://chatgpt.com/';
+  const project = projectPath(projectPathValue);
+  const base = conversationId
+    ? project
+      ? `https://chatgpt.com${project}/c/${encodeURIComponent(conversationId)}`
+      : `https://chatgpt.com/c/${encodeURIComponent(conversationId)}`
+    : project
+      ? `https://chatgpt.com${project}`
+      : 'https://chatgpt.com/';
   return `${base}?${marker}#${marker}`;
 }
 
@@ -3377,7 +3465,13 @@ async function deliverOne(): Promise<void> {
   changed();
   // A revival is the one command that must not open a fresh composer: it names the chat the
   // worker already has, so the page lands on it and the marker it redeems names it back.
-  const url = commandUrl(command.id, command.spec.type === 'revive' ? command.spec.conversationId : null);
+  const targetConversation = command.spec.type === 'revive' ? command.spec.conversationId : null;
+  const targetProject = command.spec.type === 'worker'
+    ? command.spec.projectPath
+    : targetConversation
+      ? conversationProjectPaths.get(targetConversation) ?? null
+      : null;
+  const url = commandUrl(command.id, targetConversation, targetProject);
   // The recorder can see a brand-new ChatGPT conversation before that page's content script has
   // redeemed this command. Arm the session-transfer gate before the browser gets any chance to
   // create B, otherwise that early observation invents a shadow session for B and the real A→B
@@ -3850,7 +3944,17 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
     // already be durable while the leased browser command is still waiting for its retry.
     const workerState = swarmState().agents.find((entry) => entry.id === worker.agent && entry.role === 'worker')?.state;
     if (workerState !== 'invited' && workerState !== 'active') return null;
-    return { type: 'worker', agent: worker.agent, task: worker.task.slice(0, 512 * 1024), runId: worker.runId };
+    const restoredProjectPath = worker.projectPath == null ? null : projectPath(worker.projectPath);
+    // Older durable rows have no affinity field and remain ordinary chats. A present but invalid
+    // route is corrupted state, not permission to silently open the worker somewhere else.
+    if (worker.projectPath != null && !restoredProjectPath) return null;
+    return {
+      type: 'worker',
+      agent: worker.agent,
+      task: worker.task.slice(0, 512 * 1024),
+      runId: worker.runId,
+      projectPath: restoredProjectPath
+    };
   }
   if (
     version >= 4 &&
@@ -4110,6 +4214,7 @@ export function resetBridgeForTests(): void {
   commandRetirementsAwaitingBroker.clear();
   commandLeaseWrites.clear();
   commandRedeems.clear();
+  conversationProjectPaths = new Map();
   bridgeRecovering = false;
   bridgeShutdownRequested = false;
   resetContinuationsForTests();

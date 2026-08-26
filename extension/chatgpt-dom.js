@@ -257,10 +257,20 @@ var CLF_DOM = (() => {
     return /(?:message delivery timed out|unknown error occurred|there was an error generating (?:a|the) response|error in message stream|network error|something went wrong)/i.test(line);
   }
 
+  /**
+   * ChatGPT conversation route families observed in the browser.
+   *
+   * Ordinary chats are `/c/<id>`. Project chats keep the same conversation identity under
+   * `/g/<project>/c/<id>`. Accept only those two exact route families: this id becomes MCP
+   * ownership evidence, so finding a `c/<uuid>` pair somewhere in an unrelated route is not
+   * enough to call that route a conversation.
+   */
+  const CONVERSATION_PATH = /^\/(?:c|g\/[^/]+\/c)\/([0-9a-f-]{8,64})(?:\/|$)/i;
+
   /** The conversation this tab is on, or null for a chat that has not been sent yet. */
   function conversationId() {
     return safe(() => {
-      const match = /^\/c\/([0-9a-f-]{8,64})/i.exec(location.pathname);
+      const match = CONVERSATION_PATH.exec(location.pathname);
       return match ? match[1] : null;
     }, null);
   }
