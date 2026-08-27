@@ -100,6 +100,8 @@ describe('cross-platform packaging targets', () => {
     expect(pkg.devDependencies.electron).toBe('43.4.1');
     expect(lock.packages?.['']?.devDependencies?.electron).toBe('43.4.1');
     expect(lock.packages?.['node_modules/electron']?.version).toBe('43.4.1');
+    expect(pkg.scripts?.['prepare:electron']).toBe('node node_modules/electron/install.js');
+    expect(pkg.scripts?.['verify:ci']).toMatch(/prepare:electron.*vitest run/);
     expect(smoke).toContain('const expectedElectronVersion = sourcePackage.devDependencies?.electron;');
     expect(smoke).toContain('electron: process.versions.electron');
     expect(smoke).toContain('runtime.electron !== expectedElectronVersion');

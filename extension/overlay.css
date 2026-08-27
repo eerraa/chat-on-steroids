@@ -691,6 +691,13 @@
   display: none !important;
 }
 
+/* A previously rendered sibling may stay mounted solely to preserve its exact chronological
+   insertion point while recorder/Fiber revisions catch up. It owns no presentation in this
+   state; native ChatGPT is visible until content.js proves the replacement complete again. */
+.clf-stream[data-clf-stream-inactive='1'] {
+  display: none !important;
+}
+
 /* The reading column, not the thread.
  *
  * `replaceTurn` appends this to the turn's <article>, which is as wide as the whole thread

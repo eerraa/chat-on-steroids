@@ -89,16 +89,20 @@
    * which nothing downstream reads as anything but the turn having taken that much longer.
    */
   const TURN_SETTLE_MS = 4000;
-  // While ChatGPT is generating, keep the app-owned transcript close enough to feel like a
-  // stream rather than a two-second slideshow. This does not create duplicate rows: /activity
-  // is cursor-based, streamBySeq is keyed by canonical seq, and assistant messages additionally
-  // supersede their previous revision through streamMessageSeq. Session reloads are therefore
-  // allowed to make us poll sooner without being treated as new transcript content.
+  // While ChatGPT is generating, keep the durable activity projection fresh for chronology and
+  // for a prompt settled handoff. It is deliberately *not* live presentation authority: native
+  // ChatGPT owns the active answer. This recovery poll does not create duplicate rows because
+  // /activity is cursor-based, streamBySeq is keyed by canonical seq, and assistant messages
+  // supersede their previous revision through streamMessageSeq.
   const LIVE_ACTIVITY_MS = 750;
   const ACTIVITY_MS = 2000;
   const IDLE_ACTIVITY_MS = 10_000;
   const HIDDEN_ACTIVITY_MS = 30_000;
-  /** Keep a previously proven full replacement through brief Fiber/feed disagreement. */
+  /**
+   * Placement-only grace for a sibling root whose React-owned host was synchronously moved.
+   * This never authorises a connected turn to hide native content: incomplete/current turns
+   * release ownership immediately and stage their old root as display:none instead.
+   */
   const REPLACEMENT_GRACE_MS = 8000;
   /**
    * User-driven scrolling and ChatGPT's historical virtualization happen in the same burst.
@@ -564,6 +568,8 @@
   /** Exact request id -> one durable local turn, null when the retained stream conflicts. */
   const streamRequestTurnOwners = new Map();
   let pulling = false;
+  /** An app-ACK wake arrived after the snapshot the current activity pull started from. */
+  let activityDirty = false;
 
   /**
    * `'resume' | 'worker' | null` — whether this chat was opened by the app, and how.
@@ -1165,6 +1171,8 @@
     fiberTurns = new Map();
     fiberScanToken = null;
     fiberPresent = false;
+    nativePresentationRevision = new WeakMap();
+    fiberPresentationRevision = new WeakMap();
   }
 
   function currentAssistantTurn(turns = CLF_DOM.turns()) {
@@ -2025,12 +2033,144 @@
    * waiting up to a second for the polling tick. Mutations caused by our own stream are
    * ignored to avoid feeding the renderer back into itself.
    */
+  function releaseTurnPresentationToNative(turn) {
+    if (!turn) return new Set();
+    const nodes = turn.nodes || (turn.node ? [turn.node] : []);
+    const staged = new Set();
+    for (const node of nodes) {
+      if (!node) continue;
+      const key = node.dataset ? node.dataset.clfStreamKey : '';
+      if (key) {
+        staged.add(key);
+        const root = streamRootsByKey.get(key);
+        if (root) root.setAttribute('data-clf-stream-inactive', '1');
+      }
+      const legacy = node.querySelector ? node.querySelector('.clf-stream') : null;
+      if (legacy) legacy.setAttribute('data-clf-stream-inactive', '1');
+    }
+    CLF_DOM.replaceTurn(turn, null, false);
+    CLF_DOM.hideProgress(turn, false);
+    for (const block of CLF_DOM.toolBlocks(turn)) block.removeAttribute('data-clf-native-hidden');
+    return staged;
+  }
+
+  /**
+   * Restores native visibility at the page's generation edge without running reconstruction.
+   *
+   * ChatGPT mounts Stop before CoS necessarily opens/binds its local generation. If a settled
+   * sibling overwrite is still active in that microtask, waiting for the 1s observer tick (or
+   * any /activity pull) leaves the first live native bytes hidden underneath it. A known genNode
+   * lets us release only that exact turn; before the bind exists, ambiguity fails closed by
+   * releasing every currently replaced assistant turn. Historical replacements re-qualify on
+   * the next ordinary render once exact live ownership is known.
+   */
+  function releaseLivePresentationToNative() {
+    const exact = generating ? generationTurn() : null;
+    if (exact) {
+      releaseTurnPresentationToNative(exact);
+      return;
+    }
+    const turns = typeof CLF_DOM.presentationTurns === 'function' ? CLF_DOM.presentationTurns() : CLF_DOM.turns();
+    for (const turn of turns) {
+      if (!turn || turn.role !== 'assistant') continue;
+      const nodes = turn.nodes || (turn.node ? [turn.node] : []);
+      if (!nodes.some((node) => node && node.getAttribute && node.getAttribute('data-clf-turn-replaced') === '1')) continue;
+      releaseTurnPresentationToNative(turn);
+    }
+  }
+
+  /**
+   * Native transcript sections whose visible contents may have changed in this mutation turn.
+   *
+   * Whole-section React moves are presentation churn, not a content revision, so a node that
+   * was removed and is connected again in the same observer delivery is excluded. A genuinely
+   * new/remounted section is marked dirty; so are character/child changes whose target lives
+   * inside an existing section. CoS-owned `.clf-stream` mutations never participate.
+   */
+  function transcriptMutationSections(records) {
+    const touched = new Set();
+    const moved = new Set();
+    for (const record of records || []) {
+      for (const removed of record.removedNodes || []) {
+        if (!removed || removed.nodeType !== 1 || !removed.isConnected) continue;
+        if (removed.matches && removed.matches(TURN_SECTION)) moved.add(removed);
+        if (removed.querySelectorAll) {
+          for (const section of removed.querySelectorAll(TURN_SECTION)) if (section.isConnected) moved.add(section);
+        }
+      }
+    }
+    for (const record of records || []) {
+      const target = record.target && record.target.nodeType === 1
+        ? record.target
+        : record.target && record.target.parentElement;
+      if (target && !(target.closest && target.closest('.clf-stream'))) {
+        const section = target.closest && target.closest(TURN_SECTION);
+        if (section) touched.add(section);
+      }
+      for (const added of record.addedNodes || []) {
+        if (!added || added.nodeType !== 1 || (added.closest && added.closest('.clf-stream'))) continue;
+        const candidates = [];
+        if (added.matches && added.matches(TURN_SECTION)) candidates.push(added);
+        if (added.querySelectorAll) candidates.push(...added.querySelectorAll(TURN_SECTION));
+        for (const section of candidates) if (!moved.has(section)) touched.add(section);
+      }
+    }
+    return touched;
+  }
+
+  let transcriptObserver = null;
+  let transcriptMutationHandler = null;
+
+  function flushPendingTranscriptMutations() {
+    if (!transcriptObserver || !transcriptMutationHandler || typeof transcriptObserver.takeRecords !== 'function') return;
+    const pending = transcriptObserver.takeRecords();
+    if (pending.length > 0) transcriptMutationHandler(pending);
+  }
+
   function watchTranscript() {
     if (typeof MutationObserver !== 'function' || !document.body) return;
     let timer = null;
     let urgentQueued = false;
-    const observer = new MutationObserver((records) => {
+    let pageWasGenerating = Boolean(CLF_DOM.generating());
+    const handleRecords = (records) => {
       if (!alive || !sameChat()) return;
+      // Presentation authority changes on the page edge itself, not when our slower lifecycle
+      // observer catches up. Track the transition so a genuinely stale Stop left behind after a
+      // Fiber-proven finish does not repeatedly revoke settled historical reconstruction.
+      const pageGeneratingNow = Boolean(CLF_DOM.generating());
+      const pageStartedGenerating = pageGeneratingNow && !pageWasGenerating;
+      pageWasGenerating = pageGeneratingNow;
+      if (pageStartedGenerating || (generating && pageGeneratingNow)) {
+        releaseLivePresentationToNative();
+      }
+      const touchedSections = transcriptMutationSections(records);
+      if (touchedSections.size > 0) {
+        nativePresentationClock += 1;
+        for (const section of touchedSections) {
+          if (section && section.isConnected) nativePresentationRevision.set(section, nativePresentationClock);
+        }
+      }
+      // A sibling synthetic root is outside React's section, so removing/virtualizing the
+      // native section does not remove its replacement automatically. Retire that root in the
+      // same mutation microtask once the exact section that owned its key is genuinely detached.
+      // A React move/reorder is safe because the node is connected again by observer time.
+      for (const record of records) {
+        for (const removed of record.removedNodes || []) {
+          if (!removed || removed.nodeType !== 1) continue;
+          const candidates = [];
+          if (removed.matches && removed.matches('[data-clf-stream-key]')) candidates.push(removed);
+          if (removed.querySelectorAll) candidates.push(...removed.querySelectorAll('[data-clf-stream-key]'));
+          for (const section of candidates) {
+            if (section.isConnected || !section.dataset) continue;
+            const key = section.dataset.clfStreamKey;
+            if (!key) continue;
+            const root = streamRootsByKey.get(key);
+            if (root) root.remove();
+            streamRootsByKey.delete(key);
+            delete section.dataset.clfStreamKey;
+          }
+        }
+      }
       // Stop is mounted under the composer, outside TURN_SECTION. In a background tab the final
       // prose can arrive while Stop still exists (scheduling the throttled debounce below), and
       // Stop removal can then be the *only* terminal mutation. Check the local->page generation
@@ -2052,16 +2192,7 @@
         }
         return;
       }
-      const relevant = records.some((record) => {
-        const target = record.target && record.target.nodeType === 1 ? record.target : record.target.parentElement;
-        if (!target || (target.closest && target.closest('.clf-stream'))) return false;
-        if (target.closest && target.closest(TURN_SECTION)) return true;
-        for (const node of record.addedNodes || []) {
-          if (!node || node.nodeType !== 1) continue;
-          if (node.matches(TURN_SECTION) || node.querySelector(TURN_SECTION)) return true;
-        }
-        return false;
-      });
+      const relevant = touchedSections.size > 0;
       if (!relevant) return;
       // Background tabs are allowed to throttle setTimeout aggressively. The ordinary 250 ms
       // debounce below is therefore not a reliable way to notice the one mutation that matters
@@ -2083,10 +2214,15 @@
         if (!alive) return;
         observe();
       }, TRANSCRIPT_OBSERVE_MS);
-    });
+    };
+    const observer = new MutationObserver(handleRecords);
+    transcriptObserver = observer;
+    transcriptMutationHandler = handleRecords;
     observer.observe(document.body, { childList: true, subtree: true, characterData: true });
     rememberCleanup(() => {
       observer.disconnect();
+      if (transcriptObserver === observer) transcriptObserver = null;
+      if (transcriptMutationHandler === handleRecords) transcriptMutationHandler = null;
       if (timer !== null) clearTimeout(timer);
       timer = null;
     });
@@ -2232,6 +2368,10 @@
   let fiberTurns = new Map();
   /** Exact scan frame those two descriptor maps came from. */
   let fiberScanToken = null;
+  /** Monotonic native transcript mutation clock; Fiber freshness is credited per concrete node. */
+  let nativePresentationClock = 0;
+  let nativePresentationRevision = new WeakMap();
+  let fiberPresentationRevision = new WeakMap();
   let fiberAsking = null;
   /** Off until the helper answers once, so a browser without it behaves exactly as before. */
   let fiberPresent = false;
@@ -2681,11 +2821,38 @@
     // A. A fresh, never-bound composer still scans normally because `conversationId` is null.
     const routeConversation = CLF_DOM.conversationId();
     if (conversationId && routeConversation !== conversationId) return;
+    // MutationObserver delivery is a microtask and can lag a synchronous caller that just
+    // changed the transcript. Drain that already-existing batch through the exact same handler
+    // before snapshotting native revision numbers; otherwise a scan that genuinely started
+    // *after* a DOM change would be falsely recorded as older than it.
+    flushPendingTranscriptMutations();
     // The page-context round-trip can settle after ChatGPT navigates this tab. Capture the
     // logical chat before crossing that async boundary so an answer read from chat A can
     // never be emitted under chat B's conversation id.
     const askedEpoch = epoch;
     const askedConversation = conversationId;
+    // Pin the local lifecycle owner across the same boundary. A final G1 reconciliation can
+    // overlap the start of G2 in the same conversation; consulting the mutable `generating` /
+    // `turnId` after await would reinterpret G1's Fiber reply as G2 evidence. Explicit settled
+    // ownership wins, otherwise capture the one live generation this request was made for.
+    const askedSettled = settled && typeof settled === 'object' ? settled : null;
+    const askedLiveTurnId = !askedSettled && generating ? turnId : null;
+    const askedPageNode = askedSettled?.pageTurn || (askedLiveTurnId ? generationTurn() : null);
+    const askedPageTurnId = askedSettled?.pageTurnId || askedPageNode?.id || null;
+    const askedLocalTurnId = askedSettled?.localTurnId || askedLiveTurnId || null;
+    // Snapshot the native revision each concrete section had when this Fiber read began. A
+    // mutation that lands while the async MAIN-world round-trip is in flight therefore advances
+    // nativePresentationRevision beyond the revision this answer is allowed to certify.
+    const askedPresentationRevisions = new Map();
+    const askedPresentationTurns = typeof CLF_DOM.presentationTurns === 'function'
+      ? CLF_DOM.presentationTurns()
+      : CLF_DOM.turns();
+    for (const pageTurn of askedPresentationTurns) {
+      for (const node of pageTurn.nodes || (pageTurn.node ? [pageTurn.node] : [])) {
+        if (!node || !node.isConnected) continue;
+        askedPresentationRevisions.set(node, nativePresentationRevision.get(node) || 0);
+      }
+    }
     let answer = await askFiber();
     if (answer === null) {
       // One missed reply is not proof the helper is gone: a busy main thread can outlive this
@@ -2717,6 +2884,10 @@
       }
     }
     if (epoch !== askedEpoch || conversationId !== askedConversation) return;
+    // Generation identity is as load-bearing as route identity. Do not let a response requested
+    // for one live generation cross a local turn boundary even when the conversation/epoch did
+    // not change. A subsequent observe() immediately asks again for the new generation.
+    if (askedLiveTurnId && (!generating || turnId !== askedLiveTurnId)) return;
     // The route can move before observe() has had a chance to update our local conversation
     // state. Epoch/conversation checks alone therefore are not enough: in that window they
     // still both say A while the Fiber tree already belongs to B.
@@ -2732,8 +2903,8 @@
     // actually owns, and its `data-clf-fiber-turn` stamp names the descriptor exactly even
     // when the virtualized renderer published no page turn id at all. The page-id match
     // stays as the fallback for a scan whose stamps have not been applied yet.
-    const ownedPageNode = generating ? generationTurn() : settled?.pageTurn || null;
-    const ownedPageTurnId = generating ? ownedPageNode?.id || null : settled?.pageTurnId || null;
+    const ownedPageNode = askedPageNode;
+    const ownedPageTurnId = askedPageTurnId;
     let ownedPageTurn = stampedFiberTurn(ownedPageNode, answer.turns, answer.scanToken);
     if (!ownedPageTurn && ownedPageTurnId) {
       for (let index = answer.turns.length - 1; index >= 0; index--) {
@@ -2798,15 +2969,22 @@
       else fiberTurns.set(turn.index, turn);
     }
     for (const [index, value] of fiberTurns) if (value === null) fiberTurns.delete(index);
+    // Credit only the native revisions that existed when this scan *started*. Sections that
+    // changed during the round-trip stay newer than this Fiber frame and cannot be hidden until
+    // a later scan begins after their mutation. No timer or poll cadence enters this fence.
+    for (const [node, revision] of askedPresentationRevisions) {
+      if (node && node.isConnected) fiberPresentationRevision.set(node, revision);
+    }
     // Fiber names turns with ChatGPT's page `data-turn-id`, which the live page reuses. The
     // recorder, deliberately, names the live generation with our durable local `g-...` id.
     // Never write the recycled page id into recorder evidence as though it were that durable
     // identity. Only the *newest* Fiber turn matching the assistant section this local
     // generation is currently bound to may inherit `turnId`; historical/reused matches still
     // prove the conversation made the call, but carry no durable turn id.
-    const activeLocalTurnId = generating ? turnId : settled?.localTurnId || null;
+    const activeLocalTurnId = askedLocalTurnId;
     const activeTurnIndex =
       ownedPageTurn && activeLocalTurnId ? answer.turns.indexOf(ownedPageTurn) : -1;
+    const liveGenerationScan = Boolean(askedLiveTurnId && generating && turnId === askedLiveTurnId);
     if (askedConversation) {
       // Ownership evidence is no longer gated on `activeTurnIndex`.
       //
@@ -2863,7 +3041,7 @@
         return true;
       });
       if (fresh.length > 0) {
-        if (generating && index === activeTurnIndex) lastChangeAt = Date.now();
+        if (liveGenerationScan && index === activeTurnIndex) lastChangeAt = Date.now();
         emit({
           kind: 'tool_evidence',
           ...(index === activeTurnIndex ? { turnId: activeLocalTurnId } : {}),
@@ -2956,7 +3134,7 @@
           const signature = `${activity.label}\u0000${owner}`;
           if (pageToolsReported.get(activity.messageId) === signature) continue;
           pageToolsReported.set(activity.messageId, signature);
-          if (generating && index === activeTurnIndex) lastChangeAt = Date.now();
+          if (liveGenerationScan && index === activeTurnIndex) lastChangeAt = Date.now();
           emit({
             kind: 'page_tool',
             text: activity.label,
@@ -3021,10 +3199,13 @@
           `\u0000${message.createTime || ''}`;
         if (messagesReported.get(message.messageId) === signature) continue;
         messagesReported.set(message.messageId, signature);
-        if (state === 'streaming') lastChangeAt = Date.now();
+        const scanLiveAssistant =
+          liveGenerationScan &&
+          (index === activeTurnIndex || (activeTurnIndex < 0 && index === answer.turns.length - 1));
+        if (state === 'streaming' && scanLiveAssistant) lastChangeAt = Date.now();
         const liveAssistant =
           Boolean(localOwner) ||
-          (generating && (index === activeTurnIndex || (activeTurnIndex < 0 && index === answer.turns.length - 1)));
+          scanLiveAssistant;
         emit({
           kind: 'assistant_message',
           messageId: message.messageId,
@@ -3047,7 +3228,7 @@
     // generation even if a stale Stop control remains mounted. Final message/activity
     // revisions above have already been emitted, so do not trigger a second Fiber final pass.
     if (
-      generating &&
+      liveGenerationScan &&
       activeTurnIndex >= 0 &&
       activeLocalTurnId === turnId &&
       Boolean(answer.turns[activeTurnIndex]?.endMessageId)
@@ -4061,7 +4242,11 @@
     const root = streamRootsByKey.get(priorKey) || null;
     if (!root || !root.isConnected) return false;
     const current = strongStreamIdentityKeys(rendered);
-    if (current.size === 0) return true;
+    // Request ids deliberately do not count as turn-local identity. A request-only render with
+    // no local/group owner must therefore never inherit a section's old sibling key: ChatGPT can
+    // reuse the request across retries/turns, and doing so rewrites the previous response in its
+    // old chronological slot. Strong message/thought overlap or an explicit group key is required.
+    if (current.size === 0) return false;
     let previous = [];
     try {
       const parsed = JSON.parse(root.dataset.clfStrongKeys || '[]');
@@ -4203,7 +4388,14 @@
       const owners = lookup.owners.get(requestKey) || [];
       if (owners.length > 1) return null;
       if (owners.length === 1) found = owners[0];
-      else for (const entry of exact) matched.set(entry.seq, entry);
+      else {
+        // A request id is not a turn-local website object and may survive retries/user turns.
+        // Exact orphan assistant/thought rows are reconstructable below because their ids belong
+        // to one page object; an orphan request alone is not. Without a local/group owner, keep
+        // the current ChatGPT turn native rather than minting a synthetic response from metadata
+        // that is explicitly allowed to be reused.
+        return null;
+      }
     }
 
     // Exact orphan-only data is sufficient to reconstruct the website-authored rows even if
@@ -4237,59 +4429,104 @@
    * renderer: an incomplete local transcript is useful in the app, but it is never sufficient
    * evidence to hide the source transcript the user is currently reading.
    */
+  const presentationText = (value) => String(value || '').replace(/\u00a0/g, ' ').trim();
+
   /**
-   * Whether Fiber has already exposed a connector call that the local replacement cannot show.
+   * The text a person would read from one canonical Fiber assistant revision.
    *
-   * This is different from an ordinary transient incomplete scan: an exact new request appears
-   * in ChatGPT's page model before the MCP handler can return and before recordToolCall() can
-   * append it to /activity. Keeping the previous overwrite mounted in that window hides the only
-   * current representation of the call. A newly observed unidentifiable call is equally unsafe.
+   * Prefer the exact HTML Fiber attached to the visible ChatGPT block: rawText is canonical
+   * Markdown and can legitimately differ from rendered text (`**bold**` versus `bold`). When
+   * Fiber could not prove an HTML decoration, raw text is accepted only if it already equals
+   * the page-visible text. Failing to prove parity means native stays authoritative.
    */
-  function hasUnrepresentedFiberCall(turn, entries) {
-    const descriptor = fiberTurnFor(turn);
-    if (!descriptor) return false;
-    for (const call of descriptor.calls || []) {
-      const key = websiteKey('request', call && call.requestId);
-      if (!key) return true;
-      if (!(entries || []).some((entry) => entryHasWebsiteKey(entry, key))) return true;
+  function fiberVisibleAssistantText(message) {
+    if (!message) return '';
+    const html = typeof message.renderedHtml === 'string' ? message.renderedHtml : '';
+    if (html) {
+      try {
+        const holder = document.createElement('div');
+        holder.innerHTML = html;
+        return presentationText(holder.textContent || '');
+      } catch {
+        return '';
+      }
     }
-    return false;
+    return presentationText(message.rawText || '');
   }
 
   function completeReplacementForTurn(turn, entries) {
     const descriptor = fiberTurnFor(turn);
     if (!descriptor) return false;
-    const expected = [];
+    // A Fiber descriptor is a snapshot, not automatically the current page revision. Native
+    // activity and prose can mutate under the same stable website ids after that scan. Every
+    // concrete section must still be exactly at the native revision that the accepted Fiber
+    // frame observed; otherwise native stays visible until a post-mutation scan catches up.
+    for (const node of turn.nodes || (turn.node ? [turn.node] : [])) {
+      if (!node || !node.isConnected) continue;
+      if (!fiberPresentationRevision.has(node)) return false;
+      if ((nativePresentationRevision.get(node) || 0) > fiberPresentationRevision.get(node)) return false;
+    }
     let assistantModelMessages = 0;
     for (const message of descriptor.messages || []) {
       if (!message || message.role === 'user') continue;
       assistantModelMessages += 1;
       const key = websiteKey('message', message.messageId);
-      if (key) expected.push(key);
+      // Stable identity is necessary but not sufficient. ChatGPT revises one assistant object
+      // in place while it streams, so an older /activity snapshot can carry the same message id
+      // with fewer bytes than the Fiber object visible right now. Hiding native on id equality
+      // alone is the stale-overwrite race: the page has revision N+1 while the synthetic stream
+      // still paints N. Require the exact canonical body Fiber just exposed before presentation
+      // may change owners.
+      if (!key) return false;
+      const recorded = (entries || []).filter(
+        (entry) => entry && entry.kind === 'assistant_message' && entry.messageId === message.messageId
+      );
+      if (recorded.length !== 1) return false;
+      const current = recorded[0];
+      if (String(current.text || '') !== String(message.rawText || '')) return false;
+      if (String(current.renderedHtml || '') !== String(message.renderedHtml || '')) return false;
+      const terminal = descriptor.endMessageId &&
+        (message.rawMessageId === descriptor.endMessageId || message.messageId === descriptor.endMessageId);
+      if (terminal && current.final !== true && current.state !== 'final') return false;
     }
     for (const activity of descriptor.activities || []) {
       const key = websiteKey('activity', activity && activity.messageId);
-      if (key) expected.push(key);
+      if (!key) return false;
+      const recorded = (entries || []).filter(
+        (entry) => entry && entry.kind === 'page_tool' && entry.messageId === activity.messageId
+      );
+      // Native activity captions revise under the same website id too. A stale label is a stale
+      // reconstruction just as surely as stale prose, so prove the current label byte-for-byte.
+      if (recorded.length !== 1 || String(recorded[0].label || '') !== String(activity.label || '')) return false;
     }
     for (const call of descriptor.calls || []) {
       // A call without ChatGPT request identity cannot be proven complete. Leave that turn
       // native instead of falling back to time/position/cardinality matching.
       const key = websiteKey('request', call && call.requestId);
       if (!key) return false;
-      expected.push(key);
-    }
-
-    // If ChatGPT visibly has authored assistant prose but Fiber did not identify even one
-    // model message, hiding the native prose would be destructive by definition.
-    const nativeAssistant = CLF_DOM.messagesIn(turn).some(
-      (message) => message && message.role === 'assistant' && message.text
-    );
-    if (nativeAssistant && assistantModelMessages === 0) return false;
-    if (expected.length === 0) return false;
-    for (const key of expected) {
       if (!(entries || []).some((entry) => entryHasWebsiteKey(entry, key))) return false;
     }
-    return true;
+
+    // Fiber/feed equality alone is not a freshness proof. At generation end the native React
+    // subtree can already contain revision N+1 while both the cached Fiber scan and the last
+    // /activity snapshot still agree perfectly on N. Before hiding current page prose, require
+    // its latest authored text to equal the latest canonical Fiber revision too. This extends
+    // native authority across finishGeneration()'s async final reconciliation without making
+    // Fiber latency part of answer visibility.
+    const nativeAssistantMessages = CLF_DOM.messagesIn(turn).filter(
+      (message) => message && message.role === 'assistant' && message.text
+    );
+    if (nativeAssistantMessages.length > 0) {
+      if (assistantModelMessages === 0) return false;
+      const fiberAssistantMessages = (descriptor.messages || []).filter(
+        (message) => message && message.role !== 'user' && message.rawText
+      );
+      if (fiberAssistantMessages.length === 0) return false;
+      const nativeText = presentationText(nativeAssistantMessages[nativeAssistantMessages.length - 1].text);
+      const fiberText = fiberVisibleAssistantText(fiberAssistantMessages[fiberAssistantMessages.length - 1]);
+      if (!nativeText || !fiberText || nativeText !== fiberText) return false;
+    }
+    return assistantModelMessages > 0 || (descriptor.activities || []).length > 0 || (descriptor.calls || []).length > 0;
   }
 
   const RENDERED_TAGS = new Set([
@@ -4519,9 +4756,10 @@
     // still has no route id (or after the route changed before observe() processed it).
     // Keeping the existing DOM untouched also preserves the harmless transient-null case.
     if (conversationId && CLF_DOM.conversationId() !== conversationId) return;
-    // The app owns presentation while Overwrite is on. ChatGPT's DOM stays alive underneath
-    // as the recorder's observation source, but it contributes zero visible ordering or
-    // prose: the local event stream is rendered exactly in the order the app returns it.
+    // Overwrite is a settled-turn presentation mode, not blanket ownership of the ChatGPT page.
+    // The exact live generation stays native below. Historical/settled turns transfer ownership
+    // to the app only after completeReplacementForTurn() proves current native + Fiber + durable
+    // stream parity; uncertainty always leaves ChatGPT visible.
     const enabled = renderStreamAllowed() && status.connected === true && status.paired === true;
     // Historical sections are mounted/unmounted *because* a user is moving the viewport.
     // Mutating those fresh mounts during the same wheel/touch/key burst changes document
@@ -4538,7 +4776,13 @@
     const assistantTurns = sourceTurns.filter((turn) => turn.role === 'assistant');
     const groups = streamTurnGroups(streamEntries);
     const renderIndex = streamRenderIndex(streamEntries, groups);
-    const newest = assistantTurns[assistantTurns.length - 1] || null;
+    // React document order is presentation, not lifecycle ownership. It can move an older
+    // assistant section after the one currently being authored. Resolve the active generation
+    // once from the exact genNode evidence, then match that node into presentationTurns below.
+    const liveGenerationTurn = generating ? generationTurn() : null;
+    const liveGenerationNodes = liveGenerationTurn
+      ? liveGenerationTurn.nodes || (liveGenerationTurn.node ? [liveGenerationTurn.node] : [])
+      : [];
     // Which reconstructions have already been painted in this pass. See the dedupe below.
     const painted = new Set();
     const seenStreamKeys = new Set();
@@ -4558,24 +4802,31 @@
       // live turn was never recognised as live and the reconstruction it is for — the page
       // ordering, the commentary in its own place — never ran at all.
       let localId = localGenerationOf(turn);
-      if (generating && turn === newest) {
-        const active = generationTurn();
-        localId = active === turn ? turnId : null;
-      }
+      const activeGeneration = generating && nodes.some((node) => liveGenerationNodes.includes(node));
+      if (activeGeneration) localId = turnId;
       const localGroup = localId ? groups.find((group) => group.id === localId) || null : null;
-      const activeNewest = generating && turn === newest;
+      // Presentation ownership is asymmetric by design. While ChatGPT is authoring the newest
+      // assistant turn, its native DOM is the only source that is guaranteed to contain the
+      // latest revision synchronously. Recorder/Fiber/activity continue collecting and joining
+      // exact identities in the background, but they cannot take visibility away until the turn
+      // is settled. This makes capture latency, bridge latency and Fiber repair irrelevant to the
+      // user's ability to read a live answer.
+      if (activeGeneration) {
+        for (const key of releaseTurnPresentationToNative(turn)) seenStreamKeys.add(key);
+        continue;
+      }
       const anchorRender = anchoredRenderForTurn(
         turn,
         sourceTurns,
         groups,
-        activeNewest ? localGroup : null,
-        activeNewest && !localGroup
+        activeGeneration ? localGroup : null,
+        activeGeneration && !localGroup
       );
       // The active newest turn is owned only by the local generation this document observed.
       // While generationTurn() cannot bind it yet, leave ChatGPT native. A stale Fiber stamp
       // or settled node tombstone can describe the previous turn during React reuse, so
       // website-id reconciliation is deliberately reserved for historical/reloaded turns.
-      const identityRender = activeNewest
+      const identityRender = activeGeneration
         ? websiteRenderForTurn(turn, groups, localGroup, renderIndex)
         : localId !== null
           ? websiteRenderForTurn(turn, groups, localGroup, renderIndex)
@@ -4671,27 +4922,21 @@
       }
 
       if (rendered.length === 0 || !completeReplacementForTurn(turn, rendered)) {
-        const lastComplete = existing ? Number(existing.dataset.clfCompleteAt) : 0;
-        // A one-second observer and a two-second activity pull race each other by design.
-        // Once this exact section has already been proven complete, do not tear ownership
-        // down just because one transient Fiber scan or feed page is a beat behind. That
-        // produced the visible full-overwrite -> native -> full-overwrite snap on reload and
-        // during tool phases. Persistent incompleteness still falls back after the grace.
-        const currentCallMissing = hasUnrepresentedFiberCall(turn, rendered);
-        if (
-          !currentCallMissing &&
-          existing &&
-          Number.isFinite(lastComplete) &&
-          Date.now() - lastComplete < REPLACEMENT_GRACE_MS
-        ) {
-          // Ownership is being held, not released: the stream mounted here is still on the
-          // page, so it still claims this reconstruction against the sections below it.
-          if (groupKey) painted.add(groupKey);
-          continue;
+        // Completeness is an ownership fence, not a debounce. Once Fiber says the current page
+        // model and the recorder projection differ, keeping an older synthetic root mounted for
+        // a timer hides the only fresh answer. Fall back to native immediately. The old sibling
+        // may stay *staged* at its stable document position, but CSS makes it non-presentational
+        // until exact revision parity is proven again.
+        const priorRoot = priorKey ? streamRootsByKey.get(priorKey) || null : null;
+        if (existing) existing.setAttribute('data-clf-stream-inactive', '1');
+        if (priorRoot && priorRoot !== existing && priorRoot.isConnected) {
+          priorRoot.setAttribute('data-clf-stream-inactive', '1');
         }
-        if (existing) existing.remove();
-        if (streamKey) streamRootsByKey.delete(streamKey);
-        for (const node of nodes) if (node && node.dataset) delete node.dataset.clfStreamKey;
+        for (const node of nodes) {
+          if (!node || !node.dataset) continue;
+          if (streamKey) node.dataset.clfStreamKey = streamKey;
+          else delete node.dataset.clfStreamKey;
+        }
         CLF_DOM.replaceTurn(turn, null, false);
         CLF_DOM.hideProgress(turn, false);
         for (const block of CLF_DOM.toolBlocks(turn)) block.removeAttribute('data-clf-native-hidden');
@@ -4700,6 +4945,7 @@
 
       const root = existing || document.createElement('div');
       root.className = 'clf-stream';
+      root.removeAttribute('data-clf-stream-inactive');
       if (streamKey) {
         root.dataset.clfKey = streamKey;
         streamRootsByKey.set(streamKey, root);
@@ -4737,10 +4983,11 @@
       CLF_DOM.replaceTurn(turn, root, true);
       if (streamKey) painted.add(streamKey);
     }
-    // A virtualized historical turn can disappear from the DOM entirely while its sibling
-    // stream remains. Retain it only for the same grace used for transient incomplete scans;
-    // this is long enough for React's replace/reorder burst to settle, but does not defeat
-    // ChatGPT's long-term history virtualization or leak an unbounded set of visible roots.
+    // The MutationObserver above removes a root immediately when its exact owning section is
+    // genuinely detached. What can remain unclaimed here is the different React case: a section
+    // was moved/reused while its sibling root must stay at the old chronological position. Keep
+    // that placement briefly so the host can reconcile, but this grace never hides a connected
+    // native turn and therefore cannot gate answer freshness.
     const now = Date.now();
     for (const [key, root] of streamRootsByKey) {
       if (!root || !root.isConnected) {
@@ -4802,6 +5049,9 @@
       return;
     }
     if (pulling || !conversationId || CLF_DOM.conversationId() !== conversationId) return;
+    // This pull consumes every wake that preceded it. A new notification arriving after this
+    // point sets the flag again and is therefore fenced from this snapshot rather than lost.
+    activityDirty = false;
     pulling = true;
     const forId = conversationId;
     const forEpoch = epoch;
@@ -4974,6 +5224,10 @@
       injectStage();
     } finally {
       pulling = false;
+      // If the app accepted another recorder revision while this request/Fiber pass was in
+      // flight, immediately read again. This is the generation fence for the classic race:
+      // stale /activity N -> refreshFiber emits N+1 -> /events ACK wakes us -> never idle on N.
+      if (activityDirty && current()) wakeActivityPull(forId);
     }
     // A settled compaction brief is durable page state until the app acknowledges it. A
     // successful activity round trip is also our recovery clock after a transient capture
@@ -8198,7 +8452,7 @@
     if (!readyComposer) return void (await fail('ChatGPT never exposed a usable composer for bootstrap'));
     if (await failIfRetargeted()) return;
 
-    if (!CLF_DOM.insertPrompt(boot.text)) return void (await fail('ChatGPT refused the inserted text'));
+    const insertedImmediately = CLF_DOM.insertPrompt(boot.text);
     // Give synchronous React/input work one microtask turn to replace the editing host, then
     // re-prove the exact draft before the irreversible send. This used to sleep for 100 ms.
     // Long-hidden Chrome tabs throttle wall-clock timers, so that tiny "stability" delay became
@@ -8215,6 +8469,16 @@
     // approve user text appended after focus moved into this tab.
     const squeeze = (value) => (value || '').replace(/\s+/g, '');
     const expectedText = squeeze(boot.text);
+    // `execCommand('insertText')` can publish the editable DOM one React microtask after the
+    // isolated-world call returns. Do not terminally fail just because insertPrompt's immediate
+    // DOM read missed that publication: the exact whole-draft comparison below is the stronger
+    // proof and will still reject a real insertion failure or any user-text mixture.
+    if (!insertedImmediately) {
+      composer = CLF_DOM.composer();
+      if (!composer || squeeze(composer.textContent) !== expectedText) {
+        return void (await fail('ChatGPT refused the inserted text'));
+      }
+    }
     if (!composer || squeeze(composer.textContent) !== expectedText) {
       if (composer && !(composer.textContent || '').trim() && CLF_DOM.insertPrompt(boot.text)) {
         await Promise.resolve();
@@ -8277,7 +8541,26 @@
 
   const noteStopClick = (event) => {
     const stop = CLF_DOM.stopButton();
-    if (stop && event.target instanceof Node && stop.contains(event.target)) userStopped = true;
+    if (!stop || !(event.target instanceof Node) || !stop.contains(event.target)) return;
+    userStopped = true;
+
+    // This is the one cancellation signal the website actually gives us: the user clicked
+    // ChatGPT's own Stop control. Forward only request ids stamped onto this document's exact
+    // live assistant turn; historical Fiber rows must never make a later Stop kill an older
+    // background command. The app still verifies durable ownership when it already has it.
+    const id = CLF_DOM.conversationId();
+    if (!id) return;
+    const descriptor = fiberTurnFor(generationTurn());
+    const requestIds = [];
+    const seen = new Set();
+    for (const source of ['calls', 'requests']) {
+      for (const call of descriptor?.[source] || []) {
+        if (!call?.requestId || seen.has(call.requestId)) continue;
+        seen.add(call.requestId);
+        requestIds.push(call.requestId);
+      }
+    }
+    void ask({ type: 'turn_stop', conversationId: id, requestIds });
   };
   listen(document, 'click', noteStopClick, true);
 
@@ -8311,6 +8594,18 @@
   }
 
   let activityTimer = null;
+  function wakeActivityPull(forId = conversationId) {
+    if (!forId || forId !== conversationId || CLF_DOM.conversationId() !== forId) return false;
+    activityDirty = true;
+    // Never overlap pulls. The completion fence in pullActivity() consumes this flag and
+    // schedules the immediate follow-up once the in-flight snapshot has finished rendering.
+    if (pulling) return true;
+    if (activityTimer !== null) clearTimeout(activityTimer);
+    activityTimer = null;
+    scheduleActivityPull(0);
+    return true;
+  }
+
   function scheduleActivityPull(delay = 0) {
     if (activityTimer !== null) return;
     activityTimer = setTimeout(async () => {
@@ -8320,6 +8615,12 @@
         await pullActivity();
       } catch {
         // The next scheduled pass retries after worker/app recovery.
+      }
+      // A push that raced the request has already scheduled a zero-delay recovery pull. Do not
+      // replace it with the ordinary cadence below.
+      if (activityDirty) {
+        scheduleActivityPull(0);
+        return;
       }
       const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
       const active = generating || nativeBusy || Boolean(compactCapture) || Boolean(job && job.busy) || pendingTools > 0;
@@ -8437,6 +8738,12 @@
         sendResponse({ ok: true, enabled: RENDER_STREAM });
         return false;
       }
+      if (message.type === 'clf-activity-dirty') {
+        const wanted = typeof message.conversationId === 'string' ? message.conversationId : '';
+        const accepted = wakeActivityPull(wanted);
+        sendResponse({ ok: accepted });
+        return false;
+      }
       // A revival the service worker wants to hand to the document that already has this chat.
       // The response is deliberately delayed until `/commands/redeem` made this exact document
       // the durable owner. background.js may close the app-opened fallback only after that fact,
@@ -8486,6 +8793,22 @@
   // which the established reload handshake remains unchanged: resumeOpenTurn() is still
   // awaited before the first observe() so a reloaded live turn cannot be duplicated.
   const startupCommandId = markerId();
+  // shell.openExternal() does not guarantee a new browser document. Edge can navigate an
+  // already-open worker tab to the marked revival URL, and ChatGPT can also preserve the same
+  // document through a history-state update. In either case the marker did not exist when this
+  // content script sampled startupCommandId, so a startup-only reader leaves the app command at
+  // leased/owner=null indefinitely. Track later marker publication in this same document and
+  // feed it through the exact same single-owner runCommand() transaction. The opening
+  // conversation fence prevents a marker carried into a different SPA chat from typing there.
+  let observedCommandMarker = startupCommandId || null;
+  const pollUrlCommand = () => {
+    const wanted = markerId();
+    if (!wanted || wanted === observedCommandMarker) return;
+    observedCommandMarker = wanted;
+    const currentConversation = CLF_DOM.conversationId();
+    if (OPENED_CONVERSATION && currentConversation !== OPENED_CONVERSATION) return;
+    void runCommand(wanted, true);
+  };
   // Fresh worker/resume pages still deliver before status restoration: they own an empty New
   // Chat and need no prior conversation lifecycle. A revival is the opposite. Let the recorder
   // restore this existing chat's durable open turn first, otherwise a reload during a Stop-button
@@ -8513,12 +8836,15 @@
     listen(globalThis, 'wheel', notePresentationScrollInput, { capture: true, passive: true });
     listen(globalThis, 'touchmove', notePresentationScrollInput, { capture: true, passive: true });
     listen(globalThis, 'keydown', notePresentationScrollInput, true);
+    listen(globalThis, 'hashchange', pollUrlCommand);
+    listen(globalThis, 'popstate', pollUrlCommand);
   }
   watchComposer();
   watchToolRows();
   watchTranscript();
 
   every(OBSERVE_MS, () => {
+    pollUrlCommand();
     observe();
     syncTheme();
     injectControl();
@@ -8621,6 +8947,7 @@
       injectStage,
       pullActivity,
       runCommand,
+      pollUrlCommand,
       startCompact,
       refreshFiber,
       fiberFor,

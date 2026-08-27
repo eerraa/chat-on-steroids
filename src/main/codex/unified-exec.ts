@@ -50,6 +50,7 @@ import { prefixPowershellScriptWithUtf8, type ShellType } from './shell.js';
 
 export type UnifiedExecErrorKind =
   | 'create_process'
+  | 'cancelled'
   | 'process_failed'
   | 'unknown_process_id'
   | 'write_to_stdin'
@@ -78,6 +79,10 @@ export class UnifiedExecError extends Error {
 
   static createProcess(message: string): UnifiedExecError {
     return new UnifiedExecError('create_process', `Failed to create unified exec process: ${message}`, message, null);
+  }
+
+  static cancelled(): UnifiedExecError {
+    return new UnifiedExecError('cancelled', 'Unified exec command stopped by the user', null, null);
   }
 
   static processFailed(message: string): UnifiedExecError {
@@ -110,6 +115,8 @@ export class UnifiedExecError extends Error {
     switch (this.kind) {
       case 'create_process':
         return `CreateProcess { message: ${JSON.stringify(this.detail ?? '')} }`;
+      case 'cancelled':
+        return 'Cancelled';
       case 'process_failed':
         return `ProcessFailed { message: ${JSON.stringify(this.detail ?? '')} }`;
       case 'unknown_process_id':
@@ -231,6 +238,8 @@ export interface SpawnParams {
 
 const EARLY_EXIT_GRACE_PERIOD_MS = 150;
 const POST_EXIT_CLOSE_WAIT_CAP_MS = 50;
+/** taskkill can return just before node-pty delivers its OS-exit callback on Windows. */
+const POST_TERMINATE_EXIT_WAIT_CAP_MS = 500;
 
 /** Applies `UNIFIED_EXEC_ENV` over the caller's environment, as `apply_unified_exec_env`. */
 export function applyUnifiedExecEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -498,21 +507,36 @@ class UnifiedExecProcess {
   }
 
   async terminate(): Promise<void> {
-    if (this.pty) {
-      try {
-        this.pty.kill();
-      } catch {
-        /* already gone */
+    // taskkill's own exit only proves that Windows accepted/completed the tree kill. Under
+    // load, ConPTY can publish its onExit a few milliseconds later; returning in that gap lets
+    // a caller release the managed session while the console host still has its cwd open.
+    // That is observable as EBUSY during immediate cleanup, and is exactly the kind of orphan
+    // window a browser Stop must not leave behind. Register before killing so the event cannot
+    // race past us, then wait only a small bounded grace before using the existing synthetic
+    // terminal state fallback.
+    const observedExit = this.exited ? null : this.cancelNotify.notified();
+    try {
+      if (this.pty) {
+        try {
+          this.pty.kill();
+        } catch {
+          /* already gone */
+        }
+        // node-pty queues `kill()` until the pty reports ready and drops it silently if that
+        // never happens, so the process tree is the authority here, not the handle. `pid` is a
+        // live read for exactly this reason.
+        if (this.pid > 0) await terminateProcessTree(this.pid, true);
+      } else if (this.child?.pid !== undefined) {
+        await terminateProcessTree(this.child.pid, true);
       }
-      // node-pty queues `kill()` until the pty reports ready and drops it silently if that
-      // never happens, so the process tree is the authority here, not the handle. `pid` is a
-      // live read for exactly this reason.
-      if (this.pid > 0) await terminateProcessTree(this.pid, true);
-    } else if (this.child?.pid !== undefined) {
-      await terminateProcessTree(this.child.pid, true);
+      if (observedExit && !this.exited) {
+        await Promise.race([observedExit.promise, sleep(POST_TERMINATE_EXIT_WAIT_CAP_MS)]);
+      }
+    } finally {
+      observedExit?.dispose();
+      this.signalExit(this.exit);
+      this.closeOutput();
     }
-    this.signalExit(this.exit);
-    this.closeOutput();
   }
 }
 
@@ -605,6 +629,8 @@ export interface ExecCommandRequest {
   displayCwd: string;
   env: NodeJS.ProcessEnv;
   tty: boolean;
+  /** Real browser Stop signal for the MCP call currently waiting on this process. */
+  signal?: AbortSignal;
 }
 
 export interface WriteStdinRequest {
@@ -614,6 +640,8 @@ export interface WriteStdinRequest {
   maxOutputTokens: number | undefined;
   truncationPolicy: TruncationPolicy;
   maxWriteStdinYieldTimeMs?: number;
+  /** Real browser Stop signal for the MCP call currently waiting on this process. */
+  signal?: AbortSignal;
 }
 
 export interface BackgroundTerminalInfo {
@@ -659,6 +687,10 @@ export class UnifiedExecProcessManager {
   }
 
   async execCommand(request: ExecCommandRequest): Promise<ExecCommandToolOutput> {
+    if (request.signal?.aborted) {
+      this.releaseProcessId(request.processId);
+      throw UnifiedExecError.cancelled();
+    }
     let process: UnifiedExecProcess;
     try {
       this.ensureProcessCapacity(request.processId);
@@ -700,67 +732,100 @@ export class UnifiedExecProcessManager {
         lastUsed: start
       });
     }
-
-    const deadline = start + clampYieldTime(request.yieldTimeMs);
-    const collected = await collectOutputUntilDeadline(process, deadline);
-    const wallTimeMs = Math.max(0, performance.now() - wallStart);
-
-    const originalTokenCount = approxTokensFromByteCount(collected.totalBytes());
-    const outputOmittedBytes = collected.omittedBytes() === 0 ? null : collected.omittedBytes();
-    const rawOutput = collected.toBytesWithOmissionMarker();
-    const chunkId = generateChunkId();
-
-    const failure = process.failureMessage();
-    if (failure !== null) {
-      this.releaseProcessId(request.processId);
-      throw UnifiedExecError.processFailed(failure);
-    }
-
-    let responseProcessId: number | null;
-    let exitCode: number | null;
-    if (processStartedAlive) {
-      const status = this.refreshProcessState(request.processId);
-      if (status.kind === 'alive') {
-        responseProcessId = status.processId;
-        exitCode = status.exitCode;
-      } else if (status.kind === 'exited') {
-        responseProcessId = null;
-        exitCode = status.exitCode;
-      } else {
-        throw UnifiedExecError.unknownProcessId(request.processId);
-      }
-    } else {
-      this.releaseProcessId(request.processId);
-      responseProcessId = null;
-      exitCode = process.exitCode();
-    }
-
-    const response = {
-      chunkId,
-      wallTimeMs,
-      rawOutput,
-      truncationPolicy: request.truncationPolicy,
-      maxOutputTokens: request.maxOutputTokens,
-      processId: responseProcessId,
-      exitCode,
-      originalTokenCount,
-      outputOmittedBytes
+    let aborting: Promise<void> | null = null;
+    const onAbort = () => {
+      // `terminate()` closes both output notifiers, so the collection wait below wakes as soon
+      // as the process tree is gone instead of sitting on the original yield deadline.
+      aborting ??= process.terminate();
     };
-    if (responseProcessId !== null) {
-      const entry = this.processes.get(request.processId);
-      if (entry?.process === process) entry.initialExecCommandActive = false;
+    if (processStartedAlive && request.signal) {
+      request.signal.addEventListener('abort', onAbort, { once: true });
+      // Covers Stop racing the async spawn before the listener could be installed.
+      if (request.signal.aborted) onAbort();
     }
-    return response;
+
+    try {
+      const deadline = start + clampYieldTime(request.yieldTimeMs);
+      const collected = await collectOutputUntilDeadline(process, deadline);
+      if (aborting) await aborting;
+      if (request.signal?.aborted) {
+        this.releaseProcessId(request.processId);
+        throw UnifiedExecError.cancelled();
+      }
+      const wallTimeMs = Math.max(0, performance.now() - wallStart);
+
+      const originalTokenCount = approxTokensFromByteCount(collected.totalBytes());
+      const outputOmittedBytes = collected.omittedBytes() === 0 ? null : collected.omittedBytes();
+      const rawOutput = collected.toBytesWithOmissionMarker();
+      const chunkId = generateChunkId();
+
+      const failure = process.failureMessage();
+      if (failure !== null) {
+        this.releaseProcessId(request.processId);
+        throw UnifiedExecError.processFailed(failure);
+      }
+
+      let responseProcessId: number | null;
+      let exitCode: number | null;
+      if (processStartedAlive) {
+        const status = this.refreshProcessState(request.processId);
+        if (status.kind === 'alive') {
+          responseProcessId = status.processId;
+          exitCode = status.exitCode;
+        } else if (status.kind === 'exited') {
+          responseProcessId = null;
+          exitCode = status.exitCode;
+        } else {
+          throw UnifiedExecError.unknownProcessId(request.processId);
+        }
+      } else {
+        this.releaseProcessId(request.processId);
+        responseProcessId = null;
+        exitCode = process.exitCode();
+      }
+
+      const response = {
+        chunkId,
+        wallTimeMs,
+        rawOutput,
+        truncationPolicy: request.truncationPolicy,
+        maxOutputTokens: request.maxOutputTokens,
+        processId: responseProcessId,
+        exitCode,
+        originalTokenCount,
+        outputOmittedBytes
+      };
+      if (responseProcessId !== null) {
+        const entry = this.processes.get(request.processId);
+        if (entry?.process === process) entry.initialExecCommandActive = false;
+      }
+      return response;
+    } finally {
+      request.signal?.removeEventListener('abort', onAbort);
+    }
   }
 
   async writeStdin(request: WriteStdinRequest): Promise<ExecCommandToolOutput> {
     const entry = this.processes.get(request.processId);
     if (!entry) throw UnifiedExecError.unknownProcessId(request.processId);
     const locked = entry.process;
+    let aborting: Promise<void> | null = null;
+    const onAbort = () => {
+      aborting ??= locked.terminate();
+    };
+    if (request.signal) {
+      request.signal.addEventListener('abort', onAbort, { once: true });
+      if (request.signal.aborted) onAbort();
+    }
 
     // Reads and writes against one session must not overlap: they share a draining buffer.
     const release = await locked.interactionLock.lock();
     try {
+      if (aborting) await aborting;
+      if (request.signal?.aborted) {
+        if (this.processes.get(request.processId)?.process === locked) this.releaseProcessId(request.processId);
+        throw UnifiedExecError.cancelled();
+      }
       const current = this.processes.get(request.processId);
       if (!current || current.process !== locked) throw UnifiedExecError.unknownProcessId(request.processId);
       current.lastUsed = Date.now();
@@ -811,6 +876,11 @@ export class UnifiedExecProcessManager {
       // bytes that arrive later remain in the draining buffer for the next poll. Non-empty
       // writes keep Codex's collection-window behavior so one interactive response is gathered.
       const collected = await collectOutputUntilDeadline(process, start + yieldTimeMs, request.input === '');
+      if (aborting) await aborting;
+      if (request.signal?.aborted) {
+        if (this.processes.get(request.processId)?.process === locked) this.releaseProcessId(request.processId);
+        throw UnifiedExecError.cancelled();
+      }
       const wallTimeMs = Math.max(0, performance.now() - wallStart);
 
       const originalTokenCount = approxTokensFromByteCount(collected.totalBytes());
@@ -852,6 +922,7 @@ export class UnifiedExecProcessManager {
         outputOmittedBytes
       };
     } finally {
+      request.signal?.removeEventListener('abort', onAbort);
       release();
     }
   }

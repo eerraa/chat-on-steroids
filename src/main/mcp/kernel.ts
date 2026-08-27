@@ -373,6 +373,8 @@ async function dispatch(
     startedAt: Date.now(),
     transportKey,
     agent: null,
+    tool: name,
+    abortController: new AbortController(),
     caller: { transportKey, requestId, conversationId: null },
     outcome: null,
     evidence: emptyEvidence()

@@ -1124,6 +1124,31 @@ describe('extension revival delivery', () => {
     });
   });
 
+  it('hands a revival to the same worker tab when Edge navigates that existing tab to the marked URL', async () => {
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch: quiet() });
+    await worker.registerTab(4, 'document-4-live');
+    await worker.send({ type: 'bind', conversationId: CHAT }, 4, 'document-4-live');
+    worker.tabsQuery.mockResolvedValue([{ id: 4, windowId: 7, url: REVIVAL_URL }]);
+    worker.tabsSendMessage.mockImplementation(async (id: number, message: { type: string }) => {
+      expect(id).toBe(4);
+      return message.type === 'clf-recorder-ping'
+        ? { ok: true, recorderVersion: 10 }
+        : { ok: true, claimed: true };
+    });
+
+    // shell.openExternal may reuse the exact worker tab. This URL publication can be an SPA
+    // update, so there is no new content-script startup from which markerId() could be reread.
+    await worker.startTabNavigation(4, REVIVAL_URL);
+
+    expect(worker.tabsSendMessage).toHaveBeenCalledWith(4, { type: 'clf-recorder-ping' });
+    expect(worker.tabsSendMessage).toHaveBeenCalledWith(4, {
+      type: 'clf-run-command',
+      id: 'cmd-wake',
+      conversationId: CHAT
+    });
+    expect(worker.tabsRemove).not.toHaveBeenCalled();
+  });
+
   it('does not acknowledge deferred-revival custody until local persistence succeeds, then restores it after browser restart', async () => {
     const local = new FakeStorageArea(paired);
     const session = new FakeStorageArea();
@@ -1455,6 +1480,63 @@ describe('extension observation journal', () => {
       })
     ]);
     expect(JSON.stringify(journalOf(session))).not.toContain('rejected by the local bridge');
+  });
+
+  it('pushes an activity-dirty wake only after the app accepts this conversation event batch', async () => {
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const conversationId = '10101010-2020-3030-4040-505050505050';
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/events') return response(200, { sessionId: 'activity-dirty-session', stored: 1 });
+      return response(404, {});
+    });
+    const worker = loadWorker({ local, session, fetch });
+    const tabId = 44;
+    await worker.registerTab(tabId);
+
+    const result = await worker.send({
+      type: 'events',
+      conversationId,
+      entries: [
+        { conversationId, event: { kind: 'assistant_message', time: 1, messageId: 'site-dirty', text: 'final' } }
+      ]
+    }, tabId);
+    expect(result).toMatchObject({ ok: true, pending: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(worker.tabsSendMessage).toHaveBeenCalledWith(tabId, {
+      type: 'clf-activity-dirty',
+      conversationId
+    });
+  });
+
+  it('does not push activity-dirty while a batch is only journalled locally and the app rejects it', async () => {
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const conversationId = '11101010-2020-3030-4040-505050505050';
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/events') return response(503, { error: 'retry' });
+      return response(404, {});
+    });
+    const worker = loadWorker({ local, session, fetch });
+    const tabId = 45;
+    await worker.registerTab(tabId);
+
+    const result = await worker.send({
+      type: 'events',
+      conversationId,
+      entries: [{ conversationId, event: { kind: 'progress', time: 1, text: 'not app-durable yet' } }]
+    }, tabId);
+    expect(result).toMatchObject({ ok: true, pending: 1, durable: true });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(worker.tabsSendMessage.mock.calls.filter(
+      ([, message]) => (message as { type?: string })?.type === 'clf-activity-dirty'
+    )).toEqual([]);
   });
 
   it('keeps one retry alarm while durable work remains instead of resetting it on every failure', async () => {
@@ -2469,6 +2551,36 @@ describe('extension connection', () => {
     });
   });
 
+  it('forwards a real Stop click from the owning document to the local bridge', async () => {
+    const conversationId = 'abababab-cdcd-efef-1212-343434343434';
+    const requestId = 'wfr_stop_live_command';
+    let body: any = null;
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/turn-stop') {
+        body = JSON.parse(String(init.body));
+        return response(200, { ok: true, conversationId, cancelled: 1 });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(),
+      fetch
+    });
+
+    const reply = await worker.send(
+      { type: 'turn_stop', conversationId, requestIds: [requestId] },
+      76,
+      'document-76-0',
+      `https://chatgpt.com/c/${conversationId}`
+    );
+
+    expect(body).toEqual({ conversationId, requestIds: [requestId] });
+    expect(reply).toMatchObject({ ok: true, status: 200, data: { conversationId, cancelled: 1 } });
+  });
+
   it('forwards Project affinity from Chrome-owned sender identity with the correlation handshake', async () => {
     const conversationId = 'abababab-cdcd-efef-1212-343434343434';
     const requestId = 'wfr_project_affinity';
@@ -2501,6 +2613,115 @@ describe('extension connection', () => {
     );
 
     expect(body).toMatchObject({ conversationId, projectPath });
+  });
+
+  it('does not erase Project affinity while a fresh conversation sender is still on the provisional Project route', async () => {
+    const conversationId = 'abababab-cdcd-efef-1212-343434343434';
+    const requestId = 'wfr_project_route_still_provisional';
+    const projectPath = '/g/g-p-6a86a24c609c819193e2bbb2fd52147d-webcodex';
+    let body: any = null;
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/correlations') {
+        body = JSON.parse(String(init.body));
+        return response(200, { ok: true, conversationId, confirmed: [requestId], complete: true });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(),
+      fetch
+    });
+
+    await worker.send(
+      {
+        type: 'correlate',
+        conversationId,
+        calls: [{ messageId: 'project-request-early', tool: 'read', order: 0, answered: false, requestId }]
+      },
+      74,
+      'document-74-0',
+      `https://chatgpt.com${projectPath}/project`
+    );
+
+    // The concrete conversation id can become visible to Fiber before location.pathname has
+    // advanced from the Project fresh-composer route. That URL proves neither "ordinary chat"
+    // nor a concrete Project conversation, so it must not revoke the bootstrap ACK's durable
+    // conversation -> Project mapping.
+    expect(body).not.toHaveProperty('projectPath');
+  });
+
+  it('recovers Project affinity from the current tab after the sender document stays on the provisional Project route', async () => {
+    const conversationId = 'abababab-cdcd-efef-1212-343434343434';
+    const requestId = 'wfr_project_route_current_tab';
+    const projectPath = '/g/g-p-6a86a24c609c819193e2bbb2fd52147d-webcodex';
+    let body: any = null;
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/correlations') {
+        body = JSON.parse(String(init.body));
+        return response(200, { ok: true, conversationId, confirmed: [requestId], complete: true });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(),
+      fetch,
+      tabsGet: async (tabId) => ({
+        id: tabId,
+        url: `https://chatgpt.com${projectPath}/c/${conversationId}`
+      })
+    });
+
+    await worker.send(
+      {
+        type: 'correlate',
+        conversationId,
+        calls: [{ messageId: 'project-request-current-tab', tool: 'read', order: 0, answered: false, requestId }]
+      },
+      77,
+      'document-77-0',
+      `https://chatgpt.com${projectPath}/project`
+    );
+
+    expect(body).toMatchObject({ conversationId, projectPath });
+  });
+
+  it('reports null Project affinity only when the sender proves the exact ordinary conversation route', async () => {
+    const conversationId = 'abababab-cdcd-efef-1212-343434343434';
+    const requestId = 'wfr_ordinary_route_affinity';
+    let body: any = null;
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/correlations') {
+        body = JSON.parse(String(init.body));
+        return response(200, { ok: true, conversationId, confirmed: [requestId], complete: true });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(),
+      fetch
+    });
+
+    await worker.send(
+      {
+        type: 'correlate',
+        conversationId,
+        calls: [{ messageId: 'ordinary-request', tool: 'read', order: 0, answered: false, requestId }]
+      },
+      75,
+      'document-75-0',
+      `https://chatgpt.com/c/${conversationId}`
+    );
+
+    expect(body).toMatchObject({ conversationId, projectPath: null });
   });
 
   it('does not re-ask where the app is before every single request', async () => {

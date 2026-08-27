@@ -485,12 +485,23 @@ describe('authorisation', () => {
       ['GET', '/activity?conversationId=abcdabcd'],
       ['POST', '/events'],
       ['POST', '/correlations'],
+      ['POST', '/turn-stop'],
       ['POST', '/closed'],
       ['POST', '/commands/ack']
     ] as const) {
       const reply = await request(method, path, { auth: null, ...(method === 'POST' ? { body: {} } : {}) });
       expect(reply.status, path).toBe(401);
     }
+  });
+
+  it('accepts an authenticated Stop notice even when no managed command is currently running', async () => {
+    await pair();
+    const conversationId = '12121212-3434-5656-7878-909090909090';
+    const reply = await request('POST', '/turn-stop', {
+      body: { conversationId, requestIds: ['wfr_no_long_command_here'] }
+    });
+    expect(reply.status).toBe(200);
+    expect(reply.body).toMatchObject({ ok: true, conversationId, cancelled: 0 });
   });
 
   it('refuses a token of the right shape but the wrong value', async () => {
@@ -3719,10 +3730,21 @@ describe('the goal loop over the bridge', () => {
     expect(goalObjectiveFor(from)).toBe('');
     expect(goalObjectiveFor(to)).toBe('finish the release from the resumed prime chat');
 
-    let calls = 0;
+    let completionCalls = 0;
     const realFetch = globalThis.fetch;
-    globalThis.fetch = (async () => {
-      calls++;
+    globalThis.fetch = (async (url: string) => {
+      if (url.includes('/models/')) {
+        return Response.json({
+          data: {
+            endpoints: [
+              {
+                supported_parameters: ['response_format', 'structured_outputs', 'reasoning', 'reasoning_effort']
+              }
+            ]
+          }
+        });
+      }
+      completionCalls++;
       return Response.json({
         choices: [{ message: { content: JSON.stringify({ action: 'continue', reply: 'keep going from B' }) } }]
       });
@@ -3734,7 +3756,7 @@ describe('the goal loop over the bridge', () => {
       expect(drafted.status).toBe(200);
       expect(drafted.body.sessionId).toBe(shadow.id);
       expect(drafted.body.goal.turnId).toBe('g-shadow-repaired');
-      await vi.waitFor(() => expect(calls).toBe(1));
+      await vi.waitFor(() => expect(completionCalls).toBe(1));
     } finally {
       globalThis.fetch = realFetch;
     }
@@ -3890,10 +3912,21 @@ describe('the goal loop over the bridge', () => {
       }
     });
 
-    let calls = 0;
+    let completionCalls = 0;
     const realFetch = globalThis.fetch;
-    globalThis.fetch = (async () => {
-      calls++;
+    globalThis.fetch = (async (url: string) => {
+      if (url.includes('/models/')) {
+        return Response.json({
+          data: {
+            endpoints: [
+              {
+                supported_parameters: ['response_format', 'structured_outputs', 'reasoning', 'reasoning_effort']
+              }
+            ]
+          }
+        });
+      }
+      completionCalls++;
       return Response.json({
         choices: [
           {
@@ -3924,7 +3957,7 @@ describe('the goal loop over the bridge', () => {
         if (feed.body.goal?.draft?.stage === 'ready') break;
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
-      expect(calls).toBe(1);
+      expect(completionCalls).toBe(1);
       expect(feed.body.goal.draft.reply).toBe(humanReply('what about the tests'));
 
       const acked = await request('POST', '/goal/ack', {
@@ -4244,6 +4277,7 @@ describe('shutting the listener down', () => {
     const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
     const payload = Buffer.from(JSON.stringify({ conversationId: 'cafe0009-0000-4000-8000-000000000009', events: [] }), 'utf8');
 
+    let finishRequest!: () => void;
     const answered = new Promise<number>((resolve, reject) => {
       const req = http.request(
         `${base}/events`,
@@ -4266,20 +4300,28 @@ describe('shutting the listener down', () => {
       req.on('error', reject);
       // Headers and half the body only: the handler is now parked inside readBody.
       req.write(payload.subarray(0, payload.length - 1));
-      setTimeout(() => req.end(payload.subarray(payload.length - 1)), 150);
+      finishRequest = () => req.end(payload.subarray(payload.length - 1));
     });
 
     // Give the server time to accept the connection and start reading.
     await new Promise((resolve) => setTimeout(resolve, 50));
     const started = Date.now();
-    await stopBridge();
+    let stopped = false;
+    const stopping = stopBridge().then(() => {
+      stopped = true;
+    });
+    // Hold the request open ourselves instead of inferring the remaining lifetime from two
+    // independent timers. The drain must stay pending while the accepted body is incomplete.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(stopped).toBe(false);
+    finishRequest();
+    await stopping;
     const elapsed = Date.now() - started;
 
     expect(await answered).toBe(200);
     agent.destroy();
-    // The drain is real — it waited for the request — but it ends with the request, not with
-    // the force timer 15s later.
-    expect(elapsed).toBeGreaterThanOrEqual(100);
+    // The drain is real — it waited for the held request — but it ends with the request, not
+    // with the force timer 15s later.
     expect(elapsed).toBeLessThan(3_000);
 
     const restarted = await startBridge();

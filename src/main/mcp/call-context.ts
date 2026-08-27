@@ -14,6 +14,7 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { AssetRef, FileChange, ToolOutcome } from '../../shared/session.js';
+import { awaitRequestCorrelation, requestCorrelation } from '../session/correlation.js';
 
 export interface CallEvidence {
   changes: FileChange[];
@@ -66,6 +67,17 @@ export interface CallContext {
   transportKey: string | null;
   /** Resolved agent id in multi-agent mode, else null. */
   agent: string | null;
+  /** Model-facing tool name. Dispatch-created contexts always provide it. */
+  tool?: string;
+  /**
+   * Browser Stop cancellation for work that has a safe local cancellation boundary.
+   *
+   * Most tools deliberately ignore this signal: a filesystem mutation already in progress
+   * cannot be rolled back merely because the web turn was interrupted. `exec_command` and
+   * `write_stdin` are different because the managed process layer owns a real child-tree
+   * termination primitive and can therefore honour the signal without inventing semantics.
+   */
+  abortController?: AbortController;
   /** Who this call was proven to be, for the broker tools to route by. */
   caller: CallCaller;
   /**
@@ -110,9 +122,10 @@ export function runInCallContext<T>(context: CallContext, fn: () => T): T {
  * Tool-call lifetime state, split by what is still capable of changing the machine.
  *
  * `running` is the request that has not returned from dispatch yet. This is the count the
- * ChatGPT-native compaction barrier cares about: interrupting the ChatGPT turn does not stop
- * a command/edit already inside this process, and a handoff written while that work is still
- * live can describe a machine state that changes underneath the fresh chat.
+ * ChatGPT-native compaction barrier cares about: a real browser Stop can now terminate the
+ * managed exec pair, but it cannot roll back an edit or other mutation already inside this
+ * process. A handoff written while any such work is still live can therefore describe a
+ * machine state that changes underneath the fresh chat.
  *
  * `settling` is deliberately different. It is a handler that has already returned and whose
  * MCP result has been released, but whose durable session record is still waiting for late
@@ -140,6 +153,62 @@ function countFor(calls: Iterable<CallContext>, conversationId: string | null): 
 /** Requests still inside dispatch, and therefore still potentially doing tool work. */
 export function runningToolCalls(conversationId: string | null = null): number {
   return countFor(running, conversationId);
+}
+
+const STOPPABLE_MANAGED_TOOLS = new Set(['exec_command', 'write_stdin']);
+
+/**
+ * Propagates one real ChatGPT Stop click into the managed command calls owned by that turn.
+ *
+ * The page supplies request ids from the exact live Fiber turn when it has them. That closes
+ * the race where Stop is pressed before the normal request-id -> conversation handshake has
+ * reached the app. When the page has not exposed an id yet, wait briefly for the ordinary
+ * durable correlation path instead. The candidate set is snapshotted at Stop time, so a new
+ * command started afterwards can never be cancelled by an old click.
+ *
+ * No other tool consumes the AbortSignal. In particular, this does not pretend that a web
+ * cancellation can roll back an edit or another mutation that may already have committed.
+ */
+export async function stopRunningManagedCalls(
+  conversationId: string,
+  requestIds: readonly string[] = [],
+  evidenceWaitMs = 1_500
+): Promise<number> {
+  const direct = new Set(requestIds);
+  const candidates = [...running].filter(
+    (call) => STOPPABLE_MANAGED_TOOLS.has(call.tool ?? '') && call.abortController && !call.abortController.signal.aborted
+  );
+  let stopped = 0;
+  const unresolved: CallContext[] = [];
+
+  const stop = (call: CallContext): void => {
+    if (!call.abortController || call.abortController.signal.aborted) return;
+    call.abortController.abort();
+    stopped += 1;
+  };
+
+  for (const call of candidates) {
+    const requestId = call.caller.requestId;
+    const correlated = requestCorrelation(requestId)?.conversationId ?? null;
+    const knownOwner = call.caller.conversationId ?? correlated;
+    // Contradictory durable ownership always wins over an ephemeral page sighting.
+    if (knownOwner && knownOwner !== conversationId) continue;
+    if (knownOwner === conversationId || (requestId !== null && direct.has(requestId))) {
+      stop(call);
+      continue;
+    }
+    if (requestId) unresolved.push(call);
+  }
+
+  if (unresolved.length > 0 && evidenceWaitMs > 0) {
+    await Promise.all(
+      unresolved.map(async (call) => {
+        const proof = await awaitRequestCorrelation(call.caller.requestId, evidenceWaitMs);
+        if (proof?.conversationId === conversationId) stop(call);
+      })
+    );
+  }
+  return stopped;
 }
 
 /** Finished tool work whose unattributed durable record is still landing. */

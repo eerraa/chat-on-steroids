@@ -6,9 +6,10 @@
  * OpenRouter model given the same conversation and a strict continuation-gate instruction. The
  * stock policy keeps going while a requested item is not clearly resolved, but still treats an
  * explicit whole-job completion claim as authoritative and never invents extra work.
- * OpenRouter is asked for a strict `{ action, reply }` decision and the app validates it before
- * anything reaches the browser; provider reasoning, tokenizer markers and malformed protocol
- * output are never user messages. That is the whole feature, and the two halves live in different
+ * OpenRouter is asked for the strongest JSON contract the selected endpoint actually supports,
+ * and the app strictly validates the exact `{ action, reply }` shape before anything reaches the
+ * browser; provider reasoning, tokenizer markers and malformed protocol output are never user
+ * messages. That is the whole feature, and the two halves live in different
  * places for a reason:
  *
  *   · The *page* owns "the turn is really over". Only the browser can tell a finished answer
@@ -86,9 +87,13 @@ const MAX_ERROR_BODY_BYTES = 64 * 1024;
 const MAX_GOAL_BODY_BYTES = 64 * 1024;
 /** The model catalogue is bounded UI metadata, not an unlimited provider document. */
 const MAX_MODEL_LIST_BODY_BYTES = 8 * 1024 * 1024;
+/** Endpoint capability metadata is tiny; never buffer an arbitrary provider document for it. */
+const MAX_MODEL_ENDPOINT_BODY_BYTES = 512 * 1024;
 /** Cache/picker cardinality and field bounds for provider-controlled model metadata. */
 const MAX_MODELS = 5_000;
 const MAX_MODEL_FIELD_CHARS = 500;
+const MAX_MODEL_PARAMETERS = 100;
+const MAX_MODEL_PARAMETER_CHARS = 100;
 /** How long a finished draft stays available to the page that has to type it. */
 const DRAFT_TTL_MS = 10 * 60_000;
 /** The model listing is small and changes daily, not by the second. */
@@ -113,8 +118,8 @@ const UNSAFE_REASONING_TAG = /<\/?(?:think|analysis|reasoning)\b[^>]*>/iu;
 
 /** App-owned transport contract. The editable prompt decides policy, never wire syntax. */
 const GOAL_OUTPUT_PROTOCOL =
-  'Return only the app decision described by the response schema. Use action "stop" when the editable instruction would say NO_REPLY. ' +
-  'Use action "continue" only with the exact short user message in reply. Put no reasoning, counting, labels, tokenizer markers, or protocol words in reply.';
+  'Return only one JSON object with exactly two fields: action and reply. Use action "stop" when the editable instruction would say NO_REPLY, with reply empty. ' +
+  'Use action "continue" only with the exact short user message in reply. Put no reasoning, counting, labels, tokenizer markers, protocol words, or extra JSON fields in reply.';
 
 const GOAL_RESPONSE_FORMAT = {
   type: 'json_schema',
@@ -140,6 +145,9 @@ const GOAL_RESPONSE_FORMAT = {
     }
   }
 } as const;
+
+/** JSON-only fallback for endpoints that support response_format but not JSON-schema enforcement. */
+const GOAL_JSON_OBJECT_RESPONSE_FORMAT = { type: 'json_object' } as const;
 
 /** The persisted instruction used for the next draft. Exported for focused contract tests. */
 export function goalSystemPrompt(): string {
@@ -429,6 +437,8 @@ export function resetGoalStateForTests(): void {
   firstUserCache.clear();
   legacyCommittedResumeCache.clear();
   modelCache = null;
+  modelProfileCache.clear();
+  modelParameterOverridesForTests.clear();
 }
 
 export interface StartGoalDraftInput {
@@ -533,8 +543,106 @@ interface GoalRequest {
   publish?: (text: string) => void;
 }
 
+type GoalResponseMode = 'json_schema' | 'json_object' | 'text';
+
+interface GoalRequestProfile {
+  responseMode: GoalResponseMode;
+  reasoning: boolean;
+  reasoningEffort: boolean;
+}
+
+const LEGACY_GOAL_REQUEST_PROFILE: GoalRequestProfile = {
+  responseMode: 'json_schema',
+  reasoning: true,
+  reasoningEffort: true
+};
+
+/** Live model capabilities are short-lived routing metadata, never user/session state. */
+let modelProfileCache = new Map<string, { at: number; profile: GoalRequestProfile }>();
+/** Explicit seam so request-body tests do not depend on OpenRouter's live model catalogue. */
+let modelParameterOverridesForTests = new Map<string, string[]>();
+
+function cleanModelParameters(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of value.slice(0, MAX_MODEL_PARAMETERS)) {
+    if (typeof raw !== 'string') continue;
+    const parameter = raw.trim();
+    if (!parameter || parameter.length > MAX_MODEL_PARAMETER_CHARS || !/^[a-z0-9_:-]+$/i.test(parameter)) continue;
+    if (seen.has(parameter)) continue;
+    seen.add(parameter);
+    out.push(parameter);
+  }
+  return out;
+}
+
+function profileForParameterSets(parameterSets: readonly string[][]): GoalRequestProfile {
+  const sets = parameterSets.map((parameters) => new Set(parameters));
+  if (sets.length === 0) return LEGACY_GOAL_REQUEST_PROFILE;
+
+  // `structured_outputs` is the OpenRouter endpoint capability that means a JSON schema in
+  // response_format is actually enforced. Merely advertising `response_format` is weaker:
+  // MiniMax M3 free is the live example, accepting JSON mode while explicitly not enforcing a
+  // schema. Pick the strongest response contract that at least one current endpoint can serve.
+  const strict = sets.filter((parameters) => parameters.has('structured_outputs'));
+  const json = strict.length > 0 ? strict : sets.filter((parameters) => parameters.has('response_format'));
+  const eligible = json.length > 0 ? json : sets;
+  return {
+    responseMode: strict.length > 0 ? 'json_schema' : json.length > 0 ? 'json_object' : 'text',
+    reasoning: eligible.some((parameters) => parameters.has('reasoning')),
+    reasoningEffort: eligible.some(
+      (parameters) => parameters.has('reasoning') && parameters.has('reasoning_effort')
+    )
+  };
+}
+
+/** Encodes an OpenRouter model id without allowing it to escape the model endpoint path. */
+function modelEndpointPath(model: string): string {
+  return model.split('/').map((part) => encodeURIComponent(part)).join('/');
+}
+
+async function goalRequestProfile(model: string, signal: AbortSignal): Promise<GoalRequestProfile> {
+  const override = modelParameterOverridesForTests.get(model);
+  if (override) return profileForParameterSets([override]);
+  const cached = modelProfileCache.get(model);
+  if (cached && Date.now() - cached.at < MODEL_CACHE_MS) return cached.profile;
+
+  try {
+    const response = await fetch(`${OPENROUTER_BASE}/models/${modelEndpointPath(model)}/endpoints`, {
+      headers: ATTRIBUTION_HEADERS,
+      signal
+    });
+    if (!response.ok) {
+      logWarn(`goal: endpoint capability lookup for ${model} returned HTTP ${response.status}; using legacy request profile`);
+      return LEGACY_GOAL_REQUEST_PROFILE;
+    }
+    const raw = await boundedResponseText(response, MAX_MODEL_ENDPOINT_BODY_BYTES);
+    const parsed = raw ? JSON.parse(raw) as { data?: { endpoints?: unknown } } : null;
+    const endpoints = parsed?.data?.endpoints;
+    if (!Array.isArray(endpoints)) return LEGACY_GOAL_REQUEST_PROFILE;
+    const parameterSets = endpoints
+      .filter((entry): entry is { supported_parameters?: unknown } => Boolean(entry && typeof entry === 'object'))
+      .map((entry) => cleanModelParameters(entry.supported_parameters));
+    const profile = profileForParameterSets(parameterSets);
+    modelProfileCache.set(model, { at: Date.now(), profile });
+    return profile;
+  } catch (error) {
+    // Cancellation belongs to the Goal draft that owns this lookup. Do not convert it into a
+    // capability miss and then start a completion after the browser already retired the draft.
+    if (signal.aborted || (error instanceof DOMException && error.name === 'AbortError')) throw error;
+    logWarn(`goal: could not inspect endpoint capabilities for ${model}; using legacy request profile`);
+    return LEGACY_GOAL_REQUEST_PROFILE;
+  }
+}
+
+export function setGoalModelParametersForTests(model: string, parameters: string[]): void {
+  modelParameterOverridesForTests.set(model, cleanModelParameters(parameters));
+}
+
 async function requestGoalDecision(request: GoalRequest): Promise<GoalDecision | { action: 'http'; error: string }> {
   const settings = getConfig().goal;
+  const profile = await goalRequestProfile(request.model, request.signal);
   const body: Record<string, unknown> = {
     model: request.model,
     // Response Healing works only for non-streaming structured responses. Goal decisions
@@ -546,18 +654,23 @@ async function requestGoalDecision(request: GoalRequest): Promise<GoalDecision |
       ...request.messages,
       { role: 'system', content: request.trailer }
     ],
-    response_format: GOAL_RESPONSE_FORMAT,
-    plugins: [{ id: 'response-healing' }],
     // OpenRouter otherwise may route to a provider that silently ignores response_format.
     provider: { require_parameters: true }
   };
+  if (profile.responseMode === 'json_schema') body['response_format'] = GOAL_RESPONSE_FORMAT;
+  else if (profile.responseMode === 'json_object') body['response_format'] = GOAL_JSON_OBJECT_RESPONSE_FORMAT;
+  if (profile.responseMode !== 'text') body['plugins'] = [{ id: 'response-healing' }];
   // Reasoning may still be used, but it is never part of the response body this app parses.
-  // OpenRouter documents `exclude` as supported across models even when effort selection is
-  // not. `default` therefore means "provider-selected effort", not "return its scratchpad".
-  body['reasoning'] = {
-    ...(settings.reasoning === 'default' ? {} : { effort: settings.reasoning }),
-    exclude: true
-  };
+  // Do not require a parameter the selected endpoint does not advertise: with
+  // `require_parameters:true`, that turns a usable free model into "No endpoints found" before
+  // inference starts. `default` means provider-selected effort; explicit effort is included only
+  // when at least one otherwise-eligible endpoint declares reasoning_effort too.
+  if (profile.reasoning) {
+    body['reasoning'] = {
+      ...(settings.reasoning === 'default' || !profile.reasoningEffort ? {} : { effort: settings.reasoning }),
+      exclude: true
+    };
+  }
 
   const response = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
     method: 'POST',
@@ -571,7 +684,15 @@ async function requestGoalDecision(request: GoalRequest): Promise<GoalDecision |
   });
   if (!response.ok || !response.body) return { action: 'http', error: await httpFailure(response) };
   const completion = await readGoalCompletion(response, request.publish);
-  return normalizeGoalDecision(completion.text, completion.legacy);
+  return normalizeGoalDecision(
+    completion.text,
+    completion.legacy,
+    // `json_object` is only syntax guidance, not schema enforcement. MiniMax M3 free's
+    // GMICloud endpoint is a live example that can still return the old plain-text Goal
+    // protocol even though OpenRouter accepted response_format. Keep strict-schema endpoints
+    // strict; only weaker endpoints may fall back to the already fail-closed legacy parser.
+    profile.responseMode !== 'json_schema'
+  );
 }
 
 async function run(draft: GoalDraft): Promise<void> {
@@ -805,25 +926,36 @@ function cleanGoalReply(value: string): { text: string; hadControl: boolean } {
  * prefixes such as "Counting flush: NO_REPLY" can never become a user message. Raw tokenizer
  * markers are removed; an empty or still-marked result is refused rather than typed.
  */
-function normalizeGoalDecision(raw: string, legacy: boolean): GoalDecision {
+function normalizeLegacyGoalDecision(trimmed: string): GoalDecision {
+  if (NO_REPLY_TOKEN.test(trimmed) || NO_REPLY.test(trimmed)) return { action: 'stop' };
+  const cleaned = cleanGoalReply(trimmed);
+  if (!cleaned.text) return { action: 'invalid', error: cleaned.hadControl ? 'control_tokens_only' : 'empty_reply' };
+  if (cleaned.text.includes('<|') || cleaned.text.includes('|>') || UNSAFE_REASONING_TAG.test(cleaned.text)) {
+    return { action: 'invalid', error: 'unsafe_control_tokens' };
+  }
+  if (cleaned.text.length > MAX_MESSAGE_CHARS) return { action: 'invalid', error: 'reply_too_long' };
+  return { action: 'continue', reply: cleaned.text };
+}
+
+function normalizeGoalDecision(raw: string, legacy: boolean, allowTextFallback = false): GoalDecision {
   const trimmed = raw.trim();
   if (!trimmed) return { action: 'invalid', error: 'empty_reply' };
 
-  if (legacy) {
-    if (NO_REPLY_TOKEN.test(trimmed) || NO_REPLY.test(trimmed)) return { action: 'stop' };
-    const cleaned = cleanGoalReply(trimmed);
-    if (!cleaned.text) return { action: 'invalid', error: cleaned.hadControl ? 'control_tokens_only' : 'empty_reply' };
-    if (cleaned.text.includes('<|') || cleaned.text.includes('|>') || UNSAFE_REASONING_TAG.test(cleaned.text)) {
-      return { action: 'invalid', error: 'unsafe_control_tokens' };
-    }
-    return { action: 'continue', reply: cleaned.text };
-  }
+  if (legacy) return normalizeLegacyGoalDecision(trimmed);
 
   let decision: unknown;
   try {
     decision = JSON.parse(trimmed);
   } catch {
-    return { action: 'invalid', error: 'invalid_goal_decision_json' };
+    // OpenRouter's response-healing plugin repairs malformed JSON syntax, but an endpoint that
+    // lacks schema enforcement can still ignore JSON mode altogether and answer in the older
+    // Goal protocol. That protocol was production behaviour before structured responses and is
+    // already guarded against NO_REPLY leakage, reasoning/control tokens and over-long replies.
+    // Never apply it to strict-schema endpoints, and never reinterpret *valid but wrong* JSON as
+    // text — `{}` must stay a schema failure instead of becoming a user message.
+    return allowTextFallback
+      ? normalizeLegacyGoalDecision(trimmed)
+      : { action: 'invalid', error: 'invalid_goal_decision_json' };
   }
   if (!decision || typeof decision !== 'object' || Array.isArray(decision)) {
     return { action: 'invalid', error: 'invalid_goal_decision_schema' };

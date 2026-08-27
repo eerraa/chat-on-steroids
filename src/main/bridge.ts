@@ -17,7 +17,9 @@
  *
  * It is deliberately not a general control API. It accepts observations about a
  * ChatGPT conversation and hands back activity summaries and queued commands. It
- * cannot read a file, run anything, or change a permission.
+ * cannot read a file, run anything, or change a permission. The one narrow control
+ * edge is a real ChatGPT Stop click: the trusted extension may relay it so an already-
+ * running managed command owned by that exact turn can be terminated.
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
@@ -57,7 +59,7 @@ import {
   readRecentEvents,
   sessionDurableModifiedAt
 } from './session/store.js';
-import { inFlightMcpRequests, runningToolCalls, settlingToolCalls } from './mcp/call-context.js';
+import { inFlightMcpRequests, runningToolCalls, settlingToolCalls, stopRunningManagedCalls } from './mcp/call-context.js';
 import { nativeHandoffPrompt } from './session/handoff-prompt.js';
 import { briefShortfall, resumeBootstrapText } from './session/handoff.js';
 import {
@@ -1152,6 +1154,27 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       complete: conflicts.length === 0 && confirmed.length === requestIds.length
     }, origin);
   }
+
+  if (route === '/turn-stop' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try {
+      body = (await readBody(req)) as Record<string, unknown>;
+    } catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    const id = conversationId(body['conversationId']);
+    if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
+    const requestIds = Array.isArray(body['requestIds'])
+      ? [...new Set(body['requestIds'].slice(0, MAX_CALL_EVIDENCE).filter(
+          (value): value is string => typeof value === 'string' && /^[a-z0-9_-]{1,100}$/i.test(value)
+        ))]
+      : [];
+    const cancelled = await stopRunningManagedCalls(id, requestIds);
+    if (cancelled > 0) logInfo(`bridge: ChatGPT Stop cancelled ${cancelled} managed command call(s) for ${id}`);
+    return json(res, 200, { ok: true, conversationId: id, cancelled }, origin);
+  }
+
   if (route === '/events' && req.method === 'POST') {
     let body: Record<string, unknown>;
     try {

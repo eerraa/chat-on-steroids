@@ -34,7 +34,15 @@ import {
 } from '../src/main/session/store.js';
 import { resetWorkspaces, setWorkspaceFor } from '../src/main/workspace.js';
 import { DEFAULT_CAPABILITIES, type Capabilities, type Root } from '../src/shared/types.js';
-import { emptyEvidence, noteExec, noteOutcome, runInCallContext, type CallContext } from '../src/main/mcp/call-context.js';
+import {
+  emptyEvidence,
+  noteExec,
+  noteOutcome,
+  runningToolCalls,
+  runInCallContext,
+  stopRunningManagedCalls,
+  type CallContext
+} from '../src/main/mcp/call-context.js';
 import { observeRequestCorrelation } from '../src/main/session/correlation.js';
 import { execOwner, noteExecOwner, resetExecOwnershipForTests } from '../src/main/codex/ownership.js';
 import { unifiedExecManager } from '../src/main/codex/manager.js';
@@ -3004,13 +3012,13 @@ describe('exec sessions belong to the chat that opened them', () => {
   });
 
   /** What the page reports once it has seen this connector request leave a given chat. */
-  const prove = (requestId: string, conversationId: string) =>
+  const prove = (requestId: string, conversationId: string, tool = 'exec_command') =>
     observeRequestCorrelation({
       requestId,
       conversationId,
       sessionId: '2026-08-20-execown',
       messageId: `msg-${requestId}`,
-      tool: 'exec_command',
+      tool,
       observedAt: Date.now()
     });
 
@@ -3081,6 +3089,111 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(owner.body.result?.isError).not.toBe(true);
     expect(textOf(owner)).toContain('echo=bye');
     expect(textOf(owner)).toContain('Process exited with code 0');
+  });
+
+  it('kills the exact conversation-owned managed process when ChatGPT Stop is relayed', async () => {
+    const requestId = 'wfr_execown_stop_live';
+    const conversationId = 'conv-execown-stop-live';
+    expect(prove(requestId, conversationId)).toBe('stored');
+
+    const startedPath = path.join(approved, 'stop-started.txt');
+    const survivedPath = path.join(approved, 'stop-survived.txt');
+    await fs.rm(startedPath, { force: true });
+    await fs.rm(survivedPath, { force: true });
+    await fs.writeFile(
+      path.join(approved, 'stop-long.cjs'),
+      "const fs=require('node:fs'); fs.writeFileSync('stop-started.txt','started'); setTimeout(()=>fs.writeFileSync('stop-survived.txt','survived'),1500);\n",
+      'utf8'
+    );
+
+    const running = asChat(requestId, 'exec_command', {
+      cmd: 'node stop-long.cjs',
+      workdir: '/workspace',
+      yield_time_ms: 10_000
+    });
+
+    try {
+      const deadline = Date.now() + 5_000;
+      while (true) {
+        try {
+          if ((await fs.readFile(startedPath, 'utf8')) === 'started') break;
+        } catch {
+          // The process has not reached its first synchronous instruction yet.
+        }
+        if (Date.now() >= deadline) throw new Error('managed cancellation fixture never started');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      // Durable ownership is an authority fence: the same request id presented by another
+      // conversation must never be enough to kill this child.
+      expect(await stopRunningManagedCalls('conv-execown-stranger', [requestId], 0)).toBe(0);
+      expect(unifiedExecManager.listProcesses().length).toBeGreaterThan(0);
+
+      const stoppedAt = Date.now();
+      expect(await stopRunningManagedCalls(conversationId, [requestId], 0)).toBe(1);
+      const reply = await running;
+      expect(Date.now() - stoppedAt).toBeLessThan(3_000);
+      expect(reply.body.result?.isError).toBe(true);
+      expect(textOf(reply)).toContain('stopped by the user');
+      expect(unifiedExecManager.listProcesses()).toHaveLength(0);
+
+      // If only the MCP wait was released while the child tree survived, this delayed write
+      // would still appear. Waiting past its deadline proves the local process was terminated.
+      await new Promise((resolve) => setTimeout(resolve, 1_800));
+      await expect(fs.access(survivedPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await unifiedExecManager.terminateAllProcesses();
+      resetExecOwnershipForTests();
+    }
+  });
+
+  it('also interrupts a write_stdin collection window and releases its owned session', async () => {
+    const conversationId = 'conv-execown-stop-stdin';
+    const openerRequestId = 'wfr_execown_stop_stdin_open';
+    const writeRequestId = 'wfr_execown_stop_stdin_write';
+    const workdir = path.join(approved, 'stop-stdin-workdir');
+    expect(prove(openerRequestId, conversationId)).toBe('stored');
+    expect(prove(writeRequestId, conversationId, 'write_stdin')).toBe('stored');
+    await fs.mkdir(workdir, { recursive: true });
+    await fs.writeFile(
+      path.join(workdir, 'stop-stdin.cjs'),
+      "const readline=require('node:readline'); const rl=readline.createInterface({input:process.stdin,crlfDelay:Infinity}); rl.on('line',line=>setTimeout(()=>console.log('late='+line),1500));\n",
+      'utf8'
+    );
+
+    try {
+      const opened = await asChat(openerRequestId, 'exec_command', {
+        cmd: 'node stop-stdin.cjs',
+        workdir: '/workspace/stop-stdin-workdir',
+        tty: true,
+        yield_time_ms: 25
+      });
+      expect(opened.body.result?.isError, textOf(opened)).not.toBe(true);
+      const sessionId = Number(textOf(opened).match(/Process running with session ID (\d+)/)?.[1]);
+      expect(Number.isInteger(sessionId)).toBe(true);
+      expect(execOwner(sessionId)).toBe(conversationId);
+
+      const writing = asChat(writeRequestId, 'write_stdin', {
+        session_id: sessionId,
+        chars: 'go\r',
+        yield_time_ms: 10_000
+      });
+      await vi.waitFor(() => expect(runningToolCalls(conversationId)).toBe(1), { timeout: 5_000, interval: 10 });
+
+      expect(await stopRunningManagedCalls(conversationId, [writeRequestId], 0)).toBe(1);
+      const reply = await writing;
+      expect(reply.body.result?.isError).toBe(true);
+      expect(textOf(reply)).toContain('stopped by the user');
+      expect(execOwner(sessionId)).toBeNull();
+      expect(unifiedExecManager.listProcesses()).toHaveLength(0);
+      // Windows taskkill can report completion before ConPTY publishes its exit callback.
+      // Cancellation is not complete until the session's cwd can be removed immediately.
+      await expect(fs.rm(workdir, { recursive: true, force: true, maxRetries: 0 })).resolves.toBeUndefined();
+    } finally {
+      await unifiedExecManager.terminateAllProcesses();
+      resetExecOwnershipForTests();
+      await fs.rm(workdir, { recursive: true, force: true, maxRetries: 5 });
+    }
   });
 
   it('does not let a stale owner inherit a recycled process id during the new exec yield', async () => {

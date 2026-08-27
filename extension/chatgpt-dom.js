@@ -1387,15 +1387,105 @@ var CLF_DOM = (() => {
         let done = false;
         let observer = null;
         let timer = null;
+        let legacyTimer = null;
+        let submittedOnce = false;
         const finish = (value) => {
           if (done) return;
           done = true;
           if (observer) observer.disconnect();
           if (timer !== null) clearTimeout(timer);
+          if (legacyTimer !== null) clearTimeout(legacyTimer);
           resolve(value);
         };
+        const submit = () => {
+          if (done || submittedOnce) return;
+          const button = document.querySelector(SEND);
+          if (button) {
+            // React can reconcile the inserted rich-text draft one render after the editing
+            // host already exposes it. During that gap ChatGPT keeps its real submit button
+            // mounted but disabled. Treating "disabled" as "button absent" and firing a
+            // synthetic Enter loses the only submit attempt; the button becomes enabled a
+            // moment later and the untouched draft then times out. The observer below already
+            // watches attributes, so leave the attempt pending until that exact control is
+            // usable, then click it once.
+            if (button.disabled) return;
+            submittedOnce = true;
+            // Current ChatGPT (live Edge, 2026-08-28) exposes #composer-submit-button as the
+            // form's real `type=submit` control. `requestSubmit(button)` runs the browser's
+            // native form-submission algorithm and reaches React's onSubmit path; unlike a
+            // hand-built click event it does not depend on reconstructing whatever pointer
+            // gesture details the current button component happens to gate on. Keep the
+            // synthetic activation below only for older/non-form composer variants.
+            const form = button.form || (button.closest && button.closest('form'));
+            if (form && button.type === 'submit' && typeof form.requestSubmit === 'function') {
+              try {
+                form.requestSubmit(button);
+                return;
+              } catch {
+                // A stale/replaced submitter can make requestSubmit throw. The legacy gesture
+                // path below is still safe because acceptance is independently observed.
+              }
+            }
+            // Current ChatGPT's submit control is wired through the pointer/mouse activation
+            // sequence rather than a bare `HTMLElement.click()`. A real mouse activation is
+            // pointerdown -> mousedown -> pointerup -> mouseup -> click; omitting the mouse
+            // phases (or using click(), whose synthetic MouseEvent has detail=0) can leave a
+            // perfectly valid inserted draft untouched. Reproduce that complete sequence;
+            // acceptance is still proved only by page-owned consequences below, never by
+            // dispatchEvent() returning true.
+            const Pointer = typeof PointerEvent === 'function' ? PointerEvent : MouseEvent;
+            const pointer = (type, buttons) =>
+              new Pointer(type, {
+                bubbles: true,
+                cancelable: true,
+                button: 0,
+                buttons,
+                detail: 1,
+                ...(Pointer === PointerEvent ? { pointerType: 'mouse', isPrimary: true } : {})
+              });
+            const mouse = (type, buttons) =>
+              new MouseEvent(type, {
+                bubbles: true,
+                cancelable: true,
+                button: 0,
+                buttons,
+                detail: 1
+              });
+            button.dispatchEvent(pointer('pointerdown', 1));
+            button.dispatchEvent(mouse('mousedown', 1));
+            button.dispatchEvent(pointer('pointerup', 0));
+            button.dispatchEvent(mouse('mouseup', 0));
+            button.dispatchEvent(mouse('click', 0));
+            return;
+          }
+          // A fresh current composer can expose its editing host one React commit before it
+          // mounts #composer-submit-button. Do not mistake that short gap for the legacy
+          // keyboard-only composer: doing so consumes the one submit attempt before the real
+          // control exists. MutationObserver will retry as soon as the button mounts; only if
+          // no button appears after a short grace do we take the old Enter path.
+          if (legacyTimer !== null) return;
+          legacyTimer = setTimeout(() => {
+            legacyTimer = null;
+            if (done || submittedOnce) return;
+            if (document.querySelector(SEND)) {
+              check();
+              return;
+            }
+            submittedOnce = true;
+            const key = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
+            box.dispatchEvent(new KeyboardEvent('keydown', key));
+            box.dispatchEvent(new KeyboardEvent('keyup', key));
+            check();
+          }, 350);
+        };
         const check = () => {
-          if (accepted()) finish(true);
+          if (accepted()) return finish(true);
+          try {
+            submit();
+            if (accepted()) finish(true);
+          } catch {
+            finish(false);
+          }
         };
 
         observer = new MutationObserver(check);
@@ -1408,14 +1498,7 @@ var CLF_DOM = (() => {
         timer = setTimeout(() => finish(false), 3000);
 
         try {
-          const button = document.querySelector(SEND);
-          if (button && !button.disabled) {
-            button.click();
-          } else {
-            const key = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
-            box.dispatchEvent(new KeyboardEvent('keydown', key));
-            box.dispatchEvent(new KeyboardEvent('keyup', key));
-          }
+          submit();
           // Close the race where the acceptance mutation happens synchronously inside the
           // click/keyboard handler before MutationObserver gets its microtask callback.
           check();

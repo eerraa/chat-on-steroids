@@ -85,6 +85,12 @@ beforeEach(async () => {
     goal: { ...defaultConfig().goal, enabled: true, model: 'deepseek/deepseek-v4-flash', reasoning: 'default' }
   });
   await setSecret('openRouterApiKey', 'sk-or-test');
+  goal.setGoalModelParametersForTests('deepseek/deepseek-v4-flash', [
+    'response_format',
+    'structured_outputs',
+    'reasoning',
+    'reasoning_effort'
+  ]);
 });
 
 afterEach(() => {
@@ -291,7 +297,7 @@ describe('what leaves this machine', () => {
     expect(sent.body.messages[0].role).toBe('system');
     expect(sent.body.messages[0].content).toBe(customPrompt);
     expect(sent.body.messages[1]).toMatchObject({ role: 'system' });
-    expect(sent.body.messages[1].content).toContain('response schema');
+    expect(sent.body.messages[1].content).toContain('JSON object');
     expect(sent.body.messages.slice(2, -1)).toEqual([
       { role: 'user', content: 'build the parser' },
       { role: 'assistant', content: 'parser written, tests pending' }
@@ -465,6 +471,194 @@ describe('what leaves this machine', () => {
     goal.startGoalDraft({ sessionId: session.id, conversationId: 'c-goal-3', turnId: 'g-1' });
     await settled('c-goal-3');
     expect(body.reasoning).toEqual({ effort: 'high', exclude: true });
+  });
+
+  it('uses JSON object mode for MiniMax M3 free instead of requiring unsupported JSON-schema enforcement', async () => {
+    await saveConfig({
+      ...defaultConfig(),
+      goal: { ...defaultConfig().goal, enabled: true, model: 'minimax/minimax-m3:free', reasoning: 'default' }
+    });
+    goal.setGoalModelParametersForTests('minimax/minimax-m3:free', [
+      'reasoning',
+      'response_format',
+      'tools',
+      'tool_choice'
+    ]);
+    const session = await createSession({ title: 'minimax goal', conversationId: 'c-goal-minimax-m3' });
+    await appendEvent(session.id, {
+      time: 1_000,
+      source: 'extension',
+      kind: 'user_message',
+      message: { text: 'finish this task', truncated: false, chars: 16 }
+    });
+
+    let body: any = null;
+    globalThis.fetch = (async (_url: string, init: RequestInit) => {
+      body = JSON.parse(String(init.body));
+      return decision('stop');
+    }) as never;
+
+    goal.startGoalDraft({ sessionId: session.id, conversationId: 'c-goal-minimax-m3', turnId: 'g-minimax' });
+    const view = await settled('c-goal-minimax-m3');
+    expect(view.stage).toBe('no-reply');
+    expect(body.model).toBe('minimax/minimax-m3:free');
+    expect(body.response_format).toEqual({ type: 'json_object' });
+    expect(body.response_format).not.toHaveProperty('json_schema');
+    expect(body.plugins).toEqual([{ id: 'response-healing' }]);
+    expect(body.provider).toEqual({ require_parameters: true });
+    expect(body.reasoning).toEqual({ exclude: true });
+  });
+
+  it('accepts MiniMax M3 free falling back to the old NO_REPLY sentinel when JSON mode is ignored', async () => {
+    await saveConfig({
+      ...defaultConfig(),
+      goal: { ...defaultConfig().goal, enabled: true, model: 'minimax/minimax-m3:free', reasoning: 'default' }
+    });
+    goal.setGoalModelParametersForTests('minimax/minimax-m3:free', ['reasoning', 'response_format']);
+    const session = await createSession({ title: 'minimax sentinel goal', conversationId: 'c-goal-minimax-sentinel' });
+    await appendEvent(session.id, {
+      time: 1_000,
+      source: 'extension',
+      kind: 'user_message',
+      message: { text: 'reply exactly done', truncated: false, chars: 18 }
+    });
+    globalThis.fetch = (async () =>
+      Response.json({ choices: [{ message: { content: 'NO_REPLY' } }] })) as never;
+
+    goal.startGoalDraft({
+      sessionId: session.id,
+      conversationId: 'c-goal-minimax-sentinel',
+      turnId: 'g-minimax-sentinel'
+    });
+    const view = await settled('c-goal-minimax-sentinel');
+    expect(view.stage).toBe('no-reply');
+    expect(view.reply).toBe('');
+  });
+
+  it('accepts a safe plain continuation only for a non-schema Goal endpoint', async () => {
+    await saveConfig({
+      ...defaultConfig(),
+      goal: { ...defaultConfig().goal, enabled: true, model: 'minimax/minimax-m3:free', reasoning: 'default' }
+    });
+    goal.setGoalModelParametersForTests('minimax/minimax-m3:free', ['response_format']);
+    const session = await createSession({ title: 'minimax text goal', conversationId: 'c-goal-minimax-text' });
+    await appendEvent(session.id, {
+      time: 1_000,
+      source: 'extension',
+      kind: 'user_message',
+      message: { text: 'finish the tests', truncated: false, chars: 16 }
+    });
+    globalThis.fetch = (async () =>
+      Response.json({ choices: [{ message: { content: 'please run the remaining tests' } }] })) as never;
+
+    goal.startGoalDraft({
+      sessionId: session.id,
+      conversationId: 'c-goal-minimax-text',
+      turnId: 'g-minimax-text'
+    });
+    const view = await settled('c-goal-minimax-text');
+    expect(view.stage).toBe('ready');
+    expect(view.reply).toBe(goal.humanReply('please run the remaining tests'));
+  });
+
+  it('still rejects valid but wrong JSON from a non-schema Goal endpoint instead of typing it', async () => {
+    await saveConfig({
+      ...defaultConfig(),
+      goal: { ...defaultConfig().goal, enabled: true, model: 'minimax/minimax-m3:free', reasoning: 'default' }
+    });
+    goal.setGoalModelParametersForTests('minimax/minimax-m3:free', ['response_format']);
+    const session = await createSession({ title: 'minimax wrong json goal', conversationId: 'c-goal-minimax-wrong-json' });
+    await appendEvent(session.id, {
+      time: 1_000,
+      source: 'extension',
+      kind: 'user_message',
+      message: { text: 'finish', truncated: false, chars: 6 }
+    });
+    globalThis.fetch = (async () =>
+      Response.json({ choices: [{ message: { content: '{}' } }] })) as never;
+
+    goal.startGoalDraft({
+      sessionId: session.id,
+      conversationId: 'c-goal-minimax-wrong-json',
+      turnId: 'g-minimax-wrong-json'
+    });
+    const view = await settled('c-goal-minimax-wrong-json');
+    expect(view.stage).toBe('failed');
+    expect(view.error).toBe('invalid_goal_decision_schema');
+    expect(view.reply).toBe('');
+  });
+
+  it('derives the MiniMax request profile from OpenRouter endpoint metadata and caches it', async () => {
+    await saveConfig({
+      ...defaultConfig(),
+      goal: { ...defaultConfig().goal, enabled: true, model: 'minimax/minimax-m3:free', reasoning: 'default' }
+    });
+    const session = await createSession({ title: 'minimax metadata goal', conversationId: 'c-goal-minimax-metadata' });
+    await appendEvent(session.id, {
+      time: 1_000,
+      source: 'extension',
+      kind: 'user_message',
+      message: { text: 'finish this too', truncated: false, chars: 15 }
+    });
+
+    const urls: string[] = [];
+    let body: any = null;
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      urls.push(url);
+      if (url.includes('/models/')) {
+        expect(url).toContain('/models/minimax/minimax-m3%3Afree/endpoints');
+        return Response.json({
+          data: {
+            endpoints: [
+              {
+                provider_name: 'GMICloud',
+                supported_parameters: ['reasoning', 'response_format', 'tools', 'tool_choice']
+              }
+            ]
+          }
+        });
+      }
+      body = JSON.parse(String(init?.body));
+      return decision('stop');
+    }) as never;
+
+    goal.startGoalDraft({
+      sessionId: session.id,
+      conversationId: 'c-goal-minimax-metadata',
+      turnId: 'g-minimax-metadata'
+    });
+    const view = await settled('c-goal-minimax-metadata');
+    expect(view.stage).toBe('no-reply');
+    expect(urls.filter((url) => url.includes('/models/'))).toHaveLength(1);
+    expect(urls.at(-1)).toBe('https://openrouter.ai/api/v1/chat/completions');
+    expect(body.response_format).toEqual({ type: 'json_object' });
+    expect(body.reasoning).toEqual({ exclude: true });
+  });
+
+  it('does not require reasoning when the selected endpoint does not advertise it', async () => {
+    await saveConfig({
+      ...defaultConfig(),
+      goal: { ...defaultConfig().goal, enabled: true, model: 'provider/json-only', reasoning: 'high' }
+    });
+    goal.setGoalModelParametersForTests('provider/json-only', ['response_format']);
+    const session = await createSession({ title: 'json only goal', conversationId: 'c-goal-json-only' });
+    await appendEvent(session.id, {
+      time: 1_000,
+      source: 'extension',
+      kind: 'user_message',
+      message: { text: 'go', truncated: false, chars: 2 }
+    });
+
+    let body: any = null;
+    globalThis.fetch = (async (_url: string, init: RequestInit) => {
+      body = JSON.parse(String(init.body));
+      return decision('stop');
+    }) as never;
+
+    goal.startGoalDraft({ sessionId: session.id, conversationId: 'c-goal-json-only', turnId: 'g-json-only' });
+    await settled('c-goal-json-only');
+    expect(body.response_format).toEqual({ type: 'json_object' });
+    expect(body).not.toHaveProperty('reasoning');
   });
 });
 

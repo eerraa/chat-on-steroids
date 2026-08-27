@@ -755,7 +755,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               cwd: dir.real,
               displayCwd: dir.virtual,
               env: execChildEnvironment(),
-              tty: input.tty ?? DEFAULT_TTY
+              tty: input.tty ?? DEFAULT_TTY,
+              signal: currentCall()?.abortController?.signal
             });
             // Which chat may later write to this session id. Codex gets this for free from a
             // per-conversation manager; see codex/ownership.ts for why one is needed here.
@@ -823,6 +824,9 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               structuredContent: execCommandStructuredOutput(output)
             };
           } catch (error) {
+            if (error instanceof UnifiedExecError && error.kind === 'cancelled') {
+              return fail('exec_command stopped by the user');
+            }
             const detail = error instanceof UnifiedExecError ? error.debug() : friendlyError(error);
             return fail(`exec_command failed for \`${shlexJoin(command)}\`: ${detail}`);
           }
@@ -867,7 +871,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               input: input.chars ?? '',
               yieldTimeMs: input.yield_time_ms ?? DEFAULT_WRITE_STDIN_YIELD_TIME_MS,
               maxOutputTokens: input.max_output_tokens,
-              truncationPolicy: EXEC_OUTPUT_CEILING_POLICY
+              truncationPolicy: EXEC_OUTPUT_CEILING_POLICY,
+              signal: currentCall()?.abortController?.signal
             });
             if (output.processId === null) forgetExecOwner(input.session_id);
             noteExec({
@@ -883,6 +888,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               structuredContent: execCommandStructuredOutput(output)
             };
           } catch (error) {
+            if (error instanceof UnifiedExecError && error.kind === 'cancelled') forgetExecOwner(input.session_id);
             const message = error instanceof Error ? error.message : String(error);
             return fail(`write_stdin failed: ${message}`);
           }

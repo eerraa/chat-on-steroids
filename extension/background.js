@@ -603,6 +603,37 @@ function noteDelivery(result, count, conversationId) {
   };
 }
 
+/**
+ * Wakes every currently bound page for a conversation after the app accepted newer activity.
+ *
+ * `/activity` polling remains the missed-notification recovery path, but correctness must not
+ * wait for its 750ms/2s/10s/30s cadence. The app's successful `/events` response is the exact
+ * durability boundary at which a subsequent activity read can observe this batch, so notify
+ * only after that ACK. A tab validates its own concrete route before acting on the hint.
+ */
+async function notifyActivityDirty(value) {
+  const conversationId = cleanConversationId(value);
+  if (!conversationId) return 0;
+  const tabs = Object.entries(tabConversations)
+    .filter(([, owned]) => cleanConversationId(owned) === conversationId)
+    .map(([tab]) => Number(tab))
+    .filter((tab) => Number.isInteger(tab));
+  let delivered = 0;
+  await Promise.all(
+    tabs.map(async (tabId) => {
+      try {
+        await chrome.tabs.sendMessage(tabId, { type: 'clf-activity-dirty', conversationId });
+        delivered += 1;
+      } catch {
+        // A document can disappear between the app ACK and this best-effort wake. Its next
+        // page load/activity poll recovers from the durable recorder state; do not mutate the
+        // tab registry from a presentation notification failure.
+      }
+    })
+  );
+  return delivered;
+}
+
 /** Finds the next deliverable conversation and its first batch in one journal pass. */
 function nextJournalBatch(preferredConversationId = null) {
   const blocked = new Set();
@@ -669,6 +700,7 @@ async function drainOnce(preferredConversationId = null) {
       if (!retry.ok) break;
       const sent = new Set(half);
       journal = journal.filter((entry) => !sent.has(entry));
+      void notifyActivityDirty(conversationId);
       continue;
     }
     if (result.status === 413 && mine.length === 1) {
@@ -706,6 +738,7 @@ async function drainOnce(preferredConversationId = null) {
     }
     const sent = new Set(mine);
     journal = journal.filter((entry) => !sent.has(entry));
+    void notifyActivityDirty(conversationId);
   }
   await persistJournal();
   if (journal.length > 0) scheduleRetry();
@@ -1607,17 +1640,55 @@ function conversationFromUrl(value) {
   }
 }
 
-/** Project namespace for one concrete conversation URL, or null for an ordinary chat. */
+/**
+ * Project namespace proof for one concrete conversation URL.
+ *
+ * `undefined` means the sending document is not on a concrete conversation route yet, so it
+ * proves nothing about namespace ownership. `null` is deliberately stronger: the exact ordinary
+ * `/c/<id>` route proves this conversation is outside a Project. Keeping those states distinct is
+ * important for fresh Project chats, where Fiber can expose the final conversation id while the
+ * address bar is still on `/g/<project>/project`; treating that provisional route as ordinary would
+ * revoke the Project affinity which the bootstrap ACK just persisted for worker revival.
+ */
 function projectPathFromUrl(value, expectedConversationId) {
   try {
     const url = new URL(String(value || ''));
-    if (url.protocol !== 'https:' || (url.hostname !== 'chatgpt.com' && url.hostname !== 'chat.openai.com')) return null;
-    const match = /^\/g\/([^/]+)\/c\/([0-9a-f-]{8,64})(?:\/|$)/i.exec(url.pathname);
-    if (!match || match[2].toLowerCase() !== String(expectedConversationId || '').toLowerCase()) return null;
-    return `/g/${match[1]}`;
+    if (url.protocol !== 'https:' || (url.hostname !== 'chatgpt.com' && url.hostname !== 'chat.openai.com')) return undefined;
+    const expected = String(expectedConversationId || '').toLowerCase();
+    const project = /^\/g\/([^/]+)\/c\/([0-9a-f-]{8,64})(?:\/|$)/i.exec(url.pathname);
+    if (project && project[2].toLowerCase() === expected) return `/g/${project[1]}`;
+    const ordinary = /^\/c\/([0-9a-f-]{8,64})(?:\/|$)/i.exec(url.pathname);
+    if (ordinary && ordinary[1].toLowerCase() === expected) return null;
+    return undefined;
   } catch {
-    return null;
+    return undefined;
   }
+}
+
+/**
+ * Project namespace proof for the message's current tab.
+ *
+ * Chrome's MessageSender.url identifies the document that owns the content script. ChatGPT can
+ * keep that same document alive while history.replaceState/pushState advances a fresh Project
+ * composer from `/g/<project>/project` to `/g/<project>/c/<conversation>`. In that case the
+ * document URL is intentionally only "unknown" for the conversation, while chrome.tabs.get()
+ * exposes the address-bar route which can prove the namespace. Prefer that current tab fact and
+ * fall back to the sender snapshots only if tab state is unavailable.
+ */
+async function projectPathFromSender(sender, source, expectedConversationId) {
+  const id = source && Number.isInteger(source.tab) ? source.tab : null;
+  if (id !== null) {
+    try {
+      const tab = await chrome.tabs.get(id);
+      const current = projectPathFromUrl(tab && tab.url, expectedConversationId);
+      if (current !== undefined) return current;
+    } catch {
+      // The tab may be closing between authorization and this read. Sender evidence is still safe.
+    }
+  }
+  const tabSnapshot = projectPathFromUrl(sender && sender.tab && sender.tab.url, expectedConversationId);
+  if (tabSnapshot !== undefined) return tabSnapshot;
+  return projectPathFromUrl(sender && sender.url, expectedConversationId);
 }
 
 function isChatGptUrl(value) {
@@ -1885,12 +1956,28 @@ const HANDLERS = {
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
     const calls = Array.isArray(message.calls) ? message.calls : [];
     if (calls.length === 0) return { ok: false, error: 'bad_request_evidence' };
-    // Project affinity comes from Chrome's exact sending document and rides the same
+    // Project affinity comes from Chrome-owned tab/document evidence and rides the same
     // acknowledged identity handshake as request ownership.
-    const projectPath = projectPathFromUrl(sender && sender.url, conversationId);
+    const projectPath = await projectPathFromSender(sender, source, conversationId);
     const result = await call('/correlations', {
       method: 'POST',
       body: JSON.stringify({ conversationId, calls, projectPath })
+    });
+    return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
+  },
+  async turn_stop(message, _sender, source) {
+    await load();
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const conversationId = cleanConversationId(message.conversationId);
+    if (!conversationId) return { ok: false, error: 'bad_conversation_id' };
+    await noteTabConversation(source, conversationId);
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const requestIds = Array.isArray(message.requestIds)
+      ? message.requestIds.filter((value) => typeof value === 'string').slice(0, 200)
+      : [];
+    const result = await call('/turn-stop', {
+      method: 'POST',
+      body: JSON.stringify({ conversationId, requestIds })
     });
     return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
   },
@@ -2214,6 +2301,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'bind',
     'activity',
     'correlate',
+    'turn_stop',
     'closed',
     'compact',
     'auto_compact_claim',
@@ -2281,6 +2369,25 @@ function markerFromUrl(value) {
  * bridge lease itself and report `claimed:true` before the fallback is removed. Whichever page
  * wins that durable lease stays alive; a mere health reply can never kill the winner.
  */
+async function claimRevivalOnTab(tabId, conversation, commandId) {
+  try {
+    const alive = await chrome.tabs.sendMessage(tabId, { type: 'clf-recorder-ping' });
+    if (!alive || alive.ok !== true || alive.recorderVersion !== PAGE_RECORDER_VERSION) return false;
+  } catch {
+    return false;
+  }
+  try {
+    const reply = await chrome.tabs.sendMessage(tabId, {
+      type: 'clf-run-command',
+      id: commandId,
+      conversationId: conversation
+    });
+    return Boolean(reply && reply.ok === true && reply.claimed === true);
+  } catch {
+    return false;
+  }
+}
+
 async function reuseOpenChatTab(openedTabId, conversation, commandId) {
   await load();
   let tabs = [];
@@ -2303,27 +2410,10 @@ async function reuseOpenChatTab(openedTabId, conversation, commandId) {
     // defer custody gate will retry before either document is allowed to redeem/send.
   }
   for (const candidate of existing) {
-    try {
-      const alive = await chrome.tabs.sendMessage(candidate.id, { type: 'clf-recorder-ping' });
-      if (!alive || alive.ok !== true || alive.recorderVersion !== PAGE_RECORDER_VERSION) continue;
-    } catch {
-      // Two copies of one chat can survive an extension reload differently. A dead first match
-      // must not hide a healthy second one and force a third duplicate to remain open.
-      continue;
-    }
-    let reply = null;
-    try {
-      reply = await chrome.tabs.sendMessage(candidate.id, {
-        type: 'clf-run-command',
-        id: commandId,
-        conversationId: conversation
-      });
-    } catch {
-      // It died after the ping but before it could acquire the lease. Try another already-open
-      // copy; if none can claim, the app-opened fallback remains the ordinary delivery path.
-      continue;
-    }
-    if (!reply || reply.ok !== true || reply.claimed !== true) continue;
+    // Two copies of one chat can survive an extension reload differently. A dead first match
+    // must not hide a healthy second one and force a third duplicate to remain open. Likewise,
+    // only durable command ownership permits the app-opened fallback to disappear.
+    if (!(await claimRevivalOnTab(candidate.id, conversation, commandId))) continue;
 
     // This document now owns the command durably. The marked fallback can no longer redeem it,
     // so removing that tab cannot destroy the only owner or cause duplicate user-message sends.
@@ -2376,7 +2466,22 @@ function maybeReuseRevivalTab(tabId, url) {
   if (!conversation || !commandId) return false;
   if (revivalReuseAttempted.get(tabId) === commandId) return false;
   revivalReuseAttempted.set(tabId, commandId);
-  void reuseOpenChatTab(tabId, conversation, commandId).catch(() => undefined);
+  void (async () => {
+    await load();
+    // Edge is allowed to satisfy shell.openExternal() by navigating the already-open worker tab
+    // instead of creating a separate fallback tab. For a same-document SPA URL update the page's
+    // startup marker was read before `?clf=` existed, so waiting for that page to discover the
+    // marker strands the bridge at leased/owner=null forever. The durable tab registry proves
+    // this numeric tab already owned the exact conversation before the marked URL arrived; hand
+    // the command directly to that live recorder. If this is instead a real replacement document
+    // and its recorder is not ready yet, the normal marked-page startup path still owns recovery.
+    const alreadyOwnedConversation = cleanConversationId(tabConversations[String(tabId)]) === conversation;
+    if (alreadyOwnedConversation && (await claimRevivalOnTab(tabId, conversation, commandId))) {
+      await clearRevivalPreference(commandId).catch(() => undefined);
+      return;
+    }
+    await reuseOpenChatTab(tabId, conversation, commandId);
+  })().catch(() => undefined);
   return true;
 }
 
