@@ -109,6 +109,8 @@
    * Never change a turn's layout inside that burst; let the viewport settle first.
    */
   const PRESENTATION_SCROLL_IDLE_MS = 240;
+  /** Fractional layout/scroll metrics can leave an exact visual bottom a sub-pixel away. */
+  const PRESENTATION_BOTTOM_EPSILON_PX = 2;
   const STATUS_MS = 15_000;
   /** Longer than any honest tool call: past this a silent turn is called stalled. */
   const STALL_MS = 10 * 60 * 1000;
@@ -2060,21 +2062,33 @@
    * ChatGPT mounts Stop before CoS necessarily opens/binds its local generation. If a settled
    * sibling overwrite is still active in that microtask, waiting for the 1s observer tick (or
    * any /activity pull) leaves the first live native bytes hidden underneath it. A known genNode
-   * lets us release only that exact turn; before the bind exists, ambiguity fails closed by
-   * releasing every currently replaced assistant turn. Historical replacements re-qualify on
-   * the next ordinary render once exact live ownership is known.
+   * lets us release only that exact turn. Before the bind exists, a Stop control alone proves
+   * only that *some* response is live, not which historical section React may reuse. Release
+   * only replaced assistant sections that this same native mutation batch actually touched;
+   * unrelated settled history has no reason to flash native merely because generation began.
    */
-  function releaseLivePresentationToNative() {
+  function releaseLivePresentationToNative(touchedSections = null) {
     const exact = generating ? generationTurn() : null;
     if (exact) {
       releaseTurnPresentationToNative(exact);
       return;
     }
+    // Before exact lifecycle ownership exists, a touched historical section is only a
+    // candidate. Virtualization produces exactly those mutations while the user scrolls.
+    // Freeze that ambiguous presentation change with the rest of the gesture; observe() will
+    // bind/release the real live section on the next settled pass if it genuinely was reused.
+    if (presentationScrollActive()) return;
+    if (!touchedSections || touchedSections.size === 0) return;
     const turns = typeof CLF_DOM.presentationTurns === 'function' ? CLF_DOM.presentationTurns() : CLF_DOM.turns();
     for (const turn of turns) {
       if (!turn || turn.role !== 'assistant') continue;
       const nodes = turn.nodes || (turn.node ? [turn.node] : []);
-      if (!nodes.some((node) => node && node.getAttribute && node.getAttribute('data-clf-turn-replaced') === '1')) continue;
+      if (!nodes.some((node) =>
+        node &&
+        touchedSections.has(node) &&
+        node.getAttribute &&
+        node.getAttribute('data-clf-turn-replaced') === '1'
+      )) continue;
       releaseTurnPresentationToNative(turn);
     }
   }
@@ -2127,6 +2141,26 @@
     if (pending.length > 0) transcriptMutationHandler(pending);
   }
 
+  /**
+   * Runs one synchronous CoS-owned mutation of ChatGPT's native transcript without letting the
+   * transcript observer reinterpret that mutation as new ChatGPT-authored presentation state.
+   *
+   * Flush first so a genuine page mutation that was already queued keeps its revision. JavaScript
+   * cannot interleave another browser task inside the synchronous callback, so records drained
+   * afterwards are exactly the DOM writes this callback caused. This is provenance, not a timer:
+   * the observer remains live before and after the mutation and page-authored work is never muted.
+   */
+  function mutateOwnNativePresentation(action) {
+    flushPendingTranscriptMutations();
+    try {
+      return action();
+    } finally {
+      if (transcriptObserver && typeof transcriptObserver.takeRecords === 'function') {
+        transcriptObserver.takeRecords();
+      }
+    }
+  }
+
   function watchTranscript() {
     if (typeof MutationObserver !== 'function' || !document.body) return;
     let timer = null;
@@ -2137,13 +2171,13 @@
       // Presentation authority changes on the page edge itself, not when our slower lifecycle
       // observer catches up. Track the transition so a genuinely stale Stop left behind after a
       // Fiber-proven finish does not repeatedly revoke settled historical reconstruction.
+      const touchedSections = transcriptMutationSections(records);
       const pageGeneratingNow = Boolean(CLF_DOM.generating());
       const pageStartedGenerating = pageGeneratingNow && !pageWasGenerating;
       pageWasGenerating = pageGeneratingNow;
-      if (pageStartedGenerating || (generating && pageGeneratingNow)) {
-        releaseLivePresentationToNative();
+      if (pageGeneratingNow && (pageStartedGenerating || generating || touchedSections.size > 0)) {
+        releaseLivePresentationToNative(touchedSections);
       }
-      const touchedSections = transcriptMutationSections(records);
       if (touchedSections.size > 0) {
         nativePresentationClock += 1;
         for (const section of touchedSections) {
@@ -3819,7 +3853,7 @@
     painted = false;
   }
 
-  function paint() {
+  function paintNativeRows() {
     // Presentation, all of it. applyLabel and applyPageLabel overwrite ChatGPT's own tool
     // name, add this app's classes, title and block styling — so they belong behind the
     // same user-controlled switch as the stream renderer, not merely alongside it. A
@@ -3891,6 +3925,11 @@
         if (block.dataset.clfPage) painted = true;
       });
     }
+  }
+
+  /** Relabel native rows without feeding those CoS-authored DOM writes back into freshness. */
+  function paint() {
+    return mutateOwnNativePresentation(paintNativeRows);
   }
 
   /** Keeps the newest recorded calls and forgets the rest, feed and index together. */
@@ -4728,12 +4767,51 @@
       }
       return best;
     };
-    return pick('user') || pick(null);
+    const best = pick('user') || pick(null);
+    if (!best) return null;
+    let viewportRoot = best.scrollRoot;
+    if (!viewportRoot) {
+      try {
+        const pageRoot = document.scrollingElement;
+        if (pageRoot && pageRoot.scrollHeight > pageRoot.clientHeight + 1) viewportRoot = pageRoot;
+      } catch {
+        viewportRoot = null;
+      }
+    }
+    let bottomPinned = false;
+    if (viewportRoot) {
+      try {
+        const gap = Number(viewportRoot.scrollHeight) - Number(viewportRoot.scrollTop) - Number(viewportRoot.clientHeight);
+        bottomPinned = Number.isFinite(gap) && gap <= PRESENTATION_BOTTOM_EPSILON_PX;
+      } catch {
+        bottomPinned = false;
+      }
+    }
+    return { ...best, viewportRoot, bottomPinned };
   }
 
-  /** Counteracts only the layout delta caused synchronously by this presentation pass. */
+  /**
+   * Restores the user's presentation intent after one synchronous Overwrite pass.
+   *
+   * Bottom pinning is semantic: if the reader was genuinely at the end before CoS changed
+   * transcript height, the new end wins over preserving an arbitrary visible element. Historical
+   * readers keep the older element-anchor rule instead. Active scrolling never reaches here.
+   */
   function restorePresentationViewport(anchor) {
     if (!anchor || !anchor.node || !anchor.node.isConnected || typeof anchor.node.getBoundingClientRect !== 'function') return;
+    if (anchor.bottomPinned) {
+      try {
+        let root = anchor.viewportRoot;
+        if (!root || !root.isConnected) root = presentationScrollContainer(anchor.node) || document.scrollingElement;
+        if (root) {
+          const bottom = Number(root.scrollHeight) - Number(root.clientHeight);
+          if (Number.isFinite(bottom)) root.scrollTop = Math.max(0, bottom);
+          return;
+        }
+      } catch {
+        // Fall through to element anchoring if the scroll root disappeared mid-render.
+      }
+    }
     let after;
     try {
       after = Number(anchor.node.getBoundingClientRect().top);
@@ -4751,7 +4829,8 @@
     }
   }
 
-  function renderStreams() {
+  function renderStreams(options = null) {
+    const batched = Boolean(options && options.batched === true);
     // Do not mount chat A's durable stream into a fresh-composer DOM while its future chat B
     // still has no route id (or after the route changed before observe() processed it).
     // Keeping the existing DOM untouched also preserves the harmless transient-null case.
@@ -4766,9 +4845,14 @@
     // height underneath browser scroll anchoring and is the source of the live up/down jump.
     // Existing synthetic roots are frozen for the same reason: Fiber can fill in while the
     // gesture is active, but presentation waits until the reader has stopped moving.
-    if (enabled && presentationScrollActive()) return;
-    const sourceTurns = typeof CLF_DOM.presentationTurns === 'function' ? CLF_DOM.presentationTurns() : CLF_DOM.turns();
-    const viewportAnchor = presentationViewportAnchor(sourceTurns);
+    if (!batched && enabled && presentationScrollActive()) return;
+    const sourceTurns =
+      batched && options && Array.isArray(options.sourceTurns)
+        ? options.sourceTurns
+        : typeof CLF_DOM.presentationTurns === 'function'
+          ? CLF_DOM.presentationTurns()
+          : CLF_DOM.turns();
+    const viewportAnchor = batched ? null : presentationViewportAnchor(sourceTurns);
     // A stable `data-turn-id` is not required for presentation. ChatGPT transiently and, in
     // some renderer builds, permanently exposes assistant sections without one. The preceding
     // user message id is a stronger durable boundary anyway, so an id-less response with an
@@ -5001,6 +5085,26 @@
         streamRootsByKey.delete(key);
       }
     }
+    if (!batched) restorePresentationViewport(viewportAnchor);
+  }
+
+  /**
+   * One atomic transcript-presentation pass.
+   *
+   * `paint()` changes native tool-row layout, `renderStreams()` swaps native/synthetic turn
+   * ownership, and `foldBootstrap()` can collapse a screenful of the opening user message.
+   * Treating only the middle operation as "presentation" sampled bottom intent too late and
+   * restored it too early. Capture once before any of the three, freeze all three during an
+   * active user scroll gesture, then restore bottom/history intent after the complete batch.
+   */
+  function renderPresentation(foldOpening = false) {
+    if (conversationId && CLF_DOM.conversationId() !== conversationId) return;
+    if (presentationScrollActive()) return;
+    const sourceTurns = typeof CLF_DOM.presentationTurns === 'function' ? CLF_DOM.presentationTurns() : CLF_DOM.turns();
+    const viewportAnchor = presentationViewportAnchor(sourceTurns);
+    paint();
+    renderStreams({ batched: true, sourceTurns });
+    if (foldOpening) foldBootstrap();
     restorePresentationViewport(viewportAnchor);
   }
 
@@ -5217,9 +5321,7 @@
       // Checked again: refreshFiber() talks to the page context, so the tab can move
       // between the check above and the painting below.
       if (!current()) return;
-      paint();
-      renderStreams();
-      foldBootstrap();
+      renderPresentation(true);
       renderControl();
       injectStage();
     } finally {
@@ -7947,7 +8049,7 @@
         disconnected: reply.disconnected === true
       };
     }
-    renderStreams();
+    renderPresentation(false);
     renderControl();
   }
 
@@ -8271,6 +8373,58 @@
     });
   }
 
+  /**
+   * Waits for React to publish exactly the bootstrap text that insertPrompt already requested.
+   *
+   * `execCommand('insertText')` is synchronous only at the editing-host boundary. Current
+   * ChatGPT can reconcile that mutation into the isolated-world DOM on a later browser task,
+   * so one `Promise.resolve()` is not a meaningful readiness deadline. Do not issue a second
+   * insertion while the first may still land: that can duplicate the bootstrap. Observe the
+   * exact whole draft instead, fail immediately if foreign/user text appears, and keep the only
+   * timer as a bounded failure deadline rather than as the protocol.
+   */
+  function waitForBootstrapDraft(expected, stillOnTarget, timeoutMs = 3000) {
+    const squeeze = (value) => (value || '').replace(/\s+/g, '');
+    const wanted = squeeze(expected);
+    return new Promise((resolve) => {
+      let timer = null;
+      let observer = null;
+      let done = false;
+      const finish = (state) => {
+        if (done) return;
+        done = true;
+        if (timer !== null) clearTimeout(timer);
+        if (observer) observer.disconnect();
+        resolve(state);
+      };
+      const check = () => {
+        if (!stillOnTarget()) return finish('retargeted');
+        const composer = CLF_DOM.composer();
+        if (!composer || !composer.isConnected) return;
+        const raw = composer.textContent || '';
+        if (squeeze(raw) === wanted) return finish('ready');
+        if (raw.trim() !== '') return finish('changed');
+      };
+      observer = new MutationObserver(check);
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true
+      });
+      check();
+      // The edit request itself may publish on the very next microtask. Arm the wall-clock
+      // deadline only after that turn rather than racing a legitimate immediate reconciliation
+      // with the timeout implementation (and keep the MutationObserver live throughout).
+      void Promise.resolve().then(() => {
+        if (done) return;
+        check();
+        if (done) return;
+        timer = setTimeout(() => finish('timeout'), timeoutMs);
+      });
+    });
+  }
+
   async function runCommand(id = markerId(), fromUrl = true, onClaim = null, options = {}) {
     // Once per command rather than once per document. A worker's tab is opened by a bootstrap
     // and then lives on, and the prime waking that worker later is a second command for the
@@ -8453,15 +8607,6 @@
     if (await failIfRetargeted()) return;
 
     const insertedImmediately = CLF_DOM.insertPrompt(boot.text);
-    // Give synchronous React/input work one microtask turn to replace the editing host, then
-    // re-prove the exact draft before the irreversible send. This used to sleep for 100 ms.
-    // Long-hidden Chrome tabs throttle wall-clock timers, so that tiny "stability" delay became
-    // a foreground dependency: the wake could own the durable bridge lease and have its text in
-    // the exact worker composer, yet never reach Send until the user reopened the tab. A
-    // microtask preserves the hydration guard without putting delivery behind tab visibility.
-    await Promise.resolve();
-    if (await failIfRetargeted()) return;
-    let composer = CLF_DOM.composer();
     // Compared with whitespace squeezed out of both sides. The composer is a rich-text
     // editor: a blank line in the bootstrap becomes a paragraph break, and `textContent`
     // stitches the paragraphs back together with no separator at all. Compare the entire
@@ -8469,25 +8614,32 @@
     // approve user text appended after focus moved into this tab.
     const squeeze = (value) => (value || '').replace(/\s+/g, '');
     const expectedText = squeeze(boot.text);
-    // `execCommand('insertText')` can publish the editable DOM one React microtask after the
-    // isolated-world call returns. Do not terminally fail just because insertPrompt's immediate
-    // DOM read missed that publication: the exact whole-draft comparison below is the stronger
-    // proof and will still reject a real insertion failure or any user-text mixture.
-    if (!insertedImmediately) {
-      composer = CLF_DOM.composer();
-      if (!composer || squeeze(composer.textContent) !== expectedText) {
-        return void (await fail('ChatGPT refused the inserted text'));
-      }
+    const draftState = await waitForBootstrapDraft(boot.text, stillOnTarget);
+    if (draftState === 'retargeted') {
+      return void (
+        await fail(
+          target
+            ? 'the chat this message was for changed before it was sent; nothing was sent'
+            : 'the marked fresh chat changed before bootstrap send; nothing was sent'
+        )
+      );
     }
+    if (draftState === 'changed') {
+      return void (await fail('the composer changed while inserting the bootstrap; the draft was preserved'));
+    }
+    if (draftState !== 'ready') {
+      return void (
+        await fail(
+          insertedImmediately
+            ? 'ChatGPT replaced the composer while inserting the bootstrap'
+            : 'ChatGPT refused the inserted text'
+        )
+      );
+    }
+    if (await failIfRetargeted()) return;
+    let composer = CLF_DOM.composer();
     if (!composer || squeeze(composer.textContent) !== expectedText) {
-      if (composer && !(composer.textContent || '').trim() && CLF_DOM.insertPrompt(boot.text)) {
-        await Promise.resolve();
-        if (await failIfRetargeted()) return;
-        composer = CLF_DOM.composer();
-      }
-      if (!composer || squeeze(composer.textContent) !== expectedText) {
-        return void (await fail('ChatGPT replaced the composer while inserting the bootstrap'));
-      }
+      return void (await fail('the composer changed before bootstrap send; the draft was preserved'));
     }
     // The browser opener can focus this fresh tab while the user is typing elsewhere. The
     // point-in-time empty check above is not enough: any edit after insertion must preserve
@@ -8684,8 +8836,7 @@
       }
       if (!changed) return;
       renderPreferenceReady = true;
-      paint();
-      renderStreams();
+      renderPresentation(false);
     };
     chrome.storage.onChanged.addListener(storageChanged);
     if (typeof chrome.storage.onChanged.removeListener === 'function') {
@@ -8733,8 +8884,7 @@
       if (message.type === 'clf-render-stream') {
         RENDER_STREAM = message.enabled !== false;
         renderPreferenceReady = true;
-        paint();
-        renderStreams();
+        renderPresentation(false);
         sendResponse({ ok: true, enabled: RENDER_STREAM });
         return false;
       }
@@ -8767,8 +8917,7 @@
         }
         void pullActivity()
           .then(() => {
-            paint();
-            renderStreams();
+            renderPresentation(false);
             sendResponse({ ok: true, enabled: true });
           })
           .catch((err) => sendResponse({ ok: false, error: String(err && err.message ? err.message : err) }));
@@ -8852,9 +9001,7 @@
     // Relabelling on the observe tick as well as the activity tick: the calls are
     // already known here, and ChatGPT rendering a block a second after we heard about
     // its call used to mean waiting for the next poll to see the real label.
-    paint();
-    renderStreams();
-    foldBootstrap();
+    renderPresentation(true);
   });
   scheduleActivityPull(ACTIVITY_MS);
   if (typeof document !== 'undefined' && document.addEventListener) {
@@ -8942,6 +9089,7 @@
       meterView,
       paint,
       renderStreams,
+      renderPresentation,
       foldBootstrap,
       injectControl,
       injectStage,

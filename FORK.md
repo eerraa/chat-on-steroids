@@ -69,12 +69,14 @@ then differ from the prime; in the live reproduction the worker opened in Chrome
 the `agents` tool that was available to the Edge prime.
 
 This fork records whether the request-correlation handshake came from Microsoft Edge or Google
-Chrome using the loopback request's browser User-Agent. New workers inherit that browser family
-from the prime, and the worker's successful bootstrap ACK durably attaches the same family to its
-conversation for later revivals. On Windows the launcher then targets the matching executable
-family instead of silently crossing from Edge to Chrome. The launcher still passes only the URL;
-whether an already-running browser presents it as a tab or has to create a new window remains the
-browser's own process/window behavior rather than an agent UI action.
+Chrome using the loopback request's browser User-Agent. When that paired Chromium profile is still
+present, the extension service worker now finds the exact prime conversation tab and creates each
+fresh worker in that same browser window with `chrome.tabs.create({ active: false, windowId, url })`.
+That keeps the worker inside the same Edge/Chrome profile without activating the browser, changing
+the user's selected tab, or depending on Windows mouse/focus state. The worker's successful
+bootstrap ACK still durably attaches the browser family to its conversation for later revivals.
+If the paired browser is genuinely absent, the app falls back to launching the recorded browser
+family rather than silently crossing from Edge to Chrome.
 
 ### Current ChatGPT composer compatibility
 

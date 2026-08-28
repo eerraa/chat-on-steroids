@@ -1397,65 +1397,72 @@ var CLF_DOM = (() => {
           if (legacyTimer !== null) clearTimeout(legacyTimer);
           resolve(value);
         };
+        const activateButton = (button) => {
+          const Pointer = typeof PointerEvent === 'function' ? PointerEvent : MouseEvent;
+          const pointer = (type, buttons) =>
+            new Pointer(type, {
+              bubbles: true,
+              cancelable: true,
+              button: 0,
+              buttons,
+              detail: 1,
+              ...(Pointer === PointerEvent ? { pointerType: 'mouse', isPrimary: true } : {})
+            });
+          const mouse = (type, buttons) =>
+            new MouseEvent(type, {
+              bubbles: true,
+              cancelable: true,
+              button: 0,
+              buttons,
+              detail: 1
+            });
+          button.dispatchEvent(pointer('pointerdown', 1));
+          button.dispatchEvent(mouse('mousedown', 1));
+          button.dispatchEvent(pointer('pointerup', 0));
+          button.dispatchEvent(mouse('mouseup', 0));
+          button.dispatchEvent(mouse('click', 0));
+        };
+        const submitControlReady = (button, current) =>
+          Boolean(
+            button &&
+              current &&
+              button.isConnected &&
+              current.isConnected &&
+              !button.disabled &&
+              button.getAttribute('aria-disabled') !== 'true' &&
+              current.getAttribute('aria-disabled') !== 'true' &&
+              current.getAttribute('contenteditable') !== 'false' &&
+              !generating() &&
+              !stopButton()
+          );
         const submit = () => {
           if (done || submittedOnce) return;
           const button = document.querySelector(SEND);
           if (button) {
             // React can reconcile the inserted rich-text draft one render after the editing
-            // host already exposes it. During that gap ChatGPT keeps its real submit button
-            // mounted but disabled. Treating "disabled" as "button absent" and firing a
-            // synthetic Enter loses the only submit attempt; the button becomes enabled a
-            // moment later and the untouched draft then times out. The observer below already
-            // watches attributes, so leave the attempt pending until that exact control is
-            // usable, then click it once.
-            if (button.disabled) return;
-            submittedOnce = true;
-            // Current ChatGPT (live Edge, 2026-08-28) exposes #composer-submit-button as the
-            // form's real `type=submit` control. `requestSubmit(button)` runs the browser's
-            // native form-submission algorithm and reaches React's onSubmit path; unlike a
-            // hand-built click event it does not depend on reconstructing whatever pointer
-            // gesture details the current button component happens to gate on. Keep the
-            // synthetic activation below only for older/non-form composer variants.
-            const form = button.form || (button.closest && button.closest('form'));
-            if (form && button.type === 'submit' && typeof form.requestSubmit === 'function') {
-              try {
-                form.requestSubmit(button);
-                return;
-              } catch {
-                // A stale/replaced submitter can make requestSubmit throw. The legacy gesture
-                // path below is still safe because acceptance is independently observed.
-              }
-            }
+            // host already exposes it. During that gap current ChatGPT has used both the native
+            // `disabled` property and `aria-disabled=true` on the mounted submit control/editor.
+            // Either means React has not accepted the draft as submit-ready yet. Consuming the
+            // one activation in that state strands the draft in a background worker tab. The
+            // observer below already watches attributes, so keep the attempt pending until the
+            // exact current control and editor are genuinely usable, then activate it once.
             // Current ChatGPT's submit control is wired through the pointer/mouse activation
-            // sequence rather than a bare `HTMLElement.click()`. A real mouse activation is
+            // sequence rather than a bare form submission. In particular, `requestSubmit()` can
+            // synchronously dispatch a real submit event while ChatGPT still declines to create a
+            // user message, leaving the draft untouched. That event is therefore not an
+            // irreversible acceptance boundary and cannot be used as the one allowed attempt.
+            // Drive the same control the user would press instead. A real mouse activation is
             // pointerdown -> mousedown -> pointerup -> mouseup -> click; omitting the mouse
             // phases (or using click(), whose synthetic MouseEvent has detail=0) can leave a
             // perfectly valid inserted draft untouched. Reproduce that complete sequence;
             // acceptance is still proved only by page-owned consequences below, never by
             // dispatchEvent() returning true.
-            const Pointer = typeof PointerEvent === 'function' ? PointerEvent : MouseEvent;
-            const pointer = (type, buttons) =>
-              new Pointer(type, {
-                bubbles: true,
-                cancelable: true,
-                button: 0,
-                buttons,
-                detail: 1,
-                ...(Pointer === PointerEvent ? { pointerType: 'mouse', isPrimary: true } : {})
-              });
-            const mouse = (type, buttons) =>
-              new MouseEvent(type, {
-                bubbles: true,
-                cancelable: true,
-                button: 0,
-                buttons,
-                detail: 1
-              });
-            button.dispatchEvent(pointer('pointerdown', 1));
-            button.dispatchEvent(mouse('mousedown', 1));
-            button.dispatchEvent(pointer('pointerup', 0));
-            button.dispatchEvent(mouse('mouseup', 0));
-            button.dispatchEvent(mouse('click', 0));
+            const current = composer();
+            if (!current || compact(current.textContent) !== expected) return finish(false);
+            const currentButton = document.querySelector(SEND);
+            if (!currentButton || !submitControlReady(currentButton, current)) return;
+            submittedOnce = true;
+            activateButton(currentButton);
             return;
           }
           // A fresh current composer can expose its editing host one React commit before it
@@ -1495,7 +1502,11 @@ var CLF_DOM = (() => {
           characterData: true,
           attributes: true
         });
-        timer = setTimeout(() => finish(false), 3000);
+        // This is only a bounded failure deadline; readiness itself is mutation-driven. A fresh
+        // inactive Chromium tab can take several seconds to finish composer hydration even though
+        // its DOM and extension scripts are already live, so do not turn normal background
+        // scheduling into a false terminal send failure.
+        timer = setTimeout(() => finish(false), 12_000);
 
         try {
           submit();

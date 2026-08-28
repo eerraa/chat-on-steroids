@@ -47,5 +47,11 @@ export function extensionDownloadUrl(version = APP_VERSION): string {
  *     `disconnected`, protected routes distinguish that revocation from a stale token, and
  *     /pair accepts `reconnect: true` only for an explicit browser-side reconnect. An older
  *     extension would otherwise silently undo the user's app-side Disconnect on its next 401.
+ * 9 — fresh worker tabs can be opened by the paired Chromium extension itself, inside the
+ *     exact browser profile/window that owns the prime conversation and with `active:false`.
+ *     `/commands/open` offers only inert marker metadata, `/commands/open/claim` durably leases
+ *     that one browser-open attempt, and the page still has to redeem/ACK the command normally.
+ *     An older extension does not know those routes, so letting it appear protocol-compatible
+ *     would strand worker commands that the app deliberately no longer foreground-opens.
  */
-export const BRIDGE_PROTOCOL = 8;
+export const BRIDGE_PROTOCOL = 9;

@@ -224,7 +224,21 @@ function wake(items: ReadonlyArray<{ to: string; text: string }>): void {
 }
 
 async function waitForOpened(count = 1): Promise<void> {
-  await vi.waitFor(() => expect(opened).toHaveLength(count));
+  await vi.waitFor(async () => {
+    if (opened.length >= count) return;
+    // Paired current Chromium profiles open fresh workers through the service-worker placement
+    // route rather than the native browser launcher. Model only that browser-owned placement
+    // here; page redemption below remains the same protocol all of these tests exercise.
+    if (token) {
+      const offered = await request('GET', '/commands/open');
+      const command = offered.status === 200 ? offered.body.command : null;
+      if (command) {
+        const claimed = await request('POST', '/commands/open/claim', { body: { id: command.id } });
+        if (claimed.status === 200 && claimed.body.command?.url) opened.push(claimed.body.command.url);
+      }
+    }
+    expect(opened).toHaveLength(count);
+  });
 }
 
 /**
@@ -236,7 +250,7 @@ async function waitForOpened(count = 1): Promise<void> {
 async function redeem(id?: string, client = 'tab-1'): Promise<any> {
   if (!id) {
     const index = anonymousRedeemIndex++;
-    await vi.waitFor(() => expect(opened.length).toBeGreaterThan(index));
+    await waitForOpened(index + 1);
     id = new URL(opened[index]!).searchParams.get('clf')!;
   }
   const reply = await request('POST', '/commands/redeem', { body: { id, client } });
@@ -730,10 +744,12 @@ describe('activity feed', () => {
     await waitForOpened(1);
 
     expect(new URL(opened[0]!).pathname).toBe(`${projectPath}/project`);
-    expect(openedBrowsers).toEqual(['edge']);
+    // The paired Edge extension owns placement now, so the native browser-family launcher is
+    // deliberately not involved while that browser is present.
+    expect(openedBrowsers).toEqual([]);
   });
 
-  it('opens a normal-chat worker in the same browser family as its prime', async () => {
+  it('keeps a normal-chat worker in the paired prime browser without invoking the native launcher', async () => {
     await pair();
     const conversationId = '20202020-4242-6464-8686-989898989898';
     const openedBrowsers: Array<string | null> = [];
@@ -754,7 +770,7 @@ describe('activity feed', () => {
     await waitForOpened(1);
 
     expect(new URL(opened[0]!).pathname).toBe('/');
-    expect(openedBrowsers).toEqual(['edge']);
+    expect(openedBrowsers).toEqual([]);
   });
 
   it('restores Project affinity before replaying a worker still owed after bridge restart', async () => {
@@ -2023,7 +2039,9 @@ describe('delivering a bootstrap', () => {
     await waitForOpened(2);
 
     expect(new URL(opened[1]!).pathname).toBe(`${projectPath}/c/${conversationId}`);
-    expect(openedBrowsers).toEqual(['edge', 'edge']);
+    // Fresh placement was browser-owned; revival still uses the exact recorded browser family
+    // as its native fallback trigger and the extension may hand that marker back to the live tab.
+    expect(openedBrowsers).toEqual(['edge']);
   });
 
   it('keeps an unredeemed revival durable while the exact worker chat is still busy', async () => {
@@ -3282,6 +3300,43 @@ describe('delivering a bootstrap', () => {
  * had stopped expecting.
  */
 describe('targeted open', () => {
+  it('lets the paired extension claim a fresh worker for the prime browser instead of native-opening it', async () => {
+    await pair();
+    // Any authenticated extension request establishes current browser presence. Worker spawn
+    // must then leave placement to that exact Chromium profile rather than invoking msedge.exe.
+    expect((await request('GET', '/status')).status).toBe(200);
+    setBrowserOpener(async (url) => {
+      opened.push(url);
+    });
+
+    const created = spawn({ workers: [{ task: 'background worker open' }], caller: { conversationId: PRIME_CHAT } });
+    expect(created.created).toHaveLength(1);
+    await vi.waitFor(() => expect(pendingCommands()).toHaveLength(1));
+    expect(opened).toEqual([]);
+
+    const offered = await request('GET', '/commands/open');
+    expect(offered.status).toBe(200);
+    expect(offered.body.command).toMatchObject({
+      id: expect.any(String),
+      openerConversationId: PRIME_CHAT
+    });
+    expect(offered.body.command.url).toBe(commandUrl(offered.body.command.id));
+    expect(offered.body.command).not.toHaveProperty('text');
+
+    const claimed = await request('POST', '/commands/open/claim', {
+      body: { id: offered.body.command.id }
+    });
+    expect(claimed.status).toBe(200);
+    expect(claimed.body.command).toEqual(offered.body.command);
+    expect(opened).toEqual([]);
+
+    // The browser-open lease is exclusive. A second service-worker wake cannot create a second
+    // inactive tab while the first page is still loading/redeeming the same marker.
+    const afterClaim = await request('GET', '/commands/open');
+    expect(afterClaim.status).toBe(200);
+    expect(afterClaim.body.command).toBeNull();
+  });
+
   it('opens the fresh chat the instant a resume is queued, with no tab and no timer involved', async () => {
     setBrowserOpener(async (url) => {
       opened.push(url);

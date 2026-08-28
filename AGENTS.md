@@ -559,7 +559,10 @@ A second loopback HTTP service on the first free port of **8765–8769**. The ex
 it with `/hello`, silently provisions a bearer token with `/pair`, then uses authenticated
 routes: `/status`, `/events`, `/closed`, `/activity`, `/compact/claim-auto`, `/compact`,
 `/goal/draft`, `/goal/ack`, `/goal/objective`, `/goal/open`, `/settings` (GET and POST),
-`/commands/redeem`, `/commands/ack`. `/settings` is the only pair the page may write, and
+`/commands/open`, `/commands/open/claim`, `/commands/redeem`, `/commands/ack`. The two
+`/commands/open*` routes are service-worker placement only: they expose an inert marker URL plus
+the exact prime conversation/window anchor, never bootstrap text or local capabilities. `/settings`
+is the only pair the page may write, and
 its GET exists for the one composer with no conversation to read `/activity` for: a New Chat.
 
 **Must hold.** The token never enters the ChatGPT page — the service worker holds it in
@@ -605,8 +608,10 @@ Experimental, enabled on fresh installs while existing configs preserve their st
 `worker ← prime → worker`. Workers never message each other.
 
 **Identity.** The prime is the conversation that successfully called `agents action=spawn`
-with proven caller identity. Worker slots are opened by the app through browser bootstrap;
-once the page has a real conversation id the extension reports it and the broker binds that
+with proven caller identity. While that paired Chromium profile is present, fresh worker tabs are
+created by its extension service worker with `active:false` in the exact window containing the
+prime conversation; the app's recorded browser-family launcher is only the browser-absent fallback.
+Once the page has a real conversation id the extension reports it and the broker binds that
 exact conversation before normal worker work proceeds. **Conversation identity is the
 routing credential** — established from the same evidence as recorder attribution — so no
 secret token rides in model arguments and **sender identity never comes from a model

@@ -24,7 +24,7 @@ const PORTS = [8765, 8766, 8767, 8768, 8769];
 const HELLO_TIMEOUT_MS = 1200;
 const REQUEST_TIMEOUT_MS = 10_000;
 /** Bumped only when the request/response shape changes; the app compares it. */
-const BRIDGE_PROTOCOL = 8;
+const BRIDGE_PROTOCOL = 9;
 
 /**
  * Journal caps. The byte figure is what actually matters — chrome.storage.session has a
@@ -139,6 +139,12 @@ let closing = false;
  */
 let commandAckOutbox = [];
 let ackingCommands = false;
+/** One browser-owned fresh-worker open check at a time, with a trailing wake coalesced. */
+let browserWorkerOpenWork = null;
+let browserWorkerOpenTimer = null;
+let browserWorkerOpenAgain = false;
+let browserWorkerOpenLastAt = 0;
+const BROWSER_WORKER_OPEN_MIN_MS = 750;
 
 /**
  * Which ChatGPT conversation each browser tab currently represents.
@@ -965,6 +971,113 @@ async function call(path, init = {}, retried = false) {
   }
 }
 
+/** Exact ChatGPT tab for one conversation inside this extension's own Chromium profile. */
+async function tabForConversation(conversationId) {
+  const wanted = cleanConversationId(conversationId);
+  if (!wanted) return null;
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+  } catch {
+    return null;
+  }
+  for (const tab of tabs) {
+    if (!tab || typeof tab.id !== 'number' || typeof tab.windowId !== 'number') continue;
+    if (conversationForTab(tab) === wanted) return tab;
+  }
+  return null;
+}
+
+function validBrowserWorkerOpen(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = typeof raw.id === 'string' ? raw.id : '';
+  const url = typeof raw.url === 'string' ? raw.url : '';
+  const openerConversationId = cleanConversationId(raw.openerConversationId);
+  if (!id || !url || !openerConversationId || !isChatGptUrl(url) || markerFromUrl(url) !== id) return null;
+  return { id, url, openerConversationId };
+}
+
+/**
+ * Opens at most one fresh worker as an inactive tab beside its exact prime.
+ *
+ * The offer is deliberately inert. Only after this service worker proves that the prime's
+ * conversation is open in this exact Edge/Chrome profile and learns its concrete windowId does
+ * it ask the app to durably claim the browser-open attempt. That ordering prevents an extension
+ * in the wrong profile/window from consuming the command, and `active:false` keeps OS/browser
+ * focus completely out of worker startup.
+ */
+async function openBrowserWorkerOnce() {
+  const offered = await call('/commands/open');
+  if (!offered.ok) return false;
+  const offer = validBrowserWorkerOpen(offered.data && offered.data.command);
+  if (!offer) return false;
+
+  const primeTab = await tabForConversation(offer.openerConversationId);
+  if (!primeTab) return false;
+
+  const claimed = await call('/commands/open/claim', {
+    method: 'POST',
+    body: JSON.stringify({ id: offer.id })
+  });
+  if (!claimed.ok) return false;
+  const command = validBrowserWorkerOpen(claimed.data && claimed.data.command);
+  if (!command || command.id !== offer.id || command.openerConversationId !== offer.openerConversationId) return false;
+
+  // Re-prove the window after the durable claim. The user can close/move the prime tab while the
+  // bridge write is in flight; opening into the stale numeric window would violate the affinity
+  // guarantee more severely than failing this worker attempt.
+  const currentPrime = await tabForConversation(command.openerConversationId);
+  if (!currentPrime || currentPrime.windowId !== primeTab.windowId) {
+    await ackCommand(
+      command.id,
+      'failed',
+      'the prime ChatGPT tab changed windows while the worker tab was being opened',
+      null,
+      null,
+      null,
+      null
+    );
+    return false;
+  }
+
+  try {
+    await chrome.tabs.create({
+      url: command.url,
+      windowId: currentPrime.windowId,
+      active: false
+    });
+    return true;
+  } catch {
+    await ackCommand(
+      command.id,
+      'failed',
+      'the paired browser could not create an inactive worker tab in the prime window',
+      null,
+      null,
+      null,
+      null
+    );
+    return false;
+  }
+}
+
+function scheduleBrowserWorkerOpen() {
+  browserWorkerOpenAgain = true;
+  if (browserWorkerOpenWork || browserWorkerOpenTimer !== null) return;
+  const delay = Math.max(0, BROWSER_WORKER_OPEN_MIN_MS - (Date.now() - browserWorkerOpenLastAt));
+  browserWorkerOpenTimer = setTimeout(() => {
+    browserWorkerOpenTimer = null;
+    browserWorkerOpenAgain = false;
+    browserWorkerOpenLastAt = Date.now();
+    const work = openBrowserWorkerOnce();
+    browserWorkerOpenWork = work;
+    void work.finally(() => {
+      if (browserWorkerOpenWork === work) browserWorkerOpenWork = null;
+      if (browserWorkerOpenAgain) scheduleBrowserWorkerOpen();
+    });
+  }, delay);
+}
+
 /**
  * Gets this browser a bearer token, with nothing for the user to type.
  *
@@ -1137,7 +1250,13 @@ async function drainCommandAcks(targetId = null) {
       scheduleRetry();
       break;
     }
-    if (changed) await persistLive();
+    if (changed) {
+      await persistLive();
+      // A committed worker ACK can make the next fresh worker command deliverable. Wake the
+      // browser-owned opener from this service-worker transition rather than waiting for a
+      // foreground/content-script timer to happen to poll again.
+      scheduleBrowserWorkerOpen();
+    }
     if (commandAckOutbox.length > 0) scheduleRetry();
     else clearRetryIfIdle();
     if (targetResult) return { ...targetResult, pending: commandAckOutbox.length };
@@ -2290,6 +2409,19 @@ const HANDLERS = {
   }
 };
 
+// These are the browser-side edges that naturally occur around a worker spawn/ACK even while the
+// prime tab is hidden. Coalesce them into the browser-owned opener instead of tying worker startup
+// to visibility/focus or to the popup being open.
+const BROWSER_WORKER_OPEN_WAKE_TYPES = new Set([
+  'register_document',
+  'status',
+  'events',
+  'bind',
+  'activity',
+  'correlate',
+  'ack'
+]);
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const handler = message && typeof message.type === 'string' ? HANDLERS[message.type] : null;
   if (!handler) {
@@ -2328,8 +2460,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   };
   const id = tabId(sender);
   const operation = owned.has(message.type) || message.type === 'register_document' ? serializeTab(id, run) : run();
-  operation.then(sendResponse, (err) =>
-    sendResponse({ ok: false, error: String(err && err.message ? err.message : err) })
+  operation.then(
+    (result) => {
+      sendResponse(result);
+      if (BROWSER_WORKER_OPEN_WAKE_TYPES.has(message.type)) scheduleBrowserWorkerOpen();
+    },
+    (err) => sendResponse({ ok: false, error: String(err && err.message ? err.message : err) })
   );
   return true;
 });
@@ -2795,7 +2931,10 @@ async function restoreOpenChatgptTabs() {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  void restoreOpenChatgptTabs().then(() => recoverDeferredRevivals()).catch(() => undefined);
+  void restoreOpenChatgptTabs()
+    .then(() => recoverDeferredRevivals())
+    .then(() => scheduleBrowserWorkerOpen())
+    .catch(() => undefined);
   void load().then(() => {
     if (journal.length > 0 || closeOutbox.length > 0 || commandAckOutbox.length > 0) scheduleRetry();
   });
@@ -2808,6 +2947,7 @@ if (chrome.runtime.onStartup && typeof chrome.runtime.onStartup.addListener === 
       .then(() => drain())
       .then(() => drainCloses())
       .then(() => recoverDeferredRevivals())
+      .then(() => scheduleBrowserWorkerOpen())
       .catch(() => undefined);
   });
 }
@@ -2818,6 +2958,7 @@ if (chrome.alarms && chrome.alarms.onAlarm && typeof chrome.alarms.onAlarm.addLi
     void drainCommandAcks()
       .then(() => drain())
       .then(() => drainCloses())
+      .then(() => scheduleBrowserWorkerOpen())
       .catch(() => undefined);
   });
 }
@@ -2826,7 +2967,11 @@ if (chrome.alarms && chrome.alarms.onAlarm && typeof chrome.alarms.onAlarm.addLi
 // development/reload paths. The service worker itself *must* start, though. Ping first, so
 // ordinary worker wake-ups are one cheap message per ChatGPT tab and inject nothing; only a
 // dead or stale recorder pays the scripting cost.
-void restoreOpenChatgptTabs().then(() => recoverDeferredRevivals()).catch(() => undefined);
+void restoreOpenChatgptTabs()
+  .then(() => recoverDeferredRevivals())
+  .then(() => scheduleBrowserWorkerOpen())
+  .catch(() => undefined);
 void load().then(() => {
   if (journal.length > 0 || closeOutbox.length > 0 || commandAckOutbox.length > 0) scheduleRetry();
+  scheduleBrowserWorkerOpen();
 });

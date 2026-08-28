@@ -116,6 +116,7 @@ interface Hook {
   meterView(): { filled: number; level: string; status: string; tip: string } | null;
   paint(): void;
   renderStreams(): void;
+  renderPresentation(foldOpening?: boolean): void;
   foldBootstrap(): void;
   injectControl(): void;
   injectStage(): void;
@@ -2649,7 +2650,7 @@ describe('the app-owned chronological stream', () => {
     expect(native.textContent).toBe('The first live bytes are already visible.');
   });
 
-  it('releases an existing overwrite in the same mutation turn that ChatGPT starts generating', async () => {
+  it('releases an existing overwrite as soon as a reused section publishes live bytes before lifecycle binding', async () => {
     const activity = () => ({
       ok: true,
       data: {
@@ -2692,14 +2693,16 @@ describe('the app-owned chronological stream', () => {
     expect(root).toBeTruthy();
     expect(section.getAttribute('data-clf-turn-replaced')).toBe('1');
 
-    // Stop mounts outside the transcript before the lifecycle observer necessarily opens/binds
-    // the next local generation. Native ownership must be restored from that page fact in the
-    // MutationObserver microtask, not on the next 1s render tick or /activity poll.
+    // Stop alone says only that some response is live. The first page-authored bytes inside this
+    // already-replaced section are the fact that makes this exact native turn current, and they
+    // must become visible in the same MutationObserver delivery rather than on a later render tick.
     startGenerating(live.document);
+    native.textContent = 'The first live bytes are already visible.';
     await settle();
 
     expect(section.getAttribute('data-clf-turn-replaced')).toBeNull();
     expect(root?.getAttribute('data-clf-stream-inactive')).toBe('1');
+    expect(native.textContent).toBe('The first live bytes are already visible.');
   });
 
   it('does not revoke a historical overwrite when generation starts before the new assistant section mounts', async () => {
@@ -2742,8 +2745,12 @@ describe('the app-owned chronological stream', () => {
 
     // ChatGPT publishes STOP globally before React mounts the next assistant section. The old
     // section is still the DOM-newest assistant, but it is not the section generationTurn()
-    // owns. Native-live authority must therefore not tear down this historical replacement.
+    // owns. The observer must not flash all settled history native in the gap before observe()
+    // has enough evidence to bind the live section.
     startGenerating(live.document);
+    await settle();
+    expect(old.getAttribute('data-clf-turn-replaced')).toBe('1');
+    expect(oldRoot?.getAttribute('data-clf-stream-inactive')).toBeNull();
     live.hook.observe();
     await settle();
     live.hook.renderStreams();
@@ -3191,6 +3198,174 @@ describe('the app-owned chronological stream', () => {
     live.hook.renderStreams();
     expect(section.getAttribute('data-clf-turn-replaced')).toBe('1');
     expect(overwriteText(section)).toContain(label);
+  });
+
+  it('does not treat its own native tool-row repaint as a newer ChatGPT presentation revision', async () => {
+    const localTurn = 'g-paint-provenance';
+    const requestId = 'wfr-paint-provenance';
+    const recorded = call({
+      seq: 42,
+      turnId: localTurn,
+      callId: 'call-paint-provenance',
+      requestId,
+      summary: { kind: 'read', tone: 'neutral', title: 'Read painted.ts' }
+    });
+    const activity = () => ({
+      ok: true,
+      data: {
+        entries: [recorded],
+        stream: [
+          { seq: 40, time: 100, kind: 'turn_start', turnId: localTurn, agent: null },
+          {
+            seq: 42,
+            time: 120,
+            kind: 'tool_call',
+            turnId: localTurn,
+            agent: null,
+            tool: recorded.tool,
+            callId: recorded.callId,
+            requestId,
+            outcome: recorded.outcome,
+            durationMs: recorded.durationMs,
+            summary: recorded.summary
+          },
+          {
+            seq: 43,
+            time: 140,
+            kind: 'assistant_message',
+            turnId: localTurn,
+            messageId: 'site-paint-provenance',
+            text: 'Settled answer',
+            renderedHtml: '<p>Settled answer</p>',
+            state: 'final',
+            final: true
+          }
+        ],
+        job: null
+      }
+    });
+    live = await harness(undefined, { activity });
+    renderingOn();
+    const section = assistantTurn(live.document, 'page-paint-provenance', ['Called tool!']);
+    const native = live.document.createElement('div');
+    native.className = 'markdown';
+    native.textContent = 'Settled answer';
+    section.append(native);
+    await bindFiberTurns([{ section, turn: {
+      turnId: 'page-paint-provenance',
+      endMessageId: 'site-paint-provenance',
+      calls: [{ messageId: 'fiber-paint-provenance', tool: 'read_file', order: 0, answered: true, requestId }],
+      messages: [{
+        messageId: 'site-paint-provenance',
+        rawMessageId: 'site-paint-provenance',
+        stable: true,
+        rawText: 'Settled answer',
+        renderedHtml: '<p>Settled answer</p>'
+      }]
+    } }]);
+    await live.hook.pullActivity();
+    const root = overwriteStream(section);
+    expect(root).toBeTruthy();
+    expect(section.getAttribute('data-clf-turn-replaced')).toBe('1');
+    expect(labels(section)[0]).toContain('Read painted.ts');
+
+    // MutationObserver delivery happens after pullActivity's synchronous paint/render pair.
+    // If the observer mistakes CoS's own native-row relabel for ChatGPT-authored freshness,
+    // this next render drops the already-current synthetic surface to native for one pass.
+    await settle();
+    live.hook.renderStreams();
+
+    expect(section.getAttribute('data-clf-turn-replaced')).toBe('1');
+    expect(root?.getAttribute('data-clf-stream-inactive')).toBeNull();
+  });
+
+  it('preserves a queued genuine native mutation while keeping unrelated historical ownership stable', async () => {
+    const activity = () => ({
+      ok: true,
+      data: {
+        entries: [],
+        stream: [
+          {
+            seq: 60,
+            time: 100,
+            kind: 'assistant_message',
+            turnId: null,
+            messageId: 'site-provenance-scope-one',
+            text: 'First settled historical answer',
+            renderedHtml: '',
+            state: 'final',
+            final: true
+          },
+          {
+            seq: 61,
+            time: 120,
+            kind: 'assistant_message',
+            turnId: null,
+            messageId: 'site-provenance-scope-two',
+            text: 'Second settled historical answer',
+            renderedHtml: '',
+            state: 'final',
+            final: true
+          }
+        ],
+        job: null
+      }
+    });
+    live = await harness(undefined, { activity });
+    renderingOn();
+    const first = assistantTurn(live.document, 'page-provenance-scope-one', []);
+    const firstNative = live.document.createElement('div');
+    firstNative.className = 'markdown';
+    firstNative.textContent = 'First settled historical answer';
+    first.append(firstNative);
+    const second = assistantTurn(live.document, 'page-provenance-scope-two', []);
+    const secondNative = live.document.createElement('div');
+    secondNative.className = 'markdown';
+    secondNative.textContent = 'Second settled historical answer';
+    second.append(secondNative);
+    await bindFiberTurns([
+      { section: first, turn: {
+        turnId: 'page-provenance-scope-one',
+        endMessageId: 'site-provenance-scope-one',
+        messages: [{
+          messageId: 'site-provenance-scope-one',
+          rawMessageId: 'site-provenance-scope-one',
+          stable: true,
+          rawText: 'First settled historical answer',
+          renderedHtml: ''
+        }]
+      } },
+      { section: second, turn: {
+        turnId: 'page-provenance-scope-two',
+        endMessageId: 'site-provenance-scope-two',
+        messages: [{
+          messageId: 'site-provenance-scope-two',
+          rawMessageId: 'site-provenance-scope-two',
+          stable: true,
+          rawText: 'Second settled historical answer',
+          renderedHtml: ''
+        }]
+      } }
+    ]);
+    await live.hook.pullActivity();
+    live.hook.renderStreams();
+    const firstRoot = overwriteStream(first);
+    const secondRoot = overwriteStream(second);
+    expect(first.getAttribute('data-clf-turn-replaced')).toBe('1');
+    expect(second.getAttribute('data-clf-turn-replaced')).toBe('1');
+
+    // Both mutations are queued for the transcript observer. Calling paint synchronously before
+    // its microtask forces mutateOwnNativePresentation() to flush the real page mutation first.
+    // Only the section that actually changed may lose synthetic ownership; paint's own writes
+    // are discarded afterwards and must not flap the untouched historical turn.
+    startGenerating(live.document);
+    firstNative.textContent = 'The first live bytes of a reused response are visible now.';
+    live.hook.paint();
+
+    expect(first.getAttribute('data-clf-turn-replaced')).toBeNull();
+    expect(firstRoot?.getAttribute('data-clf-stream-inactive')).toBe('1');
+    expect(second.getAttribute('data-clf-turn-replaced')).toBe('1');
+    expect(secondRoot?.getAttribute('data-clf-stream-inactive')).toBeNull();
   });
 
   it('keeps a settled turn app-owned and renders its final assistant message from the app feed', async () => {
@@ -4042,6 +4217,185 @@ describe('the app-owned chronological stream', () => {
 
     expect(historical.getAttribute('data-clf-turn-replaced')).toBe('1');
     expect(thread.scrollTop).toBe(380);
+  });
+
+  it('keeps a genuinely bottom-pinned viewport at the new bottom when Overwrite grows below its visible anchor', async () => {
+    live = await harness(undefined, { activity });
+    renderingOn();
+    const visibleUser = userTurn(live.document, 'bottom-pin-anchor', 'Keep following the newest response');
+    const response = assistantTurn(live.document, turnId, []);
+    await bindFiberRequest(response, 'wfr-app-stream');
+    const thread = live.document.querySelector('#thread') as HTMLElement;
+    thread.style.overflowY = 'auto';
+    Object.defineProperty(thread, 'scrollHeight', {
+      configurable: true,
+      get: () => response.hasAttribute('data-clf-turn-replaced') ? 2200 : 2000
+    });
+    Object.defineProperty(thread, 'clientHeight', { configurable: true, value: 600 });
+    thread.scrollTop = 1400;
+    Object.defineProperty(visibleUser, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({
+        top: 100,
+        bottom: 140,
+        left: 0,
+        right: 600,
+        width: 600,
+        height: 40,
+        x: 0,
+        y: 100,
+        toJSON: () => ({})
+      })
+    });
+
+    live.hook.renderStreams();
+
+    expect(response.getAttribute('data-clf-turn-replaced')).toBe('1');
+    expect(thread.scrollTop).toBe(1600);
+    expect(thread.scrollTop + thread.clientHeight).toBe(thread.scrollHeight);
+  });
+
+  it('keeps bottom intent across the whole paint -> stream presentation batch', async () => {
+    const localTurn = 'g-bottom-paint-batch';
+    const requestId = 'wfr-bottom-paint-batch';
+    const recorded = call({
+      seq: 55,
+      turnId: localTurn,
+      callId: 'call-bottom-paint-batch',
+      requestId,
+      summary: { kind: 'read', tone: 'neutral', title: 'Read bottom-batch.ts' }
+    });
+    live = await harness();
+    renderingOn();
+    const visibleUser = userTurn(live.document, 'bottom-paint-anchor', 'Keep me at the latest response');
+    const response = assistantTurn(live.document, 'page-bottom-paint-batch', ['Called tool!']);
+    await bindFiberTurns([{ section: response, turn: {
+      turnId: 'page-bottom-paint-batch',
+      calls: [{ messageId: 'fiber-bottom-paint-batch', tool: 'read_file', order: 0, answered: true, requestId }]
+    } }]);
+    live.reply.set('activity', () => ({
+      ok: true,
+      data: {
+        entries: [recorded],
+        stream: [
+          { seq: 54, time: 100, kind: 'turn_start', turnId: localTurn, agent: null },
+          {
+            seq: 55,
+            time: 120,
+            kind: 'tool_call',
+            turnId: localTurn,
+            agent: null,
+            tool: recorded.tool,
+            callId: recorded.callId,
+            requestId,
+            outcome: recorded.outcome,
+            durationMs: recorded.durationMs,
+            summary: recorded.summary
+          }
+        ],
+        job: null
+      }
+    }));
+    const thread = live.document.querySelector('#thread') as HTMLElement;
+    thread.style.overflowY = 'auto';
+    Object.defineProperty(thread, 'scrollHeight', {
+      configurable: true,
+      get: () => labels(response)[0]?.includes('Read bottom-batch.ts') ? 2200 : 2000
+    });
+    Object.defineProperty(thread, 'clientHeight', { configurable: true, value: 600 });
+    thread.scrollTop = 1400;
+    Object.defineProperty(visibleUser, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({
+        top: 100,
+        bottom: 140,
+        left: 0,
+        right: 600,
+        width: 600,
+        height: 40,
+        x: 0,
+        y: 100,
+        toJSON: () => ({})
+      })
+    });
+
+    await live.hook.pullActivity();
+
+    expect(labels(response)[0]).toContain('Read bottom-batch.ts');
+    expect(thread.scrollTop).toBe(1600);
+    expect(thread.scrollTop + thread.clientHeight).toBe(thread.scrollHeight);
+  });
+
+  it('keeps document-scroller bottom pinning when there is no nested transcript scroll root', async () => {
+    live = await harness(undefined, { activity });
+    renderingOn();
+    const visibleUser = userTurn(live.document, 'document-bottom-anchor', 'Follow the newest response');
+    const response = assistantTurn(live.document, turnId, []);
+    await bindFiberRequest(response, 'wfr-app-stream');
+    const pageRoot = live.document.documentElement as HTMLElement;
+    Object.defineProperty(live.document, 'scrollingElement', { configurable: true, value: pageRoot });
+    Object.defineProperty(pageRoot, 'scrollHeight', {
+      configurable: true,
+      get: () => response.hasAttribute('data-clf-turn-replaced') ? 2200 : 2000
+    });
+    Object.defineProperty(pageRoot, 'clientHeight', { configurable: true, value: 600 });
+    pageRoot.scrollTop = 1400;
+    Object.defineProperty(visibleUser, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({
+        top: 100,
+        bottom: 140,
+        left: 0,
+        right: 600,
+        width: 600,
+        height: 40,
+        x: 0,
+        y: 100,
+        toJSON: () => ({})
+      })
+    });
+
+    live.hook.renderStreams();
+
+    expect(pageRoot.scrollTop).toBe(1600);
+    expect(pageRoot.scrollTop + pageRoot.clientHeight).toBe(pageRoot.scrollHeight);
+  });
+
+  it('gives bottom pinning precedence over a nonzero element-anchor delta', async () => {
+    live = await harness(undefined, { activity });
+    renderingOn();
+    const visibleUser = userTurn(live.document, 'bottom-precedence-anchor', 'Stay on the newest response');
+    const response = assistantTurn(live.document, turnId, []);
+    await bindFiberRequest(response, 'wfr-app-stream');
+    const thread = live.document.querySelector('#thread') as HTMLElement;
+    thread.style.overflowY = 'auto';
+    Object.defineProperty(thread, 'scrollHeight', {
+      configurable: true,
+      get: () => response.hasAttribute('data-clf-turn-replaced') ? 2200 : 2000
+    });
+    Object.defineProperty(thread, 'clientHeight', { configurable: true, value: 600 });
+    thread.scrollTop = 1400;
+    Object.defineProperty(visibleUser, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => {
+        const top = response.hasAttribute('data-clf-turn-replaced') ? 40 : 100;
+        return {
+          top,
+          bottom: top + 40,
+          left: 0,
+          right: 600,
+          width: 600,
+          height: 40,
+          x: 0,
+          y: top,
+          toJSON: () => ({})
+        };
+      }
+    });
+
+    live.hook.renderStreams();
+
+    expect(thread.scrollTop).toBe(1600);
   });
 });
 
@@ -7932,6 +8286,24 @@ describe('folding away the chat’s opening instruction', () => {
     expect(section.querySelectorAll('.clf-boot')).toHaveLength(1);
   });
 
+  it('freezes bootstrap refolding with the rest of presentation during an active scroll gesture', async () => {
+    live = await harness();
+    renderingOn();
+    const section = await opened('worker', 'You are worker agent worker-1. Your task is a long instruction.');
+    const message = section.querySelector('[data-message-id]') as HTMLElement;
+    message.replaceChildren(live.document.createElement('div'));
+    message.firstElementChild!.textContent = 'You are worker agent worker-1. Your task is a long instruction.';
+    expect(section.querySelector('.clf-boot')).toBeNull();
+
+    live.window.dispatchEvent(new live.window.Event('wheel'));
+    live.hook.renderPresentation(true);
+    expect(section.querySelector('.clf-boot')).toBeNull();
+
+    live.advance(live.hook.PRESENTATION_SCROLL_IDLE_MS + 1);
+    live.hook.renderPresentation(true);
+    expect(section.querySelector('.clf-boot')).not.toBeNull();
+  });
+
   it('is not fooled by a chat whose first message is the assistant’s', async () => {
     live = await harness();
     assistantTurn(live.document, 'turn-0', []);
@@ -8334,11 +8706,16 @@ describe('the fresh chat the app opened', () => {
         send.type = 'submit';
         send.setAttribute('aria-label', '프롬프트 보내기');
         const form = send.form!;
-        const requestSubmit = (submitter?: HTMLElement | null) => {
-          expect(submitter).toBe(send);
+        Object.defineProperty(form, 'requestSubmit', {
+          configurable: true,
+          value: () => {
+            throw new Error('current composer submit must activate the button, not requestSubmit the form');
+          }
+        });
+        send.addEventListener('click', (event) => {
+          event.preventDefault();
           dom.reconfigure({ url: 'https://chatgpt.com/g/g-p-project/c/33333333-4444-5555-6666-777777777777' });
-        };
-        Object.defineProperty(form, 'requestSubmit', { configurable: true, value: requestSubmit });
+        });
       }
     );
 
@@ -8349,6 +8726,61 @@ describe('the fresh chat the app opened', () => {
         id: 'cmd-current-submit',
         status: 'sent',
         conversationId: '33333333-4444-5555-6666-777777777777',
+        agent: 'worker-1'
+      })
+    ]);
+  });
+
+  it('never treats requestSubmit as the current ChatGPT submit action', async () => {
+    let requestSubmits = 0;
+    let clicks = 0;
+    live = await harness(
+      'https://chatgpt.com/g/g-p-project/project?clf=cmd-request-submit-noop',
+      {
+        redeem: () => ({
+          ok: true,
+          command: {
+            id: 'cmd-request-submit-noop',
+            type: 'worker',
+            text: 'Verify the current submit control is activated directly.',
+            agent: 'worker-1'
+          }
+        }),
+        ack: () => ({ ok: true })
+      },
+      (document, dom) => {
+        const send = document.querySelector('[data-testid="send-button"]') as HTMLButtonElement;
+        send.removeAttribute('data-testid');
+        send.id = 'composer-submit-button';
+        send.type = 'submit';
+        send.setAttribute('aria-label', '프롬프트 보내기');
+        const form = send.form!;
+        Object.defineProperty(form, 'requestSubmit', {
+          configurable: true,
+          value: () => {
+            requestSubmits++;
+            // If production calls this, it has taken the exact live path that left the worker
+            // draft sitting in the composer despite a synchronous form submit event.
+          }
+        });
+        send.addEventListener('click', (event) => {
+          event.preventDefault();
+          clicks++;
+          document.querySelector('#prompt-textarea')!.textContent = '';
+          dom.reconfigure({ url: 'https://chatgpt.com/g/g-p-project/c/34343434-4545-5656-6767-787878787878' });
+        });
+      }
+    );
+
+    await settle(400);
+
+    expect(requestSubmits).toBe(0);
+    expect(clicks).toBe(1);
+    expect(live.sent.filter((message) => message.type === 'ack')).toEqual([
+      expect.objectContaining({
+        id: 'cmd-request-submit-noop',
+        status: 'sent',
+        conversationId: '34343434-4545-5656-6767-787878787878',
         agent: 'worker-1'
       })
     ]);
@@ -8399,6 +8831,56 @@ describe('the fresh chat the app opened', () => {
     ]);
   });
 
+  it('waits for a bootstrap draft that React publishes on a later task instead of failing after one microtask', async () => {
+    live = await harness(
+      'https://chatgpt.com/g/g-p-project/project?clf=cmd-late-task-insert',
+      {
+        redeem: () => ({
+          ok: true,
+          command: {
+            id: 'cmd-late-task-insert',
+            type: 'worker',
+            text: 'Verify the later-task Project composer insertion.',
+            agent: 'worker-1'
+          }
+        }),
+        ack: () => ({ ok: true })
+      },
+      (document, dom) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          document.querySelector('#prompt-textarea')!.textContent = '';
+          dom.reconfigure({ url: 'https://chatgpt.com/g/g-p-project/c/36363636-4747-5858-6969-808080808080' });
+        });
+      },
+      (document, dom) => {
+        const composer = document.querySelector('#prompt-textarea') as HTMLElement;
+        // Keep content.js's bounded waits real enough for this case to model a later browser task.
+        dom.window.setTimeout = ((fn: () => void, ms?: number) =>
+          globalThis.setTimeout(fn, Math.min(Number(ms) || 0, 25))) as unknown as typeof dom.window.setTimeout;
+        document.execCommand = ((command: string, showUi?: boolean, value?: string) => {
+          void showUi;
+          if (command !== 'insertText') return false;
+          globalThis.setTimeout(() => {
+            composer.textContent = String(value || '');
+          }, 5);
+          return false;
+        }) as typeof document.execCommand;
+      }
+    );
+
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 60));
+    await settle(100);
+
+    expect(live.sent.filter((message) => message.type === 'ack')).toEqual([
+      expect.objectContaining({
+        id: 'cmd-late-task-insert',
+        status: 'sent',
+        conversationId: '36363636-4747-5858-6969-808080808080',
+        agent: 'worker-1'
+      })
+    ]);
+  });
+
   it('waits for the current submit button to become enabled after the inserted draft is reconciled', async () => {
     live = await harness();
     const domApi = (live.window as any).CLF_DOM;
@@ -8428,6 +8910,39 @@ describe('the fresh chat the app opened', () => {
       globalThis.setTimeout(fn, Math.min(Number(ms) || 0, 25))) as unknown as typeof live.window.setTimeout;
     const accepted = domApi.send();
     send.disabled = false;
+
+    await expect(accepted).resolves.toBe(true);
+    expect(clicks).toBe(1);
+    expect(syntheticEnters).toBe(0);
+  });
+
+  it('does not consume the worker submit while ChatGPT only marks the mounted control aria-disabled', async () => {
+    live = await harness();
+    const domApi = (live.window as any).CLF_DOM;
+    const composer = live.document.querySelector('#prompt-textarea') as HTMLElement;
+    const send = live.document.querySelector('[data-testid="send-button"]') as HTMLButtonElement;
+    send.removeAttribute('data-testid');
+    send.id = 'composer-submit-button';
+    send.setAttribute('aria-label', '프롬프트 보내기');
+    send.setAttribute('aria-disabled', 'true');
+
+    let clicks = 0;
+    let syntheticEnters = 0;
+    send.addEventListener('click', () => {
+      clicks++;
+      composer.textContent = '';
+    });
+    composer.addEventListener('keydown', (event) => {
+      if ((event as KeyboardEvent).key === 'Enter') syntheticEnters++;
+    });
+
+    expect(domApi.insertPrompt('Background worker waits for aria readiness')).toBe(true);
+    live.window.setTimeout = ((fn: () => void, ms?: number) =>
+      globalThis.setTimeout(fn, Math.min(Number(ms) || 0, 25))) as unknown as typeof live.window.setTimeout;
+    const accepted = domApi.send();
+
+    expect(clicks).toBe(0);
+    send.setAttribute('aria-disabled', 'false');
 
     await expect(accepted).resolves.toBe(true);
     expect(clicks).toBe(1);

@@ -447,7 +447,14 @@ function noteBrowserSeen(): boolean {
   if (browserPresenceTimer) clearTimeout(browserPresenceTimer);
   browserPresenceTimer = setTimeout(() => {
     browserPresenceTimer = null;
-    if (!browserPresent()) changed();
+    if (!browserPresent()) {
+      changed();
+      // A fresh worker may have deliberately stayed unleased while the paired extension was
+      // expected to open it inactive in the prime window. Once that browser is genuinely gone,
+      // re-enter normal delivery so the recorded browser-family launcher becomes the fallback
+      // instead of leaving the worker parked behind a presence fact that is no longer true.
+      void deliver();
+    }
   }, BROWSER_PRESENT_MS + 1);
   browserPresenceTimer.unref?.();
   return !wasPresent;
@@ -1086,6 +1093,53 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   if (route === '/status') {
     const live = liveConversations();
     return json(res, 200, { ok: true, conversations: live, commands: commands.length }, origin);
+  }
+
+  // Browser-owned fresh worker opening. The service worker asks for inert marker metadata first,
+  // locates the exact prime tab/window inside *its own Chromium profile*, and only then claims
+  // the one open attempt. No bootstrap text crosses this route and no page ownership is created:
+  // the inactive tab still has to redeem the marker through /commands/redeem before it can type.
+  if (route === '/commands/open' && req.method === 'GET') {
+    tidyCommands();
+    const command = nextDeliverable();
+    const directive = command && command.spec.type === 'worker' && browserPresent()
+      ? browserWorkerOpenDirective(command)
+      : null;
+    return json(res, 200, { command: directive }, origin);
+  }
+
+  if (route === '/commands/open/claim' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try {
+      body = (await readBody(req)) as Record<string, unknown>;
+    } catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    const id = typeof body['id'] === 'string' ? body['id'] : '';
+    if (!id) return json(res, 400, { error: 'bad_command_id' }, origin);
+    tidyCommands();
+    const command = commands.find((entry) => entry.id === id) ?? null;
+    if (!command || command.spec.type !== 'worker') {
+      return json(res, 404, { error: 'no_such_command' }, origin);
+    }
+    if (!browserPresent()) {
+      // Presence disappeared between offer and claim. Leave the command queued so the normal
+      // native-browser fallback can take it rather than creating a tab in an unknown profile.
+      void deliver();
+      return json(res, 409, { error: 'browser_not_present' }, origin);
+    }
+    if (command.claimedAt !== null) return json(res, 409, { error: 'command_taken' }, origin);
+    const directive = browserWorkerOpenDirective(command);
+    if (!directive) return json(res, 404, { error: 'no_such_command' }, origin);
+    const claimedAt = Date.now();
+    if (!(await persistCommandLease(command, null, claimedAt))) {
+      if (!commands.includes(command)) return json(res, 404, { error: 'no_such_command' }, origin);
+      return json(res, 503, { error: 'command_lease_not_durable', retryable: true }, origin);
+    }
+    armDeadline(command);
+    changed();
+    return json(res, 200, { command: directive }, origin);
   }
 
   if (route === '/correlations' && req.method === 'POST') {
@@ -3563,17 +3617,43 @@ export function commandUrl(id: string, conversationId?: string | null, projectPa
   return `${base}?${marker}#${marker}`;
 }
 
+interface BrowserWorkerOpenDirective {
+  id: string;
+  url: string;
+  /** Exact prime conversation whose Chromium tab/window must own this fresh worker tab. */
+  openerConversationId: string;
+}
+
+/**
+ * Browser-level instruction for creating a fresh worker tab without touching OS focus.
+ *
+ * The extension gets only the command marker and the exact prime conversation to anchor the
+ * window lookup. The worker task stays behind /commands/redeem, and the marker remains inert until
+ * the newly-created content document wins that ordinary lease. This keeps browser placement and
+ * worker identity as separate proofs: same profile/window says where to open; redeem+ACK says
+ * which conversation became the worker.
+ */
+function browserWorkerOpenDirective(command: Command): BrowserWorkerOpenDirective | null {
+  if (command.spec.type !== 'worker') return null;
+  const openerConversationId = primeConversation();
+  if (!openerConversationId || command.spec.runId !== currentRunId()) return null;
+  return {
+    id: command.id,
+    url: commandUrl(command.id, null, command.spec.projectPath),
+    openerConversationId
+  };
+}
+
 /**
  * Sends the next queued bootstrap to the browser, now. The only way one is ever delivered.
  *
  * This is the whole answer to "the fresh chat opened five minutes late, or only once I
- * happened to open ChatGPT again". Delivery used to be pull-only: the app queued a command
- * and waited for some ChatGPT tab's content script to poll for it, which meant a browser
- * with no ChatGPT tab open — or no browser at all — was a queue that nothing drained, and
- * which tab picked the job up was whichever one happened to ask. Opening the target chat
- * directly makes the app the active party: it launches the browser if it is closed, creates
- * the tab if there is none, and the marker in the URL tells that one page which command it
- * is for, so no other tab and no global pending slot is involved.
+ * happened to open ChatGPT again". Delivery used to be page-pull-only: the app queued a command
+ * and waited for some ChatGPT content script to take it. Current worker delivery instead has two
+ * active openers with an explicit boundary. While the paired browser is present, its extension
+ * service worker creates the fresh worker tab inactive in the exact prime window. If that browser
+ * is absent, the app launches the recorded browser family itself. Either way the marker in the URL
+ * tells one new page which command it may redeem; the page never chooses work from a global queue.
  *
  * The poll route is gone with it, and so is the recovery it offered. One press opens one
  * chat; if that does not work, it fails and says so, rather than leaving a job in a queue
@@ -3591,6 +3671,15 @@ async function deliverOne(): Promise<void> {
   tidyCommands();
   const command = nextDeliverable();
   if (!command) return;
+  if (command.spec.type === 'worker' && browserPresent()) {
+    // A paired Chromium profile that can still report the prime is a strictly stronger opener
+    // than launching msedge.exe/chrome again. The extension can name the exact prime tab/window
+    // and create this worker with active:false, so an unrelated fullscreen app — or a different
+    // Edge window/profile — is never disturbed. Leave the command unleased until background.js
+    // has found that prime window and claims /commands/open/claim; if the browser disappears,
+    // the presence timer below re-enters deliver() and this same command takes the native fallback.
+    return;
+  }
   if (!openInBrowser) {
     // Nothing can open a browser in this process, and nothing will come and ask. Ending it
     // here is what keeps the failure honest: the continuation stays in the chat it is in and

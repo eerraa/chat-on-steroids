@@ -38,8 +38,8 @@ describe('extension release metadata', () => {
     expect(lock.version).toBe(APP_VERSION);
     expect(lock.packages?.['']?.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
-    expect(BRIDGE_PROTOCOL).toBe(8);
-    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 8;');
+    expect(BRIDGE_PROTOCOL).toBe(9);
+    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 9;');
   });
 
   /**
@@ -771,39 +771,55 @@ describe('extension command delivery', () => {
     expect(fetch.mock.calls.some(([input]) => String(input).includes('/commands/redeem'))).toBe(false);
   });
 
-  /**
-   * The extension does not go looking for work, and cannot open a chat of its own accord.
-   *
-   * This replaces the whole recovery-alarm path. A command used to be a thing the browser
-   * fetched: a half-minute `chrome.alarms` tick pulled `GET /commands`, opened a marked tab
-   * per unopened command, and persisted an `opened` list so a restarted service worker would
-   * not open a second chat for the same job. Every part of that could act on a run the app
-   * had already finished with, and every part of it was a clock. The app opens the chat now,
-   * in the same transaction that creates the command, so the extension has nothing to poll
-   * and nothing to remember. The only alarm now is a delivery retry for observations and
-   * close notices already accepted into durable session storage; it never discovers work
-   * and never opens a tab.
-   */
-  it('opens no tabs and holds no alarm of its own', async () => {
+  it('opens a fresh worker inactive in the exact prime window without focusing the browser', async () => {
     const local = new FakeStorageArea(paired);
     const session = new FakeStorageArea();
-    const fetch = vi.fn(async (input: string) => {
+    const prime = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const workerUrl = 'https://chatgpt.com/?clf=cmd-background-worker#clf=cmd-background-worker';
+    const order: string[] = [];
+    let claimed = false;
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
       const url = new URL(input);
       if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/commands/open' && (!init.method || init.method === 'GET')) {
+        order.push('offer');
+        return response(200, {
+          command: claimed
+            ? null
+            : { id: 'cmd-background-worker', url: workerUrl, openerConversationId: prime }
+        });
+      }
+      if (url.pathname === '/commands/open/claim') {
+        expect(JSON.parse(String(init.body))).toEqual({ id: 'cmd-background-worker' });
+        order.push('claim');
+        claimed = true;
+        return response(200, {
+          command: { id: 'cmd-background-worker', url: workerUrl, openerConversationId: prime }
+        });
+      }
       return response(404, {});
     });
-    const worker = loadWorker({ local, session, fetch });
+    const worker = loadWorker({
+      local,
+      session,
+      fetch,
+      tabsQuery: async () => [{ id: 41, windowId: 73, url: `https://chatgpt.com/c/${prime}` }],
+      tabsSendMessage: async () => ({ ok: true, recorderVersion: 10 })
+    });
 
-    // Starting up is not a reason to open anything, and neither is asking how things are.
+    // status is only a wake; placement comes from the exact conversation returned by the app,
+    // never from whichever window/tab happens to be active on the desktop.
     await worker.send({ type: 'status' });
-    expect(worker.tabsCreate).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(worker.tabsCreate).toHaveBeenCalledTimes(1));
+    expect(worker.tabsCreate).toHaveBeenCalledWith({
+      url: workerUrl,
+      windowId: 73,
+      active: false
+    });
+    expect(order.indexOf('claim')).toBeGreaterThan(order.indexOf('offer'));
     expect(worker.tabsUpdate).not.toHaveBeenCalled();
+    expect(worker.windowsUpdate).not.toHaveBeenCalled();
     expect(session.data.opened).toBeUndefined();
-
-    // There is no listing route left to ask, so nothing here ever asks for one.
-    expect(fetch.mock.calls.every(([input]) => new URL(String(input)).pathname !== '/commands')).toBe(true);
-    expect(backgroundSource).toContain("const RETRY_ALARM = 'clf-bridge-drain'");
-    expect(backgroundSource).not.toContain("call('/commands'");
   });
 
   it('re-injects the recorder into already-open ChatGPT tabs after an extension reload', async () => {
@@ -865,22 +881,42 @@ describe('extension command delivery', () => {
     expect(await worker.send({ type: 'repair_fiber' }, 73)).toMatchObject({ ok: false, error: 'tab_closed' });
   });
 
-  it('has no way to ask the app for work at all', async () => {
+  it('does not claim a fresh worker when the prime conversation is absent from this browser profile', async () => {
     const local = new FakeStorageArea(paired);
     const session = new FakeStorageArea();
+    const prime = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const workerUrl = 'https://chatgpt.com/?clf=cmd-wrong-profile#clf=cmd-wrong-profile';
+    let claims = 0;
     const fetch = vi.fn(async (input: string) => {
       const url = new URL(input);
       if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/commands/open') {
+        return response(200, {
+          command: { id: 'cmd-wrong-profile', url: workerUrl, openerConversationId: prime }
+        });
+      }
+      if (url.pathname === '/commands/open/claim') {
+        claims++;
+        return response(500, {});
+      }
       return response(404, {});
     });
-    const worker = loadWorker({ local, session, fetch });
+    const worker = loadWorker({
+      local,
+      session,
+      fetch,
+      tabsQuery: async () => [
+        { id: 52, windowId: 8, url: 'https://chatgpt.com/c/11111111-2222-4333-8444-555555555555' }
+      ]
+    });
 
-    // The old poll message, from a stale content script that was never reloaded. It is not
-    // a route any more, so it is answered as the unknown message it is rather than
-    // reopening a path the app has stopped serving.
-    const reply = await worker.send({ type: 'poll' });
-    expect(reply?.ok).not.toBe(true);
-    expect(fetch.mock.calls.every(([input]) => new URL(String(input)).pathname !== '/commands')).toBe(true);
+    await worker.send({ type: 'status' });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(claims).toBe(0);
+    expect(worker.tabsCreate).not.toHaveBeenCalled();
+    expect(worker.tabsUpdate).not.toHaveBeenCalled();
+    expect(worker.windowsUpdate).not.toHaveBeenCalled();
   });
 
   it('provisions itself silently on the first call and retries with the new token', async () => {
