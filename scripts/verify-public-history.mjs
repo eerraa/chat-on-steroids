@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 
 const maintainerLogin = 'totec448-spec';
 const safeMaintainerEmail = /^(?:\d+\+)?totec448-spec@users\.noreply\.github\.com$/i;
+const trustedUpstreamFile = 'scripts/public-history-trusted-upstream.txt';
 
 // Keep the blocked values split so this guard does not contain the data it rejects.
 const blockedText = [
@@ -77,8 +78,43 @@ function checkMessageFile(messagePath) {
   ];
 }
 
+function trustedUpstreamCommits() {
+  let source = '';
+  try {
+    source = readFileSync(trustedUpstreamFile, 'utf8');
+  } catch (err) {
+    if (err && typeof err === 'object' && err.code === 'ENOENT') return new Set();
+    throw err;
+  }
+
+  const tips = source
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('#'));
+  const trusted = new Set();
+  for (const tip of tips) {
+    if (!/^[0-9a-f]{40}$/i.test(tip)) {
+      throw new Error(`${trustedUpstreamFile} contains an invalid commit id.`);
+    }
+    const exists = runGit(['cat-file', '-e', `${tip}^{commit}`], { allowFailure: true });
+    if (exists.status !== 0) {
+      throw new Error(`${trustedUpstreamFile} names a commit that is not present in this checkout.`);
+    }
+    for (const commit of String(runGit(['rev-list', tip]).stdout).split(/\r?\n/).filter(Boolean)) {
+      trusted.add(commit);
+    }
+  }
+  return trusted;
+}
+
 function checkHistory() {
   const failures = [];
+  // Forks sometimes merge already-public upstream history whose original author/committer
+  // identity predates this repository's noreply policy. Such history is trusted only after a
+  // maintainer pins the reviewed upstream tip by full SHA in the version-controlled file above.
+  // The exemption is deliberately identity-only: blocked session/path/message text is still
+  // checked below for every reachable commit, including trusted upstream ancestry.
+  const trustedUpstream = trustedUpstreamCommits();
   const commits = String(runGit(['rev-list', '--all']).stdout)
     .split(/\r?\n/)
     .filter(Boolean);
@@ -96,8 +132,12 @@ function checkHistory() {
       record.split('\0');
     const location = `commit ${commit}`;
     failures.push(
-      ...checkMaintainerIdentity(authorName, authorEmail, `${location} author`),
-      ...checkMaintainerIdentity(committerName, committerEmail, `${location} committer`),
+      ...(trustedUpstream.has(commit)
+        ? []
+        : [
+            ...checkMaintainerIdentity(authorName, authorEmail, `${location} author`),
+            ...checkMaintainerIdentity(committerName, committerEmail, `${location} committer`),
+          ]),
       ...findBlockedText(body.join('\0'), `${location} message`),
     );
   }

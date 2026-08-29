@@ -1026,7 +1026,10 @@ that publishes them, and never travel between runs. A tag alone no longer builds
 attaching the files, runs the public-history privacy gate again, and refuses to overwrite an
 existing release. Maintainers and agents install the versioned Git hooks with
 `npm run hooks:install`; those hooks reject personal maintainer identities and Claude session
-provenance before it can be committed or pushed. `release.yml` on
+provenance before it can be committed or pushed. A fork may import reviewed, already-public
+upstream ancestry with a legacy maintainer identity only when its exact full tip SHA is pinned in
+`scripts/public-history-trusted-upstream.txt`; that exemption applies to identity metadata only,
+while blocked commit-message/path/session content remains checked. `release.yml` on
 `workflow_dispatch` still produces an unpublished candidate from any ref.
 
 ## 21. Security-sensitive areas

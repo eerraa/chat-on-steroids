@@ -1,0 +1,5 @@
+# Official upstream history reviewed for ancestry import into this fork.
+#
+# A full SHA here exempts only author/committer email policy for that commit and its ancestors.
+# Commit messages and repository contents remain subject to the normal privacy checks.
+9e27c0fafc20bf2c81509844d5f92868678b4168

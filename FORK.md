@@ -100,6 +100,12 @@ Regression coverage includes normal/Project conversation parsing, Project reques
 fresh worker Project affinity, the current Project New Chat and submit-button shapes, same-browser
 worker spawn/revival, and Project/browser-affinity restoration across a bridge restart.
 
+The public-history privacy gate still rejects private maintainer identity and local session/path
+provenance created by this fork. When reviewed upstream history is imported verbatim, its full tip
+SHA is pinned in `scripts/public-history-trusted-upstream.txt`; only author/committer email checks
+are waived for that already-public ancestry. Commit-message and repository-content privacy checks
+remain active for the trusted ancestry as well.
+
 ## Remotes for contributors
 
 A local checkout should normally keep the fork as `origin` and the original project as
