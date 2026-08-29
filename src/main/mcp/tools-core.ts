@@ -787,22 +787,35 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             // cannot let an unseen real failure pass as benign.
             const batchSections = isBatch ? parseCommandBatchSections(responseText) : [];
             const nonZeroSections = batchSections.filter((section) => section.exitCode !== 0);
+            const realFailedSections = isBatch
+              ? nonZeroSections.filter(
+                  (section) =>
+                    !nonZeroExitIsBenign(boundCommands[section.index - 1] ?? '', section.exitCode, section.text)
+                )
+              : [];
             const benign = isBatch
               ? batchSections.length === rawCommands.length &&
                 nonZeroSections.length > 0 &&
-                nonZeroSections.every((section) =>
-                  nonZeroExitIsBenign(boundCommands[section.index - 1] ?? '', section.exitCode, section.text)
-                )
+                realFailedSections.length === 0
               : nonZeroExitIsBenign(boundCommand, output.exitCode, responseText);
+            // The shell wrapper exits with the *first* non-zero section. That can be a benign
+            // search miss followed by a real compiler/test failure, so the recorder summary must
+            // name the first real failed section rather than blaming the wrapper's earlier code.
+            const recordedExitCode = realFailedSections[0]?.exitCode ?? output.exitCode;
             noteExec({
               ...(output.processId === null ? {} : { id: String(output.processId) }),
               running: output.processId !== null,
-              exitCode: output.exitCode,
+              exitCode: recordedExitCode,
               timedOut: false,
               durationMs: output.wallTimeMs,
               benignExit: benign
             });
-            noteDetail(commandDetail.replace(/\s+/g, ' ').slice(0, 120));
+            const failedSection = realFailedSections[0];
+            const recordedDetail =
+              failedSection && batchSections.length === rawCommands.length
+                ? `Command failed (${failedSection.index} of ${rawCommands.length}): ${rawCommands[failedSection.index - 1] ?? ''}`
+                : commandDetail;
+            noteDetail(recordedDetail.replace(/\s+/g, ' ').slice(0, 120));
             logInfo(`tool exec_command ${shell.shellType} -> ${output.processId ?? `exit ${output.exitCode ?? 'unknown'}`}`);
             // `benign` was previously spent only on the error count, leaving the model to read
             // `Process exited with code 1` under an empty body and re-run a search that had

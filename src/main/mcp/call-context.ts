@@ -24,6 +24,8 @@ export interface CallEvidence {
   /** Free-form qualifier the summariser may use, e.g. "lines 200-420". */
   detail: string | null;
   exitCode: number | null;
+  /** A non-zero exit that the command adapter proved is a normal result (for example rg no-match). */
+  benignExit?: boolean;
   timedOut: boolean;
   /** Child/process lifetime when the command surface measured it itself. */
   durationMs: number | null;
@@ -107,6 +109,7 @@ export function emptyEvidence(): CallEvidence {
     count: null,
     detail: null,
     exitCode: null,
+    benignExit: false,
     timedOut: false,
     durationMs: null,
     running: null,
@@ -368,6 +371,7 @@ export function noteExec(result: {
   const store = storage.getStore();
   if (!store) return;
   noteProcess(result);
+  store.evidence.benignExit = result.benignExit === true;
   store.evidence.timedOut = result.timedOut === true;
   // A command that ran and failed is not an `ok` call. The dispatcher's fallback only sees
   // `result.isError`, and a completed non-zero shell result is not a transport error, so a

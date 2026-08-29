@@ -760,10 +760,10 @@ describe('the calls a turn says it made', () => {
     expect(turnStamps).toEqual(['test-nonce:0']);
   });
 
-  it('keeps a long public assistant answer beyond the old 32k transcript cap', async () => {
-    const long = 'handoff detail '.repeat(14000);
-    expect(long.length).toBeGreaterThan(180_000);
-    expect(long.length).toBeLessThan(256_000);
+  it('keeps a long public assistant answer beyond the handoff wire cap so the app can preserve its tail', async () => {
+    const long = 'handoff detail '.repeat(22000);
+    expect(long.length).toBeGreaterThan(256_000);
+    expect(long.length).toBeLessThan(512 * 1024);
     const { turns } = await scan([], [{ id: 'turn-long-answer', messages: [authored('assistant-long', long)] }]);
 
     expect(turns[0]!.messages[0]!.rawText).toBe(long);

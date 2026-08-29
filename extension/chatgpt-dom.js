@@ -49,6 +49,27 @@ var CLF_DOM = (() => {
   const STOP =
     'button[data-testid="stop-button"], button[data-testid="composer-stop-button"], ' +
     'button[aria-label="Stop streaming"], button[aria-label="Stop generating"]';
+  /**
+   * Locale-independent response retry affordances seen on terminal transport failures.
+   *
+   * Never match button text here. ChatGPT localizes the visible copy, while data/action
+   * identifiers are renderer structure. Bare Regenerate is deliberately absent: a successful
+   * answer normally offers it too. Only Regenerate nested under an explicit error surface is
+   * accepted as the renderer's failed-response action.
+   */
+  const RESPONSE_RETRY = [
+    'button[data-testid*="retry" i]',
+    '[role="button"][data-testid*="retry" i]',
+    'button[data-action*="retry" i]',
+    '[role="button"][data-action*="retry" i]',
+    '[data-testid*="error" i] button[data-testid*="retry" i]',
+    '[data-testid*="error" i] [role="button"][data-testid*="retry" i]',
+    // Some renderer generations reuse the Regenerate action component for a failed response.
+    // Scope that spelling under an explicit error surface so a normal completed answer's
+    // Regenerate button never becomes failure evidence.
+    '[data-testid*="error" i] button[data-testid*="regenerate" i]',
+    '[data-testid*="error" i] [role="button"][data-testid*="regenerate" i]'
+  ];
   const SEND =
     'button#composer-submit-button, button[data-testid="send-button"], form button[aria-label^="Send" i]';
   /** The composer's own trailing controls, where the send and dictation buttons live. */
@@ -134,12 +155,53 @@ var CLF_DOM = (() => {
     return safe(() => {
       if (!node) return true;
       if (typeof node.closest === 'function' && node.closest(SCREEN_READER_ONLY)) return false;
+      // DOM presence is not visible presence. React can leave the previous composer control
+      // mounted after a terminal response failure; one retained production worker then kept a
+      // hidden Stop while the user saw only Retry, so the turn stayed "generating" forever.
+      let current = node;
+      for (let depth = 0; current && depth < 32; depth += 1) {
+        if (current.hidden === true) return false;
+        if (typeof current.hasAttribute === 'function' && current.hasAttribute('hidden')) return false;
+        if (typeof current.getAttribute === 'function') {
+          if (current.getAttribute('aria-hidden') === 'true') return false;
+          if (current.getAttribute('inert') !== null) return false;
+          const inline = String(current.getAttribute('style') || '').toLowerCase();
+          if (/display\s*:\s*none\b/.test(inline)) return false;
+          if (/visibility\s*:\s*(?:hidden|collapse)\b/.test(inline)) return false;
+        }
+        if (current.style) {
+          if (current.style.display === 'none') return false;
+          if (current.style.visibility === 'hidden' || current.style.visibility === 'collapse') return false;
+        }
+        current = current.parentElement || null;
+      }
+      // Modern Chromium can answer CSS visibility without geometry. Keep this opportunistic:
+      // structural fakes/JSDOM may not implement it, and zero layout geometry by itself is not
+      // allowed to delete error evidence in those environments.
+      if (typeof node.checkVisibility === 'function') {
+        try {
+          if (!node.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return false;
+        } catch {
+          // Fall through to the older geometry check.
+        }
+      }
       if (typeof node.getBoundingClientRect !== 'function') return true;
       const rect = node.getBoundingClientRect();
       if (!rect) return true;
       const clipped = (size) => size > 0 && size <= 8;
       return !(clipped(rect.width) || clipped(rect.height));
     }, true);
+  }
+
+  /** A control the person could actually press now, rather than a stale React node. */
+  function actionable(node) {
+    return safe(() => {
+      if (!node || !displayed(node)) return false;
+      if (node.disabled === true) return false;
+      if (typeof node.hasAttribute === 'function' && node.hasAttribute('disabled')) return false;
+      if (typeof node.getAttribute === 'function' && node.getAttribute('aria-disabled') === 'true') return false;
+      return true;
+    }, false);
   }
   /**
    * ChatGPT sometimes renders transport failures inside the same `.markdown` shape as
@@ -466,11 +528,27 @@ var CLF_DOM = (() => {
 
   /** True while ChatGPT is producing a turn. The stop button is the honest signal. */
   function generating() {
-    return safe(() => document.querySelector(STOP) !== null, false);
+    return stopButton() !== null;
   }
 
   function stopButton() {
-    return safe(() => document.querySelector(STOP), null);
+    return safe(() => [...document.querySelectorAll(STOP)].find((node) => actionable(node)) || null, null);
+  }
+
+  /** The locale-neutral terminal Retry control for one assistant turn, if present. */
+  function responseRetryButton(turn) {
+    return safe(() => {
+      if (!turn || turn.role !== 'assistant') return null;
+      for (const section of turnNodes(turn)) {
+        for (const selector of RESPONSE_RETRY) {
+          for (const node of section.querySelectorAll(selector)) {
+            if (node.closest && (node.closest(OWN_SURFACES) || node.closest(TOOL))) continue;
+            if (actionable(node)) return node;
+          }
+        }
+      }
+      return null;
+    }, null);
   }
 
   /**
@@ -1076,6 +1154,7 @@ var CLF_DOM = (() => {
     return safe(() => {
       const out = [];
       const texts = new Set();
+      const assistantTurns = turns().filter((turn) => turn.role === 'assistant');
       for (const node of document.querySelectorAll('[role="alert"]')) {
         if (node.closest && node.closest(OWN_SURFACES)) continue;
         if (!displayed(node)) continue;
@@ -1084,8 +1163,7 @@ var CLF_DOM = (() => {
         out.push({ text: value, node, turnId: null });
         texts.add(value);
       }
-      for (const turn of turns()) {
-        if (turn.role !== 'assistant') continue;
+      for (const turn of assistantTurns) {
         for (const section of turnNodes(turn)) {
           for (const markdown of section.querySelectorAll('.markdown')) {
             const value = text(markdown, 500).replace(/\s+/g, ' ').trim();
@@ -1093,6 +1171,46 @@ var CLF_DOM = (() => {
             texts.add(value);
             out.push({ text: value, node: markdown, turnId: turn.id, turn });
           }
+        }
+        // Primary locale-independent failure signal. The retained production card rendered
+        // translated Korean text, but its response Retry action is the stable terminal fact.
+        const retry = responseRetryButton(turn);
+        if (retry) {
+          const already = out.some((entry) =>
+            (turn.nodes || [turn.node]).some(
+              (section) => section && typeof section.contains === 'function' && section.contains(entry.node)
+            )
+          );
+          if (!already) {
+            out.push({
+              text: 'ChatGPT response delivery failed and exposed a Retry control.',
+              node: retry,
+              turnId: turn.id,
+              turn
+            });
+          }
+        }
+      }
+      // ChatGPT can render the failed-response card as a status/toast sibling rather than as a
+      // child of the assistant section. Do not guess which DOM turn it is "nearest" to. Emit it
+      // as an unscoped occurrence and let content.js's first-seen local-generation fence assign
+      // it only if it actually appeared while one exact generation was running.
+      for (const selector of RESPONSE_RETRY) {
+        for (const retry of document.querySelectorAll(selector)) {
+          if (!actionable(retry)) continue;
+          if (retry.closest && (retry.closest(OWN_SURFACES) || retry.closest(TOOL))) continue;
+          if (out.some((entry) => entry.node === retry)) continue;
+          const insideKnownTurn = assistantTurns.some((turn) =>
+            (turn.nodes || [turn.node]).some(
+              (section) => section && typeof section.contains === 'function' && section.contains(retry)
+            )
+          );
+          if (insideKnownTurn) continue;
+          out.push({
+            text: 'ChatGPT response delivery failed and exposed a Retry control.',
+            node: retry,
+            turnId: null
+          });
         }
       }
       return out;

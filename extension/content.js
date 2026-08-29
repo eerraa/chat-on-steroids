@@ -24,24 +24,13 @@
 (() => {
   'use strict';
 
-  // Static content scripts are not re-run in an already-open tab when an unpacked
-  // extension is reloaded/updated. background.js deliberately re-injects this file into
-  // those tabs from runtime.onInstalled. The normal static injection can race that recovery
-  // on a freshly loaded page, so one live isolated-world recorder stays the invariant.
-  //
-  // What that used to be, and why it was wrong: a bare `__CLF_CONTENT_RECORDER_ACTIVE__`
-  // boolean with the note that "a real extension reload invalidates the old isolated world,
-  // so its marker disappears with it". It does not. Chrome keys the isolated world by
-  // extension id and leaves that JS context standing when the extension reloads; what it
-  // invalidates is `chrome.runtime`. The orphan therefore keeps its globals — including
-  // this marker — and the recovery injection from runtime.onInstalled returned at this very
-  // line. The document was then left with a recorder that can never send again, which is
-  // precisely the state that produces a healthy MCP tunnel, a visibly alive MAIN-world
-  // fiber.js, and every single call filed under `Unattributed activity`.
-  //
-  // So: publish a handle instead of a flag and let a replacement supersede a dead one. A
-  // *healthy* incumbent still wins, so the ordinary static/recovery race is unchanged.
-  const RECORDER_VERSION = 10;
+  // One recorder belongs to one fresh ChatGPT document. Extension update/reload deliberately
+  // does not replace that recorder inside the same document: Chromium can preserve the old
+  // isolated world while invalidating chrome.runtime, and trying to hot-swap page observers and
+  // React/Fiber readers in that half-invalidated document has repeatedly stalled long WebCodex
+  // tabs. A stale document therefore degrades to "CoS unavailable until reload/new document".
+  // The old recorder self-quiesces as soon as it notices its extension context is gone.
+  const RECORDER_VERSION = 15;
   const recorderHandle = {
     version: RECORDER_VERSION,
     healthy: () => false,
@@ -49,22 +38,7 @@
   };
   {
     const incumbent = globalThis.__CLF_CONTENT_RECORDER__ || null;
-    let incumbentHealthy = false;
-    try {
-      incumbentHealthy =
-        !!incumbent && typeof incumbent.healthy === 'function' && incumbent.healthy() === true;
-    } catch {
-      // A handle that throws is not a working recorder.
-      incumbentHealthy = false;
-    }
-    if (incumbentHealthy && (incumbent.version || 0) >= RECORDER_VERSION) return;
-    if (incumbent && typeof incumbent.stop === 'function') {
-      try {
-        incumbent.stop();
-      } catch {
-        // Best effort. The orphan's loops are inert once its `chrome.runtime` is gone.
-      }
-    }
+    if (incumbent) return;
     globalThis.__CLF_CONTENT_RECORDER__ = recorderHandle;
     // Kept only so a recorder from before this handle existed is still visible as "a script
     // ran here". It is never read as a reason to bail out any more.
@@ -114,6 +88,8 @@
   const STATUS_MS = 15_000;
   /** Longer than any honest tool call: past this a silent turn is called stalled. */
   const STALL_MS = 10 * 60 * 1000;
+  /** A stalled turn may rescue through Auto Compact once it is within 10% of the normal line. */
+  const AUTO_COMPACTION_STALL_RATIO = 0.9;
   /** How long the button says "Starting…" before believing something went wrong. */
   const PRESS_GRACE_MS = 12_000;
   /** Persistent popup preference. On by default as of 1.7.4; the popup can turn it off. */
@@ -175,7 +151,20 @@
   let painted = false;
 
   let alive = true;
-  /** DOM/window bindings owned by this recorder instance and removed on takeover. */
+  /**
+   * True only after the reload/startup identity handshake has had first claim on observation.
+   *
+   * MutationObservers are installed synchronously, while checkStatus() -> resumeOpenTurn() is
+   * asynchronous. On a live streaming turn ChatGPT can mutate the transcript in that gap; the
+   * observer used to call observe() first, mint a new RUN_ID generation, and then make the later
+   * resume unable to adopt the durable pre-reload turn. The real 2026-08-29 session produced
+   * exactly that split: a new document-local generation appeared while the app still held the
+   * old one open. Observation therefore stays behind one explicit startup barrier. The first
+   * post-handshake observe() scans current state, so ignoring an early mutation edge loses no
+   * durable fact.
+   */
+  let observationReady = false;
+  /** DOM/window bindings owned by this recorder instance and removed when it quiesces. */
   const stopCleanups = [];
   function rememberCleanup(cleanup) {
     stopCleanups.push(cleanup);
@@ -183,6 +172,27 @@
   function listen(target, type, listener, options) {
     target.addEventListener(type, listener, options);
     rememberCleanup(() => target.removeEventListener(type, listener, options));
+  }
+  /**
+   * Whether this document still belongs to the currently installed extension instance.
+   *
+   * MV3 worker sleep does not remove chrome.runtime.id from a content script. Extension
+   * reload/update does. That makes the id a cheap, local orphan test which does not wake the
+   * service worker and, crucially, does not touch ChatGPT's DOM/React tree.
+   */
+  function extensionContextAlive() {
+    try {
+      return !!globalThis.chrome && !!chrome.runtime && typeof chrome.runtime.id === 'string';
+    } catch {
+      return false;
+    }
+  }
+
+  function recorderOperational() {
+    if (!alive) return false;
+    if (extensionContextAlive()) return true;
+    quiesceInvalidatedRecorder();
+    return false;
   }
   let status = { connected: false, paired: false, disconnected: false };
 
@@ -741,12 +751,12 @@
   let documentReady = null;
 
   async function sendToWorker(message) {
-    if (!alive) return null;
+    if (!recorderOperational()) return null;
     try {
       return await chrome.runtime.sendMessage(message);
     } catch (err) {
       const text = String(err && err.message ? err.message : err);
-      if (text.includes('Extension context invalidated')) alive = false;
+      if (text.includes('Extension context invalidated')) quiesceInvalidatedRecorder();
       return null;
     }
   }
@@ -1308,6 +1318,17 @@
     return false;
   }
 
+  /** Error occurrences that belong to this exact local generation/visible turn. */
+  function failuresForTurn(errors, turn) {
+    return errors.filter((error) => {
+      if (isStale(error.node)) return false;
+      if (error.turnId || error.turn) return turn ? sameTurn(error, turn) : false;
+      // A node nothing has recorded yet can only have arrived on this tick, which is this
+      // turn's — the same generation-scoped default used for toast errors.
+      return (errorFirstSeen.get(error.node) ?? turnId) === turnId;
+    });
+  }
+
   /** An error occurrence this script has not already emitted for this node and turn. */
   function unreportedError(error, turnKey) {
     const reported = seenErrors.get(error.node);
@@ -1337,13 +1358,7 @@
     // Only this turn's failures. An error inside another turn's section is that turn's,
     // and a toast still on screen from an earlier failure was already on screen when this
     // turn began — neither says anything about how this one ended.
-    const failures = CLF_DOM.errors().filter((error) => {
-      if (isStale(error.node)) return false;
-      if (error.turnId || error.turn) return turn ? sameTurn(error, turn) : false;
-      // A node nothing has recorded yet can only have arrived on this tick, which is this
-      // turn's — the same default the clock version had, without the tie.
-      return (errorFirstSeen.get(error.node) ?? turnId) === turnId;
-    });
+    const failures = failuresForTurn(CLF_DOM.errors(), turn);
     if (failures.length > 0) return { outcome: 'failed', detail: failures[0].text };
     // Degraded fallback only. If the MAIN-world Fiber helper has ever answered on this page,
     // its end_turn bit is the authority on successful completion and mere visible prose is
@@ -1591,6 +1606,10 @@
   }
 
   function observe() {
+    // watchTranscript()/watchToolRows are live before the async startup chain is finished. A
+    // transcript mutation during that window is not permission to invent lifecycle identity;
+    // resumeOpenTurn() must first get the app's durable activeTurnId (or a definitive absence).
+    if (!observationReady) return;
     const id = CLF_DOM.conversationId();
     // One DOM turn snapshot per observation, created lazily because a transient id-less route
     // returns before transcript work. Everything below this stack frame that needs `turns()`
@@ -1698,7 +1717,7 @@
       emit({ kind: 'conversation_title', text: pageTitle });
     }
 
-    const nowGenerating = CLF_DOM.generating();
+    let nowGenerating = CLF_DOM.generating();
 
     // The transcript that is already settled goes in first — before this tick can open a
     // new generation. The recorded order used to be the other way round: `turn_start` for
@@ -1798,7 +1817,10 @@
     // which is the exact thing that comparison exists to prevent.
     const visibleErrors = CLF_DOM.errors();
     for (const error of visibleErrors) {
-      if (!errorFirstSeen.has(error.node)) errorFirstSeen.set(error.node, turnId);
+      // Empty string is the explicit "seen while no generation was open" sentinel. Storing
+      // null here and later using `?? turnId` accidentally reassigned an old pre-turn toast to
+      // whichever generation happened to start next.
+      if (!errorFirstSeen.has(error.node)) errorFirstSeen.set(error.node, turnId || '');
     }
 
     const turn = generating ? generationTurn(observedTurns) : currentAssistantTurn(observedTurns);
@@ -1806,6 +1828,11 @@
       pageTurnIds.set(turnId, turn.id);
       if (pageTurnIds.size > 500) pageTurnIds.delete(pageTurnIds.keys().next().value);
     }
+    // An explicit same-turn transport failure is a terminal page fact and outranks a stale Stop
+    // control. This is deliberately scoped with the same identity rule as endOutcome(): an old
+    // retry card left elsewhere in the transcript may not stop a newer generation, while the
+    // current response's Retry/error surface may not be kept open by leftover composer chrome.
+    if (generating && failuresForTurn(visibleErrors, turn).length > 0) nowGenerating = false;
 
     // Progress lines are only meaningful while they are moving. Captured live they
     // give the one thing a page reloaded from history can never reconstruct: the
@@ -2002,11 +2029,10 @@
       seededPath = null;
     }
     const observer = new MutationObserver((records) => {
-      // Recorder takeover cannot disconnect observers created by the predecessor's isolated
-      // world, so `alive` is the ownership fence. Without it every extension reload leaves a
-      // watcher behind that still scans connector mutations and starts a MAIN-world Fiber
-      // round-trip even though sendToWorker() has correctly gone inert.
-      if (!alive || !sameChat()) {
+      // Extension reload can leave this isolated-world observer alive after chrome.runtime has
+      // been invalidated. Detect that locally before touching the page model and self-quiesce;
+      // no successor content script is injected into this document.
+      if (!recorderOperational() || !sameChat()) {
         return;
       }
       let sawConnector = false;
@@ -2021,7 +2047,7 @@
       }
       if (!sawConnector) return;
       void refreshFiber().then(() => {
-        if (!alive || !sameChat()) return;
+        if (!recorderOperational() || !sameChat()) return;
         void flush();
       });
     });
@@ -2167,7 +2193,7 @@
     let urgentQueued = false;
     let pageWasGenerating = Boolean(CLF_DOM.generating());
     const handleRecords = (records) => {
-      if (!alive || !sameChat()) return;
+      if (!recorderOperational() || !sameChat()) return;
       // Presentation authority changes on the page edge itself, not when our slower lifecycle
       // observer catches up. Track the transition so a genuinely stale Stop left behind after a
       // Fiber-proven finish does not repeatedly revoke settled historical reconstruction.
@@ -2179,6 +2205,8 @@
         releaseLivePresentationToNative(touchedSections);
       }
       if (touchedSections.size > 0) {
+        transcriptSweepNeeded = true;
+        presentationSweepNeeded = true;
         nativePresentationClock += 1;
         for (const section of touchedSections) {
           if (section && section.isConnected) nativePresentationRevision.set(section, nativePresentationClock);
@@ -2220,7 +2248,7 @@
           urgentQueued = true;
           void Promise.resolve().then(() => {
             urgentQueued = false;
-            if (!alive || !sameChat()) return;
+            if (!recorderOperational() || !sameChat()) return;
             observe();
           });
         }
@@ -2245,7 +2273,7 @@
       // the app has durably accepted the transcript.
       timer = setTimeout(() => {
         timer = null;
-        if (!alive) return;
+        if (!recorderOperational()) return;
         observe();
       }, TRANSCRIPT_OBSERVE_MS);
     };
@@ -2558,7 +2586,11 @@
       if (!entry || typeof entry !== 'object') continue;
       const messageId = cap(entry.messageId, 200);
       if (!messageId) continue;
-      const rawText = typeof entry.rawText === 'string' ? entry.rawText.slice(0, 256_000) : '';
+      // Fiber's raw authored text is canonical transcript/recovery data, not rendered chrome.
+      // Keep its 512 KiB per-message allowance intact until the recorder can spill anything
+      // above its 256k inline limit to an asset. Truncating here would destroy the tail before
+      // Compact & Resume can apply its intentional head+tail wire bound.
+      const rawText = typeof entry.rawText === 'string' ? entry.rawText.slice(0, 512 * 1024) : '';
       const renderedHtml = typeof entry.renderedHtml === 'string' ? entry.renderedHtml.slice(0, 120_000) : '';
       if (!rawText && !renderedHtml) continue;
       const message = {
@@ -4961,6 +4993,17 @@
       const streamKey = groupKey || compatiblePriorKey || canonicalKey;
       if (streamKey) seenStreamKeys.add(streamKey);
       let existing = streamKey ? streamRootsByKey.get(streamKey) || null : null;
+      if (!existing && compatiblePriorKey) {
+        existing = streamRootsByKey.get(compatiblePriorKey) || null;
+        // A canonical fallback key can be promoted to an exact local lifecycle group after the
+        // durable feed is restored. The visible root is still the same response; migrate its map
+        // key instead of manufacturing another sibling beside it.
+        if (existing && streamKey && streamKey !== compatiblePriorKey) {
+          streamRootsByKey.delete(compatiblePriorKey);
+          streamRootsByKey.set(streamKey, existing);
+          if (existing.dataset) existing.dataset.clfKey = streamKey;
+        }
+      }
       if (existing && !existing.isConnected) {
         streamRootsByKey.delete(streamKey);
         existing = null;
@@ -5194,7 +5237,8 @@
         renderControl();
         return;
       }
-      if (data.resetActivity === true) {
+      const activityReset = data.resetActivity === true;
+      if (activityReset) {
         // The app deliberately bounded an old/reload cursor to its newest presentation
         // window. Replace, never merge, or stale rows from before the gap would survive
         // beside the authoritative tail and appear to jump across turns.
@@ -5338,8 +5382,8 @@
       current() &&
       CLF_DOM.conversationId() === forId &&
       compactCapture &&
-      typeof compactCapture.summary === 'string' &&
-      compactCapture.summary.trim()
+      compactCapture.settled === true &&
+      (compactCapture.generation || (typeof compactCapture.summary === 'string' && compactCapture.summary.trim()))
     ) {
       await deliverCapturedBrief();
     }
@@ -5766,10 +5810,24 @@
     // auto-compaction *claim* command: its conversation is its durable agent identity and the
     // 400k ceiling only changes whether the next stop can be revived.
     if (goalConfig && goalConfig.blocked === 'worker') return;
-    if (!conversationId || !context || !context.auto || !autoCompactReady) return;
+    if (!conversationId || !context || !context.auto) return;
     // Anything already running owns this chat, including a run started by hand.
     if (nativeBusy || pressedAt > 0) return;
     if (job && job.busy) return;
+    const stalled = lastChangeAt > 0 && Date.now() - lastChangeAt > STALL_MS;
+    const threshold = Number(context.threshold);
+    const stalledNearThreshold =
+      stalled &&
+      Number.isFinite(tokens) &&
+      Number.isFinite(threshold) &&
+      threshold > 0 &&
+      tokens >= Math.floor(threshold * AUTO_COMPACTION_STALL_RATIO);
+    // Normal turns follow the configured threshold. A genuinely stalled turn may rescue a
+    // little earlier because our local token estimate does not include ChatGPT's hidden/system
+    // context; a 400k configured line therefore does not mean a 381k local recording is safely
+    // below the provider's real pressure point. This is deliberately a *near-threshold* escape,
+    // not a general stall watchdog: small chats still wait for the provider/user to recover them.
+    if (!autoCompactReady && !stalledNearThreshold) return;
     // Three views of liveness, and any of them is enough. `CLF_DOM.generating()` flickers
     // false between phases of one answer, so demanding all three would miss long turns at
     // exactly their busiest moments; the local generation flag and the app's durable
@@ -5779,7 +5837,11 @@
 
     // Consume before touching ChatGPT. If the tab vanishes or the barrier fails after this,
     // this chat's automatic compaction is spent and the user can still press the button.
-    const claimed = await ask({ type: 'auto_compact_claim', conversationId });
+    const claimed = await ask({
+      type: 'auto_compact_claim',
+      conversationId,
+      ...(stalledNearThreshold ? { stalledNearThreshold: true } : {})
+    });
     if (!current()) return;
     if (!claimed || claimed.ok !== true || claimed.data?.claimed !== true) {
       autoCompactReady = false;
@@ -7012,11 +7074,18 @@
       nativePhase = 'interrupting';
       renderControl();
       const stop = CLF_DOM.stopButton();
-      if (stop) stop.click();
+      // Stop is one-way. Once the click is issued there is no safe "nothing happened" timeout:
+      // ChatGPT may acknowledge it later, especially in a throttled/background tab. Abandoning
+      // after 15 seconds used to strand the old chat when that delayed stop finally landed — the
+      // automatic trigger was already spent, the turn ended as stopped, and no handoff existed.
+      // If the page says it is generating but exposes no current Stop control, fail before doing
+      // anything destructive instead.
+      if (!stop) return 'ChatGPT is generating but did not expose a Stop control. Nothing was compacted.';
+      stop.click();
       userStopped = true;
-      const stopped = await waitUntil(() => !current() || !CLF_DOM.generating(), INTERRUPT_WAIT_MS);
+      const stopped = await waitForGenerationStop(current);
       if (!current()) return 'This chat changed while compaction was stopping the turn.';
-      if (!stopped) return 'ChatGPT would not stop the current turn. Nothing was compacted.';
+      if (!stopped) return 'This chat changed while compaction was stopping the turn.';
     }
 
     // SETTLING — bounded and fail-closed. A call that is still running at the deadline is
@@ -7133,7 +7202,10 @@
         generation: null,
         priorGeneration: turnId || null,
         armedAt: Date.now(),
-        summary: null
+        // DOM prose is a stability/compatibility snapshot only. The authoritative final bytes
+        // are resolved by the app from this capture's exact local generation.
+        summary: null,
+        settled: false
       };
       rememberCapture();
       if (!CLF_DOM.send()) {
@@ -7161,8 +7233,9 @@
    * The compaction turn this tab is watching, and the transaction it belongs to.
    *
    * `{ token, conversationId, generation }`, or null when nothing is being watched. This is
-   * the load-bearing part of Compact & Resume: the brief is whatever the model wrote as its
-   * answer, and this is what makes "its answer" a fact rather than a guess.
+   * the load-bearing part of Compact & Resume: the page proves *which generation* answered the
+   * handoff prompt, while the app's canonical Fiber/session record supplies *what it authored*.
+   * Keeping those two facts separate prevents renderer layout from becoming storage authority.
    *
    * The binding is to one *local* generation id — the ids this script mints when it sees a
    * turn open, which are unique per page load and never reused. Not to "the newest assistant
@@ -7236,10 +7309,22 @@
     // must carry this document's epoch so an A -> B -> A SPA round trip cannot revive it.
     stored.epoch = epoch;
     compactCapture = stored;
-    // Once the exact generation settled, its brief is itself durable page state. The app's
-    // capture endpoint is idempotent by token, so a reload after a lost request/response can
-    // safely retry these exact bytes without re-identifying anything from the transcript.
-    if (typeof stored.summary === 'string' && stored.summary.trim()) {
+    // Captures written by builds before `settled` existed used a non-empty summary as their
+    // durable "this generation finished" marker. Preserve that restart compatibility, but do
+    // not make the summary authoritative again.
+    if (
+      stored.settled !== true &&
+      stored.generation &&
+      typeof stored.summary === 'string' &&
+      stored.summary.trim()
+    ) {
+      stored.settled = true;
+      rememberCapture();
+    }
+    // Once the exact generation settled, the app's capture endpoint is idempotent by token and
+    // resolves its canonical final by generation. A reload after a lost request/response can
+    // therefore retry without re-identifying or re-reading authored bytes from the transcript.
+    if (stored.settled === true) {
       nativeBusy = true;
       nativePhase = 'delivering';
       renderControl();
@@ -7252,9 +7337,22 @@
         renderControl();
         return;
       }
-      return void (await abandonCapture(
-        'This tab reloaded while ChatGPT was writing the brief, so the app can no longer tell which answer was it. Nothing was compacted — press Compact & Resume again.'
-      ));
+      if (generating && turnId && stored.generation !== turnId) {
+        return void (await abandonCapture(
+          'This tab reloaded after the compaction turn was replaced by another live turn, so the old handoff transaction was cancelled rather than retargeted.'
+        ));
+      }
+      // The generation binding survived the reload even though the document missed its terminal
+      // edge. Do not guess from whatever prose happens to be visible now. Ask the app to resolve
+      // this exact generation from its canonical recorder; if the final journal batch is still
+      // in flight the bridge returns retryable and this capture remains owned here.
+      compactCapture.settled = true;
+      rememberCapture();
+      nativeBusy = true;
+      nativePhase = 'delivering';
+      renderControl();
+      void deliverCapturedBrief();
+      return;
     }
 
     // Reloaded between submitting the prompt and seeing the turn open, so the binding was
@@ -7479,18 +7577,23 @@
   }
 
   /**
-   * Retries the exact settled brief until the app accepts or terminally refuses its token.
+   * Retries the exact settled generation until the app accepts or terminally refuses its token.
    *
    * `/compact` capture is idempotent: a response can disappear after the app has already
-   * stored the handoff, and presenting the same token again simply returns that same handoff.
-   * Keeping the bytes here until an acknowledgement is therefore what makes the boundary
-   * atomic from the page's point of view. Dropping them before the POST made a transient
-   * worker/app failure strand an already-armed continuation in `awaiting-summary` forever.
+   * stored the handoff, and presenting the same token/generation again simply returns that same
+   * handoff. The optional DOM summary is kept only for diagnostics; the app resolves the
+   * canonical final bytes by generation. Retaining this capture until an
+   * acknowledgement is what makes the boundary atomic from the page's point of view.
    */
   async function deliverCapturedBrief() {
     const held = compactCapture;
     const brief = held && typeof held.summary === 'string' ? held.summary.trim() : '';
-    if (!held || !brief || briefDeliveryBusy) return;
+    if (
+      !held ||
+      held.settled !== true ||
+      (!held.generation && !brief) ||
+      briefDeliveryBusy
+    ) return;
     const current = () =>
       alive &&
       compactCapture === held &&
@@ -7502,7 +7605,13 @@
     briefDeliveryBusy = true;
     let reply = null;
     try {
-      reply = await ask({ type: 'compact', conversationId: held.conversationId, token: held.token, summary: brief });
+      reply = await ask({
+        type: 'compact',
+        conversationId: held.conversationId,
+        token: held.token,
+        ...(typeof held.generation === 'string' && held.generation ? { turnId: held.generation } : {}),
+        ...(brief ? { summary: brief } : {})
+      });
     } finally {
       briefDeliveryBusy = false;
     }
@@ -7522,8 +7631,8 @@
     }
 
     if (retryableBriefReply(reply)) {
-      // Keep the exact generation-bound bytes in sessionStorage. The normal activity loop is
-      // the retry clock, so there is no second independent timer to race navigation/cancel.
+      // Keep the exact generation binding in sessionStorage. The normal activity loop is the
+      // retry clock, so there is no second independent timer to race navigation/cancel.
       nativeBusy = true;
       nativePhase = 'delivering';
       pressedAt = 0;
@@ -7545,12 +7654,12 @@
   }
 
   /**
-   * Hands the app the brief for the exact generation that was asked for it.
+   * Hands the app the exact generation that was asked for the brief.
    *
-   * The generation binding is released immediately only when there is intentionally no brief.
-   * A valid settled brief is first persisted beside its token, then retried idempotently until
-   * the app acknowledges it. That keeps duplicate observations harmless without making one
-   * dropped POST destroy the only copy that can finish the transaction.
+   * Interrupted/failed/stopped outcomes are still explicit cancellation. A completed/otherwise
+   * deliverable generation is persisted beside its token, then retried idempotently until the
+   * app resolves and acknowledges its canonical final. DOM prose may be empty or fragmented;
+   * neither is authority to cancel a generation whose canonical final exists in the recorder.
    */
   async function deliverBrief(text, outcome) {
     const held = compactCapture;
@@ -7563,17 +7672,15 @@
       CLF_DOM.conversationId() === held.conversationId;
     if (!current()) return;
     const brief = String(text || '').trim();
-    // An interrupted or empty compaction is not a short brief — it is no brief. Half a
-    // handoff reads exactly like a whole one to the chat that receives it, which is why
-    // this is the one place the extension refuses to send something it has.
-    if (!brief || outcome === 'stopped' || outcome === 'interrupted' || outcome === 'failed') {
+    // Interrupted/failed/stopped are terminal page facts and can never become a valid handoff.
+    // Empty DOM prose is *not* one: the canonical ChatGPT message model can hold the complete
+    // final even when renderer fragmentation leaves this DOM reader with no useful text.
+    if (outcome === 'stopped' || outcome === 'interrupted' || outcome === 'failed') {
       releaseCapture();
       const why =
         outcome === 'stopped'
           ? 'The compaction turn was stopped, so nothing was compacted.'
-          : outcome === 'interrupted' || outcome === 'failed'
-            ? 'ChatGPT did not finish writing the brief, so nothing was compacted.'
-            : 'ChatGPT answered the compaction request with nothing, so nothing was compacted.';
+          : 'ChatGPT did not finish writing the brief, so nothing was compacted.';
       nativeBusy = false;
       nativePhase = '';
       pressedAt = 0;
@@ -7586,12 +7693,11 @@
       return;
     }
 
-    // First settled observer wins. If another observer runs while delivery is in flight it
-    // reuses these bytes rather than replacing the durable identity with a later DOM reading.
-    if (typeof held.summary !== 'string' || !held.summary.trim()) {
-      held.summary = brief;
-      rememberCapture();
-    }
+    // First settled observer wins. The DOM snapshot is diagnostic/legacy data; generation is
+    // the durable identity. Never replace either from a later transcript reading.
+    if (typeof held.summary !== 'string') held.summary = brief;
+    held.settled = true;
+    rememberCapture();
     nativeBusy = true;
     nativePhase = 'delivering';
     localError = '';
@@ -7947,8 +8053,6 @@
     }
   }
 
-  /** How long to wait for ChatGPT to actually stop after the stop button is pressed. */
-  const INTERRUPT_WAIT_MS = 15_000;
   /**
    * How long to wait for local tool calls and their recorder tail to settle before refusing.
    *
@@ -7993,6 +8097,48 @@
       if (Date.now() >= until) return false;
       await sleep(250);
     }
+  }
+
+  /**
+   * Waits for the one-way native Stop request to become visible on the page.
+   *
+   * This deliberately has no wall-clock timeout. A timeout cannot roll a Stop click back, so
+   * returning failure while ChatGPT may still honour that click later is dishonest and loses
+   * the only safe continuation path. MutationObserver is the right clock here as well as the
+   * faster one: background tabs throttle timers aggressively, while the Stop-control removal is
+   * itself the DOM edge we need. Navigation resolves false so the old document never continues a
+   * compaction in a different chat.
+   */
+  async function waitForGenerationStop(current) {
+    if (!current()) return false;
+    if (!CLF_DOM.generating()) return true;
+    if (typeof MutationObserver !== 'function' || !document.body) {
+      // Non-browser/test-degraded fallback. There is still no timeout after a destructive Stop;
+      // the existing sleep only yields until the page can answer the state question.
+      for (;;) {
+        if (!current()) return false;
+        if (!CLF_DOM.generating()) return true;
+        await sleep(250);
+      }
+    }
+    return await new Promise((resolve) => {
+      let done = false;
+      const finish = (value) => {
+        if (done) return;
+        done = true;
+        observer.disconnect();
+        resolve(value);
+      };
+      const check = () => {
+        if (!current()) return finish(false);
+        if (!CLF_DOM.generating()) return finish(true);
+      };
+      const observer = new MutationObserver(check);
+      observer.observe(document.body, { childList: true, subtree: true, attributes: true });
+      // Close the registration race: Stop may disappear between the pre-check above and
+      // observer.observe().
+      check();
+    });
   }
 
   async function cancelCompact() {
@@ -8732,7 +8878,7 @@
 
   function every(ms, fn) {
     const timer = setInterval(() => {
-      if (!alive) {
+      if (!recorderOperational()) {
         clearInterval(timer);
         return;
       }
@@ -8746,6 +8892,21 @@
   }
 
   let activityTimer = null;
+  /**
+   * One-shot work flags for the 1s safety tick.
+   *
+   * A settled 400k-token chat can keep hundreds of turn/tool nodes mounted. The old safety
+   * loop unconditionally ran observe() *and* renderPresentation() every second even when that
+   * DOM had not changed, which meant several transcript-wide querySelectorAll/Fiber joins per
+   * second forever. On the 2026-08-29 ERA handoff chat one renderer sat near one full CPU core
+   * and grew past 4 GiB while the tab was in the background; closing that tab was the only way
+   * to stop the work. MutationObserver and /activity already provide the real change clocks, so
+   * the interval is only a fallback now: it performs a full pass while a generation is live,
+   * while route/resume identity is unsettled, or once after a native transcript mutation asked
+   * for reconciliation. An idle unchanged chat pays only the cheap route/Stop checks.
+   */
+  let transcriptSweepNeeded = false;
+  let presentationSweepNeeded = false;
   function wakeActivityPull(forId = conversationId) {
     if (!forId || forId !== conversationId || CLF_DOM.conversationId() !== forId) return false;
     activityDirty = true;
@@ -8803,12 +8964,33 @@
     }, Math.max(0, delay));
   }
 
+  function periodicObservationTick() {
+    pollUrlCommand();
+    const pageConversation = CLF_DOM.conversationId();
+    const pageGenerating = Boolean(CLF_DOM.generating());
+    const routeUnsettled =
+      pageConversation !== conversationId && Boolean(pageConversation || conversationId);
+    const lifecycleActive =
+      generating || pageGenerating || routeUnsettled || resumeIdentityPending;
+    if (lifecycleActive || transcriptSweepNeeded) {
+      transcriptSweepNeeded = false;
+      observe();
+    }
+    syncTheme();
+    injectControl();
+    injectStage();
+    if (lifecycleActive || presentationSweepNeeded) {
+      presentationSweepNeeded = false;
+      renderPresentation(true);
+    }
+  }
+
   // Re-attach immediately when React swaps the composer out, rather than up to a second
   // later. Cheap because it does nothing unless our node has actually been detached.
   function watchComposer() {
     try {
       const observer = new MutationObserver(() => {
-        if (!alive) return;
+        if (!recorderOperational()) return;
         if (!control || !control.root.isConnected) injectControl();
         if (stagePanel && !stagePanel.root.isConnected) injectStage();
       });
@@ -8822,7 +9004,7 @@
   /** Apply popup changes immediately in every open ChatGPT tab. */
   if (globalThis.chrome && chrome.storage && chrome.storage.onChanged) {
     const storageChanged = (changes, areaName) => {
-      if (!alive) return;
+      if (!recorderOperational()) return;
       if (areaName !== 'local' || !changes) return;
       let changed = false;
       if (changes[RENDER_STREAM_KEY]) {
@@ -8847,10 +9029,7 @@
   /** Popup commands target this tab directly; no bridge credential is involved. */
   if (globalThis.chrome && chrome.runtime && chrome.runtime.onMessage) {
     const runtimeMessage = (message, _sender, sendResponse) => {
-      // Recorder takeover revokes every browser-facing control channel, not only observation.
-      // A predecessor left registered in this same isolated world can otherwise win a ping or
-      // revival response race against its successor even though sendToWorker() is already inert.
-      if (!alive) return false;
+      if (!recorderOperational()) return false;
       if (!message || typeof message.type !== 'string') return false;
       // background.js uses this only to distinguish a live isolated-world recorder from the
       // dead context Chrome leaves behind when an unpacked extension is reloaded while the
@@ -8970,6 +9149,10 @@
     .then(() => resumeOpenTurn().catch(() => undefined))
     .then(() => restoreCapture().catch(() => undefined))
     .then(() => {
+      // Publish the barrier immediately before the one authoritative first observation. Any
+      // observer callback queued during startup may run after this point, but by then durable
+      // turn identity has already been adopted/refused and duplicate-generation minting is safe.
+      observationReady = true;
       observe();
       commandReadinessInitialized = true;
       notifyCommandReadiness();
@@ -8993,15 +9176,7 @@
   watchTranscript();
 
   every(OBSERVE_MS, () => {
-    pollUrlCommand();
-    observe();
-    syncTheme();
-    injectControl();
-    injectStage();
-    // Relabelling on the observe tick as well as the activity tick: the calls are
-    // already known here, and ChatGPT rendering a block a second after we heard about
-    // its call used to mean waiting for the next poll to see the real label.
-    renderPresentation(true);
+    periodicObservationTick();
   });
   scheduleActivityPull(ACTIVITY_MS);
   if (typeof document !== 'undefined' && document.addEventListener) {
@@ -9015,23 +9190,7 @@
   }
   every(STATUS_MS, checkStatus);
 
-  // Only now, with every binding above initialised, does this recorder answer for itself.
-  // `chrome.runtime.id` is the exact orphan test: an invalidated isolated world keeps its
-  // globals and its timers but loses that property, so a successor can tell a live
-  // recorder it must not disturb from a dead one it must replace.
-  recorderHandle.healthy = () => {
-    if (!alive) return false;
-    try {
-      return !!globalThis.chrome && !!chrome.runtime && typeof chrome.runtime.id === 'string';
-    } catch {
-      return false;
-    }
-  };
-  recorderHandle.stop = () => {
-    // `alive` gates sendToWorker(), so this is what actually silences the old recorder:
-    // no observation, evidence or command of its can reach the app afterwards. Its
-    // intervals drain themselves on their next tick through every().
-    alive = false;
+  function releaseRecorderBindings() {
     if (activityTimer !== null) {
       clearTimeout(activityTimer);
       activityTimer = null;
@@ -9040,14 +9199,8 @@
       try {
         cleanup();
       } catch {
-        // Detached DOM and an invalidated extension world are both normal takeover states.
+        // Detached DOM and an invalidated extension world are both normal teardown states.
       }
-    }
-    try {
-      // Hand ChatGPT's own labels back before the successor paints its own.
-      unpaint();
-    } catch {
-      // A detached/rewritten DOM is not worth failing a handover over.
     }
     try {
       hideTip();
@@ -9061,6 +9214,33 @@
       control = null;
     } catch {
       // Presentation cleanup is best effort; ownership was already revoked by `alive=false`.
+    }
+  }
+
+  /**
+   * Stops an orphaned recorder without traversing ChatGPT's transcript.
+   *
+   * Extension reload invalidates chrome.runtime but can leave this JS context, its timers and
+   * MutationObservers alive. The safe response is to revoke those bindings in-place and do
+   * nothing else. In particular, do not unpaint/reconstruct historical turns: the next fresh
+   * document will receive the new extension normally.
+   */
+  function quiesceInvalidatedRecorder() {
+    if (!alive) return;
+    alive = false;
+    releaseRecorderBindings();
+  }
+
+  // Only now, with every binding above initialised, does this recorder answer for itself.
+  recorderHandle.healthy = () => recorderOperational();
+  recorderHandle.stop = () => {
+    if (!alive) return;
+    alive = false;
+    releaseRecorderBindings();
+    try {
+      unpaint();
+    } catch {
+      // A detached/rewritten DOM is not worth failing ordinary teardown over.
     }
   };
 
@@ -9097,6 +9277,7 @@
       runCommand,
       pollUrlCommand,
       startCompact,
+      periodicObservationTick,
       refreshFiber,
       fiberFor,
       readDescriptor,

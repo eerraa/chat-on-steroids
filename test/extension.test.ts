@@ -38,8 +38,8 @@ describe('extension release metadata', () => {
     expect(lock.version).toBe(APP_VERSION);
     expect(lock.packages?.['']?.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
-    expect(BRIDGE_PROTOCOL).toBe(9);
-    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 9;');
+    expect(BRIDGE_PROTOCOL).toBe(10);
+    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 10;');
   });
 
   /**
@@ -279,6 +279,48 @@ describe('ChatGPT DOM adapter', () => {
     // apart from the next, and the turn is what scopes it.
     expect(dom.errors()).toMatchObject([
       { text: 'Message delivery timed out. Please try again. Retry', node: failure, turnId: 'request-failed' }
+    ]);
+  });
+
+  it('recognises a localized response Retry surface structurally, without matching its language', () => {
+    const retry = new FakeNode({ 'data-testid': 'response-retry-button' }, '다시 시도');
+    const assistant = turn('assistant', 'request-localized-timeout')
+      .with('[data-message-id]', [])
+      .with('.markdown', [])
+      .with('button[data-testid*="retry" i]', [retry])
+      .with('[data-interrupted="true"]', []);
+    const dom = loadDom([assistant]);
+
+    expect(dom.messages()).toEqual([]);
+    expect(dom.errors()).toMatchObject([
+      {
+        text: 'ChatGPT response delivery failed and exposed a Retry control.',
+        node: retry,
+        turnId: 'request-localized-timeout'
+      }
+    ]);
+  });
+
+  it('accepts Regenerate only inside an explicit error surface, never as a normal-turn failure', () => {
+    const normalRegenerate = new FakeNode({ 'data-testid': 'regenerate-button' }, 'Regenerate');
+    const normal = turn('assistant', 'request-normal-regenerate')
+      .with('[data-message-id]', [])
+      .with('.markdown', [])
+      .with('button[data-testid*="regenerate" i]', [normalRegenerate])
+      .with('[data-interrupted="true"]', []);
+    expect(loadDom([normal]).errors()).toEqual([]);
+
+    const failedRegenerate = new FakeNode({ 'data-testid': 'regenerate-button' }, '다시 시도');
+    const failed = turn('assistant', 'request-error-regenerate')
+      .with('[data-message-id]', [])
+      .with('.markdown', [])
+      .with('[data-testid*="error" i] button[data-testid*="regenerate" i]', [failedRegenerate])
+      .with('[data-interrupted="true"]', []);
+    expect(loadDom([failed]).errors()).toMatchObject([
+      {
+        text: 'ChatGPT response delivery failed and exposed a Retry control.',
+        turnId: 'request-error-regenerate'
+      }
     ]);
   });
 
@@ -692,6 +734,55 @@ describe('worker settings authority', () => {
     });
     expect(fetch.mock.calls.some(([input]) => new URL(String(input)).pathname === '/settings')).toBe(false);
   });
+
+  it('forwards the exact stalled-rescue proof and compaction generation across the service-worker bridge', async () => {
+    const posted: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/compact/claim-auto' || url.pathname === '/compact') {
+        posted.push({ path: url.pathname, body: JSON.parse(String(init.body || '{}')) });
+        return response(200, { claimed: true, stored: true });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch });
+    await worker.registerTab(45);
+    await worker.send({ type: 'bind', conversationId: CHAT }, 45);
+
+    await worker.send(
+      { type: 'auto_compact_claim', conversationId: CHAT, stalledNearThreshold: true },
+      45
+    );
+    await worker.send(
+      {
+        type: 'compact',
+        conversationId: CHAT,
+        token: 'capture-token-123456',
+        turnId: 'g-exact-compaction-turn-1',
+        summary: 'legacy DOM snapshot'
+      },
+      45
+    );
+
+    expect(posted).toEqual([
+      {
+        path: '/compact/claim-auto',
+        body: { conversationId: CHAT, stalledNearThreshold: true }
+      },
+      {
+        path: '/compact',
+        body: {
+          conversationId: CHAT,
+          resume: true,
+          cancel: false,
+          token: 'capture-token-123456',
+          turnId: 'g-exact-compaction-turn-1',
+          summary: 'legacy DOM snapshot'
+        }
+      }
+    ]);
+  });
 });
 
 // ------------------------------------------------------------ command delivery
@@ -804,7 +895,7 @@ describe('extension command delivery', () => {
       session,
       fetch,
       tabsQuery: async () => [{ id: 41, windowId: 73, url: `https://chatgpt.com/c/${prime}` }],
-      tabsSendMessage: async () => ({ ok: true, recorderVersion: 10 })
+      tabsSendMessage: async () => ({ ok: true, recorderVersion: 15 })
     });
 
     // status is only a wake; placement comes from the exact conversation returned by the app,
@@ -822,7 +913,7 @@ describe('extension command delivery', () => {
     expect(session.data.opened).toBeUndefined();
   });
 
-  it('re-injects the recorder into already-open ChatGPT tabs after an extension reload', async () => {
+  it('does not inject scripts or CSS into already-open ChatGPT tabs after an extension update', async () => {
     const local = new FakeStorageArea(paired);
     const session = new FakeStorageArea();
     const worker = loadWorker({ local, session });
@@ -830,36 +921,41 @@ describe('extension command delivery', () => {
 
     await worker.installed('update');
 
-    expect(worker.tabsQuery).toHaveBeenCalledWith({
-      url: ['https://chatgpt.com/*', 'https://chat.openai.com/*']
-    });
-    expect(worker.scriptingExecuteScript.mock.calls).toEqual([
-      [{ target: { tabId: 41 }, files: ['chatgpt-dom.js'] }],
-      [{ target: { tabId: 41 }, world: 'MAIN', files: ['fiber.js'] }],
-      [{ target: { tabId: 41 }, files: ['content.js'] }],
-      [{ target: { tabId: 42 }, files: ['chatgpt-dom.js'] }],
-      [{ target: { tabId: 42 }, world: 'MAIN', files: ['fiber.js'] }],
-      [{ target: { tabId: 42 }, files: ['content.js'] }]
-    ]);
-    expect(worker.scriptingInsertCSS.mock.calls).toEqual([
-      [{ target: { tabId: 41 }, files: ['overlay.css'] }],
-      [{ target: { tabId: 42 }, files: ['overlay.css'] }]
-    ]);
+    expect(worker.scriptingExecuteScript).not.toHaveBeenCalled();
+    expect(worker.scriptingInsertCSS).not.toHaveBeenCalled();
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
   });
 
-  it('keeps a live recorder but revalidates the idempotent MAIN-world Fiber helper', async () => {
+  it('leaves a stale existing document untouched instead of attempting same-document recovery', async () => {
     const local = new FakeStorageArea(paired);
     const session = new FakeStorageArea();
     const worker = loadWorker({ local, session });
     worker.tabsQuery.mockResolvedValueOnce([{ id: 41 }]);
-    worker.tabsSendMessage.mockResolvedValueOnce({ ok: true, recorderVersion: 10 });
+    worker.tabsSendMessage.mockResolvedValueOnce({ ok: true, recorderVersion: 14 });
 
     await worker.installed('update');
 
-    expect(worker.tabsSendMessage).toHaveBeenCalledWith(41, { type: 'clf-recorder-ping' });
-    expect(worker.scriptingExecuteScript.mock.calls).toEqual([
-      [{ target: { tabId: 41 }, world: 'MAIN', files: ['fiber.js'] }]
-    ]);
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+    expect(worker.scriptingExecuteScript).not.toHaveBeenCalled();
+    expect(worker.scriptingInsertCSS).not.toHaveBeenCalled();
+  });
+
+  it('does not inject into existing ChatGPT documents on an ordinary service-worker cold start', async () => {
+    const local = new FakeStorageArea(paired);
+    const session = new FakeStorageArea();
+    const worker = loadWorker({
+      local,
+      session,
+      tabsQuery: async () => [{ id: 41, url: 'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }]
+    });
+
+    // background.js runs its cold-start recovery at module load. Let that promise chain settle;
+    // an ordinary MV3 wake may recover durable commands, but it may not probe or script an
+    // unrelated already-open ChatGPT document.
+    for (let turn = 0; turn < 4; turn += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+    expect(worker.scriptingExecuteScript).not.toHaveBeenCalled();
     expect(worker.scriptingInsertCSS).not.toHaveBeenCalled();
   });
 
@@ -1006,7 +1102,7 @@ describe('extension revival delivery', () => {
     worker.tabsSendMessage.mockImplementation(async (id: number, message: { type: string }) => {
       order.push(`${message.type}:${id}`);
       return message.type === 'clf-recorder-ping'
-        ? { ok: true, recorderVersion: 10 }
+        ? { ok: true, recorderVersion: 15 }
         : { ok: true, claimed: true };
     });
 
@@ -1031,7 +1127,7 @@ describe('extension revival delivery', () => {
     const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch: quiet() });
     worker.tabsQuery.mockResolvedValue([{ id: 4, windowId: 7, url: `https://chatgpt.com/c/${CHAT}` }]);
     worker.tabsSendMessage.mockImplementation(async (_id: number, message: { type: string }) => {
-      if (message.type === 'clf-recorder-ping') return { ok: true, recorderVersion: 10 };
+      if (message.type === 'clf-recorder-ping') return { ok: true, recorderVersion: 15 };
       // The app-opened fallback loaded faster and redeemed while background was pinging this
       // existing tab. The existing document truthfully reports that it did not get the lease.
       return { ok: true, claimed: false };
@@ -1100,7 +1196,7 @@ describe('extension revival delivery', () => {
     worker.tabsSendMessage.mockImplementation(async (id: number, message: { type: string }) => {
       if (id === 4) throw new Error('stale recorder');
       return message.type === 'clf-recorder-ping'
-        ? { ok: true, recorderVersion: 10 }
+        ? { ok: true, recorderVersion: 15 }
         : { ok: true, claimed: true };
     });
 
@@ -1122,7 +1218,7 @@ describe('extension revival delivery', () => {
     worker.tabsQuery.mockResolvedValue([{ id: 4, windowId: 7, url: `https://chat.openai.com/c/${CHAT}` }]);
     worker.tabsSendMessage.mockImplementation(async (_id: number, message: { type: string }) =>
       message.type === 'clf-recorder-ping'
-        ? { ok: true, recorderVersion: 10 }
+        ? { ok: true, recorderVersion: 15 }
         : { ok: true, claimed: true }
     );
 
@@ -1141,7 +1237,7 @@ describe('extension revival delivery', () => {
     worker.tabsQuery.mockResolvedValue([{ id: 4, windowId: 7, url: `https://chatgpt.com/c/${CHAT}` }]);
     worker.tabsSendMessage.mockImplementation(async (_id: number, message: { type: string }) =>
       message.type === 'clf-recorder-ping'
-        ? { ok: true, recorderVersion: 10 }
+        ? { ok: true, recorderVersion: 15 }
         : { ok: true, claimed: true }
     );
 
@@ -1168,7 +1264,7 @@ describe('extension revival delivery', () => {
     worker.tabsSendMessage.mockImplementation(async (id: number, message: { type: string }) => {
       expect(id).toBe(4);
       return message.type === 'clf-recorder-ping'
-        ? { ok: true, recorderVersion: 10 }
+        ? { ok: true, recorderVersion: 15 }
         : { ok: true, claimed: true };
     });
 
@@ -1272,7 +1368,7 @@ describe('extension revival delivery', () => {
       tabsSendMessage: async (_tabId, message) => {
         if (message.type === 'clf-recorder-ping') {
           if (!recorderReady) throw new Error('receiver not ready yet');
-          return { ok: true, recorderVersion: 10 };
+          return { ok: true, recorderVersion: 15 };
         }
         if (message.type === 'clf-run-command') return { ok: true, claimed: true };
         return { ok: true };
@@ -1325,7 +1421,7 @@ describe('extension revival delivery', () => {
       tabsSendMessage: async (tabId, message) => {
         if (message.type === 'clf-recorder-ping') {
           if (tabId === 4 && !recorderReady) throw new Error('original recorder is still starting');
-          return { ok: true, recorderVersion: 10 };
+          return { ok: true, recorderVersion: 15 };
         }
         if (message.type === 'clf-run-command') {
           if (tabId !== 4) throw new Error('fallback must never receive the revival command');
@@ -1401,7 +1497,7 @@ describe('extension revival delivery', () => {
       tabsSendMessage: async (tabId, message) => {
         if (message.type === 'clf-recorder-ping') {
           if (tabId === 4) throw new Error('surviving worker recorder is remounting');
-          return { ok: true, recorderVersion: 10 };
+          return { ok: true, recorderVersion: 15 };
         }
         if (message.type === 'clf-run-command') {
           if (tabId !== 4) throw new Error('the current fallback must never steal this wake');

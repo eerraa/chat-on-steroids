@@ -72,6 +72,7 @@ const {
   stageQueuedWorkerRevivals,
   stageFinishAgent,
   stageWorkerConversationFinish,
+  stageWorkerConversationSleep,
   stageMessages,
   stageSpawn,
   snapshotSwarm,
@@ -209,7 +210,18 @@ describe('spawning a run', () => {
     expect(pendingWorkerSpawns()).toEqual([]);
   });
 
-  it('enforces the configured live-worker limit', () => {
+  it('enforces the configured live-worker limit atomically', () => {
+    expect(() =>
+      spawn({
+        workers: [{ task: 'one' }, { task: 'two' }, { task: 'three' }, { task: 'four' }],
+        caller: prime
+      })
+    ).toThrow(/limit|maximum|too many/i);
+    // An oversized first request is a normal capacity refusal, not a partial spawn. This is
+    // the production shape behind the UI's "Refused to create 4 worker agents" row.
+    expect(swarmRunning()).toBe(false);
+    expect(pendingWorkerSpawns()).toEqual([]);
+
     startSwarm(3);
     expect(() => spawn({ workers: [{ task: 'one too many' }], caller: prime })).toThrow(/limit|maximum|too many/i);
   });
@@ -909,6 +921,76 @@ describe('a worker that is sleeping', () => {
     const revival = pendingWorkerRevivals()[0]!;
     expect(revival.text).toContain('now inspect only the lexer');
     expect(revival.text).not.toContain('parser edge case');
+  });
+
+  it('stages an observed failed turn as reusable sleep without inventing a worker result', async () => {
+    const persisted: Array<ReturnType<typeof snapshotSwarm>> = [];
+    onSwarmPersistNow(async (snapshot) => {
+      persisted.push(snapshot);
+    });
+    startSwarm(1);
+    startWorker('worker-1');
+
+    const staged = stageWorkerConversationSleep(
+      'c-worker-1',
+      'Its ChatGPT turn failed before producing a final worker result: transport failure.'
+    );
+    expect(staged?.repeat).toBe(false);
+    expect(await persistCriticalSwarmNow()).toBe(true);
+    const projected = persisted.at(-1)!;
+    expect(projected.agents.find((entry) => entry.info.id === 'worker-1')?.info).toMatchObject({
+      state: 'sleeping',
+      result: null,
+      revivable: true
+    });
+    expect(projected.agents.find((entry) => entry.info.id === PRIME_ID)?.queue.at(-1)?.text).toMatch(
+      /failed before producing a final worker result/i
+    );
+    // Critical staging is not publication: status still says active until the exact disk
+    // generation carrying both the sleep and the prime report has been accepted.
+    expect(swarmState().agents.find((entry) => entry.id === 'worker-1')?.state).toBe('active');
+
+    staged!.rollback();
+    expect(swarmState().agents.find((entry) => entry.id === 'worker-1')?.state).toBe('active');
+
+    const retry = stageWorkerConversationSleep(
+      'c-worker-1',
+      'Its ChatGPT turn failed before producing a final worker result: transport failure.'
+    );
+    expect(await persistCriticalSwarmNow()).toBe(true);
+    retry!.commit();
+    expect(swarmState().agents.find((entry) => entry.id === 'worker-1')).toMatchObject({
+      state: 'sleeping',
+      result: null,
+      revivable: true
+    });
+  });
+
+  it('keeps an observed no-result stop truthful when the worker crosses its context ceiling before commit', async () => {
+    const persisted: Array<ReturnType<typeof snapshotSwarm>> = [];
+    onSwarmPersistNow(async (snapshot) => {
+      persisted.push(snapshot);
+    });
+    startSwarm(1);
+    startWorker('worker-1');
+    const staged = stageWorkerConversationSleep(
+      'c-worker-1',
+      'Its ChatGPT turn failed before producing a final worker result: transport failure.'
+    );
+    noteAgentContextTokens('c-worker-1', WORKER_CONTEXT_CEILING_TOKENS);
+
+    expect(await persistCriticalSwarmNow()).toBe(true);
+    const projected = persisted.at(-1)!;
+    expect(projected.agents.find((entry) => entry.info.id === 'worker-1')?.info).toMatchObject({
+      state: 'finished',
+      result: null,
+      revivable: false,
+      contextTokens: WORKER_CONTEXT_CEILING_TOKENS
+    });
+    expect(projected.agents.find((entry) => entry.info.id === PRIME_ID)?.queue.at(-1)?.text).toMatch(
+      /stopped without a result.*context limit/i
+    );
+    staged!.commit();
   });
 
   it('frees its slot without leaving the run, and is woken by being messaged', () => {

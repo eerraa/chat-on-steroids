@@ -124,6 +124,7 @@ interface Hook {
   runCommand(): Promise<void>;
   pollUrlCommand(): void;
   startCompact(): Promise<void>;
+  periodicObservationTick(): void;
   chronological<T extends { seq: number; time: number; kind: string; turnId?: string | null }>(entries: T[]): T[];
   streamTurnGroups(
     entries: Array<{ seq: number; time: number; kind: string; turnId?: string | null }>
@@ -181,7 +182,8 @@ async function harness(
   url = 'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
   replies: Record<string, (message: Record<string, any>) => unknown> = {},
   before: (document: Document, dom: JSDOM) => void = () => undefined,
-  afterEditingSetup: (document: Document, dom: JSDOM) => void = () => undefined
+  afterEditingSetup: (document: Document, dom: JSDOM) => void = () => undefined,
+  afterDomSetup: (document: Document, dom: JSDOM) => void = () => undefined
 ): Promise<Harness> {
   const dom = new JSDOM(PAGE, { url, runScripts: 'outside-only', pretendToBeVisual: true });
   const window = dom.window as unknown as Window & typeof globalThis & Record<string, any>;
@@ -214,6 +216,7 @@ async function harness(
 
   window.chrome = {
     runtime: {
+      id: 'clf-test-extension',
       async sendMessage(message: Record<string, any>) {
         sent.push(message);
         const answer = reply.get(message.type);
@@ -291,6 +294,7 @@ async function harness(
   };
 
   window.eval(domSource);
+  afterDomSetup(window.document, dom);
   window.eval(contentSource);
   if (!hook) throw new Error('content.js did not expose its test hook');
 
@@ -359,6 +363,45 @@ describe('one synchronous page snapshot per observer turn', () => {
     live.hook.observe();
 
     expect(reads).toBe(1);
+  });
+
+  it('does not rescan an unchanged idle transcript every second', async () => {
+    live = await harness();
+    const domApi = (live.window as any).CLF_DOM;
+    const originalTurns = domApi.turns;
+    const originalPresentationTurns = domApi.presentationTurns;
+    let turnReads = 0;
+    let presentationReads = 0;
+    domApi.turns = (...args: unknown[]) => {
+      turnReads++;
+      return originalTurns(...args);
+    };
+    domApi.presentationTurns = (...args: unknown[]) => {
+      presentationReads++;
+      return originalPresentationTurns(...args);
+    };
+
+    live.hook.periodicObservationTick();
+
+    expect(turnReads).toBe(0);
+    expect(presentationReads).toBe(0);
+  });
+
+  it('keeps the one-second lifecycle safety pass while ChatGPT is generating', async () => {
+    live = await harness();
+    startGenerating(live.document);
+    await settle();
+    const domApi = (live.window as any).CLF_DOM;
+    const originalTurns = domApi.turns;
+    let turnReads = 0;
+    domApi.turns = (...args: unknown[]) => {
+      turnReads++;
+      return originalTurns(...args);
+    };
+
+    live.hook.periodicObservationTick();
+
+    expect(turnReads).toBeGreaterThan(0);
   });
 });
 
@@ -5382,6 +5425,97 @@ describe('a stop button that goes missing while the turn is still running', () =
     expect(ends[0]!.detail).toBe('Message delivery timed out. Please try again.');
   });
 
+  it('closes a localized transport timeout as failed even when ChatGPT leaves a hidden Stop control behind', async () => {
+    live = await harness();
+    startGenerating(live.document);
+    const section = assistantTurn(live.document, 'turn-localized-timeout', []);
+    live.hook.observe();
+    await settle();
+
+    // Production 2026-08-29: the visible page had no Stop control, but the recorder remained
+    // generating for more than ten minutes. Model that renderer state directly: the old Stop
+    // node is still mounted but CSS-hidden, while the failed response exposes a localized Retry
+    // card rather than an English role=alert/Markdown string.
+    const stop = live.document.querySelector('[data-testid="stop-button"]') as HTMLButtonElement;
+    stop.style.display = 'none';
+    const failure = live.document.createElement('div');
+    const label = live.document.createElement('span');
+    label.textContent = '메시지 전송 시간이 초과되었습니다. 다시 시도해 주세요.';
+    const retry = live.document.createElement('button');
+    retry.setAttribute('data-testid', 'response-retry-button');
+    retry.textContent = '다시 시도';
+    failure.append(label, retry);
+    section.append(failure);
+
+    live.hook.observe();
+    await settle();
+    live.advance(live.hook.TURN_SETTLE_MS + 1);
+    live.hook.observe();
+    await settle();
+
+    const ends = emitted(live.sent, 'turn_end').map((entry) => entry.event);
+    expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatchObject({
+      outcome: 'failed',
+      detail: 'ChatGPT response delivery failed and exposed a Retry control.'
+    });
+    expect(emitted(live.sent, 'chat_error').map((entry) => entry.event.text)).toContain(
+      'ChatGPT response delivery failed and exposed a Retry control.'
+    );
+  });
+
+  it('lets an exact Retry failure outrank a stale Stop control that remains mounted', async () => {
+    live = await harness();
+    startGenerating(live.document);
+    const section = assistantTurn(live.document, 'turn-retry-outranks-stop', []);
+    live.hook.observe();
+    await settle();
+
+    // Leave Stop fully mounted/actionable. The explicit failed-response action belongs to this
+    // exact generation and is stronger terminal evidence than stale composer chrome.
+    const retry = live.document.createElement('button');
+    retry.setAttribute('data-testid', 'response-retry-button');
+    retry.textContent = '다시 시도';
+    section.append(retry);
+    live.hook.observe();
+    await settle();
+    live.advance(live.hook.TURN_SETTLE_MS + 1);
+    live.hook.observe();
+    await settle();
+
+    expect(emitted(live.sent, 'turn_end').map((entry) => entry.event)).toEqual([
+      expect.objectContaining({ outcome: 'failed' })
+    ]);
+  });
+
+  it('attributes a turn-external response Retry card to the generation that first saw it', async () => {
+    live = await harness();
+    startGenerating(live.document);
+    assistantTurn(live.document, 'turn-external-retry-card', []);
+    live.hook.observe();
+    await settle();
+
+    // Some ChatGPT errors are toast/status siblings rather than children of the assistant
+    // section. The node has no page turn id, so the existing first-seen generation fence is the
+    // exact authority: whichever local turn first observes this occurrence owns it.
+    const retry = live.document.createElement('button');
+    retry.setAttribute('data-testid', 'response-retry-button');
+    retry.textContent = '다시 시도';
+    live.document.querySelector('#thread')!.append(retry);
+    live.hook.observe();
+    await settle();
+    live.advance(live.hook.TURN_SETTLE_MS + 1);
+    live.hook.observe();
+    await settle();
+
+    expect(emitted(live.sent, 'turn_end').map((entry) => entry.event)).toEqual([
+      expect.objectContaining({
+        outcome: 'failed',
+        detail: 'ChatGPT response delivery failed and exposed a Retry control.'
+      })
+    ]);
+  });
+
   it('ends a genuinely finished turn exactly once', async () => {
     live = await harness();
     startGenerating(live.document);
@@ -5671,6 +5805,39 @@ describe('a content script reloaded into a turn already in flight', () => {
     const order = live.sent.map((message) => message.type);
     expect(order.indexOf('bind')).toBeGreaterThanOrEqual(0);
     expect(order.indexOf('bind')).toBeLessThan(order.indexOf('events'));
+  });
+
+  it('does not let a transcript mutation outrun the reload identity handshake', async () => {
+    let page: Document | null = null;
+    let mutated = false;
+    live = await harness(
+      'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      {
+        status: () => {
+          if (!mutated && page) {
+            mutated = true;
+            const liveTurn = page.querySelector('[data-turn-id="turn-live"]');
+            const progress = page.createElement('div');
+            progress.textContent = 'A live token landed while startup was restoring identity.';
+            liveTurn?.append(progress);
+          }
+          return { connected: true, paired: true, port: 8765, pending: 0 };
+        },
+        activity: () => activity({ activeTurnId: 'g-old-run-0-4' })
+      },
+      (document) => {
+        page = document;
+        midTurn(document);
+      }
+    );
+    await settle();
+
+    expect(mutated).toBe(true);
+    // The MutationObserver is installed before the async startup chain settles. It must not
+    // call observe() early and mint a fresh generation before resumeOpenTurn() can adopt the
+    // durable pre-reload turn. That split is the root of the live UNKNOWN/restart cascade.
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
+    expect(emitted(live.sent, 'turn_end')).toHaveLength(0);
   });
 
   it('waits for durable turn identity when the first reload activity request misses the app', async () => {
@@ -7948,7 +8115,7 @@ describe('the Compact & resume control', () => {
     expect(live.document.querySelector('.clf-pill-text')!.textContent).toContain('Could not verify');
   });
 
-  it('leaves the old chat alone and never opens a request at all when the turn will not stop', async () => {
+  it('keeps ownership after issuing Stop and compacts when a delayed stop finally lands', async () => {
     live = await harness(undefined, {
       // Positively prove this is an ordinary chat first; the test is about ChatGPT refusing the
       // later Stop, not about the separate unknown-role authority fence.
@@ -7967,18 +8134,37 @@ describe('the Compact & resume control', () => {
     live.hook.injectControl();
     startGenerating(live.document); // and nothing ever clears it
     const sends = watchSend(live.document);
+    const stop = live.document.querySelector('[data-testid="stop-button"]') as HTMLButtonElement;
+    let stopClicks = 0;
+    stop.addEventListener('click', () => {
+      stopClicks += 1;
+      // Deliberately do not remove Stop yet. The production regression was a hidden/background
+      // tab where ChatGPT acknowledged this click well after the old 15-second budget.
+    });
 
-    await live.hook.startCompact();
+    let completed = false;
+    const pending = live.hook.startCompact().then(() => {
+      completed = true;
+    });
+    await settle(100);
 
-    // Never typed, never sent — and no app-side request to withdraw, because stopping the
-    // turn now happens *before* asking. The request is what makes the app take its copy of
-    // the recording, so a conversation that will not hold still never gets that far, and
-    // there is no window in which a late save_handoff could save a brief and open a chat
-    // for a run that gave up.
+    expect(stopClicks).toBe(1);
+    // The old implementation had already declared "would not stop" by this point and released
+    // its compaction state, even though the irreversible Stop request was still outstanding.
+    // The new path remains the owner of that stop and has not taken the app-side snapshot yet.
     expect(composerText(live.document)).toBe('');
     expect(sends()).toBe(0);
     expect(live.sent.filter((message) => message.type === 'compact')).toEqual([]);
-    expect(live.document.querySelector('.clf-pill-text')!.textContent).toContain('would not stop');
+    expect(completed).toBe(false);
+
+    // Much later, ChatGPT finally reflects the already-issued Stop. Mutation delivery, not a
+    // foreground timer, resumes the same transaction and produces the handoff request once.
+    live.advance(60_000);
+    stopGenerating(live.document);
+    await settle(100);
+    await pending;
+    expect(completed).toBe(true);
+    expect(startedCompactions(live)).toHaveLength(1);
   });
 
   it('never overwrites a draft the user is writing', async () => {
@@ -8493,106 +8679,6 @@ describe('the fresh chat the app opened', () => {
         error: expect.stringMatching(/page changed|fresh chat|navigation/i)
       })
     ]);
-  });
-
-  it('abandons a redeemed bootstrap when recorder takeover supersedes its document owner', async () => {
-    let redeemCalls = 0;
-    let releaseFirst!: (value: unknown) => void;
-    const firstRedeem = new Promise<unknown>((resolve) => {
-      releaseFirst = resolve;
-    });
-    let sends = 0;
-    live = await harness(
-      'https://chatgpt.com/?clf=cmd-recorder-takeover#clf=cmd-recorder-takeover',
-      {
-        redeem: () => {
-          redeemCalls++;
-          // The predecessor owns the first request. Recovery injects a successor while that
-          // request is unresolved; its own marker attempt is refused so only the stale
-          // predecessor can accidentally type the bootstrap in this repro.
-          return redeemCalls === 1 ? firstRedeem : { ok: false, error: 'command_taken' };
-        },
-        ack: () => ({ ok: true })
-      },
-      (document) => {
-        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
-          sends++;
-        });
-      }
-    );
-    expect(redeemCalls).toBe(1);
-
-    const window = live.window as any;
-    window.chrome.runtime.id = 'clf-extension-id';
-    window.__CLF_CONTENT_RECORDER__.healthy = () => false;
-    window.CLF_TEST_HOOK = () => undefined;
-    window.eval(contentSource);
-    await settle();
-    expect(redeemCalls).toBe(2);
-
-    releaseFirst({
-      ok: true,
-      command: {
-        id: 'cmd-recorder-takeover',
-        type: 'worker',
-        text: 'Only the authoritative recorder may send this.',
-        agent: 'worker-1'
-      }
-    });
-    await settle(400);
-
-    expect(sends).toBe(0);
-    expect(composerText(live.document)).toBe('');
-  });
-
-  it('removes predecessor body UI and delegated DOM handlers during recorder takeover', async () => {
-    live = await harness();
-    expect(live.listenerCounts()).toEqual({ runtime: 1, storage: 1 });
-    live.hook.injectControl();
-    live.hook.toggleMenu();
-    await settle();
-
-    const oldMenu = live.document.querySelector('.clf-menu') as HTMLElement;
-    expect(oldMenu).not.toBeNull();
-    expect(oldMenu.hidden).toBe(false);
-
-    // Tips are delegated from the document, so use an ordinary body node to prove the old
-    // recorder owns a live document-level listener rather than a handler attached to its menu.
-    const tipAnchor = live.document.createElement('button');
-    tipAnchor.setAttribute('data-clf-tip', 'predecessor tip');
-    live.document.body.append(tipAnchor);
-    tipAnchor.focus();
-    await settle();
-    const oldTip = live.document.querySelector('.clf-tip') as HTMLElement;
-    expect(oldTip).not.toBeNull();
-    expect(oldTip.hidden).toBe(false);
-
-    const window = live.window as any;
-    window.chrome.runtime.id = 'clf-extension-id';
-    window.__CLF_CONTENT_RECORDER__.healthy = () => false;
-    let successor: Hook | null = null;
-    window.CLF_TEST_HOOK = (api: Hook) => {
-      successor = api;
-    };
-    window.eval(contentSource);
-    await settle(120);
-
-    expect(oldMenu.isConnected).toBe(false);
-    expect(oldTip.isConnected).toBe(false);
-    expect(live.document.querySelectorAll('.clf-menu')).toHaveLength(0);
-    expect(live.document.querySelectorAll('.clf-tip')).toHaveLength(0);
-    expect(successor).not.toBeNull();
-    // Browser-extension listeners live outside the DOM cleanup above. Leaving the predecessor's
-    // runtime/storage subscriptions behind lets it answer health/revival messages or repaint the
-    // page after ownership was revoked, racing the successor in the same isolated world.
-    expect(live.listenerCounts()).toEqual({ runtime: 1, storage: 1 });
-
-    // The replacement owns exactly one delegated tooltip listener/surface. If the predecessor's
-    // listener survived, this focus would create both its stale bubble and the successor's.
-    tipAnchor.blur();
-    tipAnchor.focus();
-    await settle();
-    expect(live.document.querySelectorAll('.clf-tip')).toHaveLength(1);
   });
 
   it('never submits a worker bootstrap mixed with text typed after the tab took focus', async () => {
@@ -9845,6 +9931,54 @@ describe('the context meter and automatic compaction', () => {
     expect(live.sent.filter((message) => message.type === 'auto_compact_claim')).toEqual([]);
   });
 
+  it('rescues a near-threshold stalled turn through the normal compaction chain', async () => {
+    live = await harness(undefined, {
+      activity: () => withContext(381_494, settings({ auto: true, threshold: 400_000 }), { autoCompactReady: false }),
+      auto_compact_claim: (message) => {
+        expect(message).toMatchObject({ stalledNearThreshold: true });
+        return { ok: true, data: { claimed: true } };
+      },
+      compact: () => ({ ok: true, data: { started: true, job: null } })
+    });
+    live.hook.injectControl();
+    startGenerating(live.document);
+    assistantTurn(live.document, 'turn-stalled-auto', []);
+    const stop = live.document.querySelector('[data-testid="stop-button"]') as HTMLButtonElement;
+    stop.addEventListener('click', () => stopGenerating(live!.document));
+    live.hook.observe();
+    await settle();
+
+    // The current production failure stalled at 381,494 local tokens against a 400k configured
+    // line. The local estimate omits provider/system context, so once the exact turn has also
+    // been silent for the full stall window this is close enough to treat as context pressure
+    // and run the same owned Stop -> handoff chain as an ordinary threshold crossing.
+    live.advance(live.hook.STALL_MS + 1);
+    await live.hook.pullActivity();
+    await settle();
+
+    expect(live.sent.filter((message) => message.type === 'auto_compact_claim')).toHaveLength(1);
+    expect(startedCompactions(live)).toHaveLength(1);
+  });
+
+  it('does not use Auto Compact as a general watchdog for a small stalled chat', async () => {
+    live = await harness(undefined, {
+      activity: () => withContext(200_000, settings({ auto: true, threshold: 400_000 }), { autoCompactReady: false }),
+      auto_compact_claim: () => ({ ok: true, data: { claimed: true } }),
+      compact: () => ({ ok: true, data: { started: true, job: null } })
+    });
+    live.hook.injectControl();
+    startGenerating(live.document);
+    assistantTurn(live.document, 'turn-small-stall', []);
+    live.hook.observe();
+    await settle();
+    live.advance(live.hook.STALL_MS + 1);
+    await live.hook.pullActivity();
+    await settle();
+
+    expect(live.sent.filter((message) => message.type === 'auto_compact_claim')).toEqual([]);
+    expect(startedCompactions(live)).toEqual([]);
+  });
+
   it('interrupts the turn it is standing in and compacts exactly once', async () => {
     let ready = true;
     live = await harness(undefined, {
@@ -10201,7 +10335,12 @@ describe('binding the brief to the generation that wrote it', () => {
     await settle();
 
     expect(delivered(live)).toHaveLength(2);
-    expect(delivered(live)[1]).toMatchObject({ token: TOKEN, summary: delivered(live)[0]!.summary });
+    expect(delivered(live)[0]!.turnId).toMatch(/^g-/);
+    expect(delivered(live)[1]).toMatchObject({
+      token: TOKEN,
+      turnId: delivered(live)[0]!.turnId,
+      summary: delivered(live)[0]!.summary
+    });
     expect(live.window.sessionStorage.getItem('clf-compact-capture')).toBeNull();
   });
 
@@ -10225,7 +10364,8 @@ describe('binding the brief to the generation that wrote it', () => {
             generation: 'g-finished-before-reload',
             priorGeneration: null,
             armedAt: 1_700_000_000_000,
-            summary: brief
+            summary: brief,
+            settled: true
           })
         );
       }
@@ -10233,7 +10373,48 @@ describe('binding the brief to the generation that wrote it', () => {
     await settle();
 
     expect(delivered(live)).toHaveLength(1);
-    expect(delivered(live)[0]).toMatchObject({ token: TOKEN, summary: brief });
+    expect(delivered(live)[0]).toMatchObject({
+      token: TOKEN,
+      turnId: 'g-finished-before-reload',
+      summary: brief
+    });
+    expect(live.window.sessionStorage.getItem('clf-compact-capture')).toBeNull();
+    expect(withdrawn(live)).toEqual([]);
+  });
+
+  it('retries a settled generation after reload even when the DOM snapshot had no usable prose', async () => {
+    live = await harness(
+      `https://chatgpt.com/c/${CHAT}`,
+      {
+        ...compactionReplies(),
+        compact: (message) =>
+          message.turnId === 'g-canonical-only-before-reload' && message.summary === undefined
+            ? { ok: true, data: { stored: true, job: null } }
+            : { ok: false, error: 'unexpected_compact_shape' }
+      },
+      (_document, dom) => {
+        dom.window.sessionStorage.setItem(
+          'clf-compact-capture',
+          JSON.stringify({
+            token: TOKEN,
+            conversationId: CHAT,
+            generation: 'g-canonical-only-before-reload',
+            priorGeneration: null,
+            armedAt: 1_700_000_000_000,
+            summary: '',
+            settled: true
+          })
+        );
+      }
+    );
+    await settle();
+
+    expect(delivered(live)).toEqual([]);
+    const captures = live.sent.filter(
+      (message) => message.type === 'compact' && message.turnId === 'g-canonical-only-before-reload'
+    );
+    expect(captures).toHaveLength(1);
+    expect(captures[0]).not.toHaveProperty('summary');
     expect(live.window.sessionStorage.getItem('clf-compact-capture')).toBeNull();
     expect(withdrawn(live)).toEqual([]);
   });
@@ -10407,44 +10588,22 @@ describe('binding the brief to the generation that wrote it', () => {
   });
 });
 
-/**
- * One live recorder per document — and the ability to replace a dead one.
- *
- * Chrome keys the isolated world by extension id and leaves that JS context standing when the
- * extension reloads; what it invalidates is `chrome.runtime`. The orphan therefore keeps its
- * globals, and a guard that bailed out on a global marker made the recovery injection from
- * runtime.onInstalled a no-op — leaving the document with a recorder that can never send.
- */
+/** One recorder belongs to one fresh document; extension reload never hot-swaps that document. */
 describe('one live isolated-world recorder per document', () => {
   it('reports the recorder protocol version rather than the unrelated Fiber protocol version', async () => {
     live = await harness();
 
     await expect(live.runtimeMessage({ type: 'clf-recorder-ping' })).resolves.toEqual({
       ok: true,
-      recorderVersion: 10
+      recorderVersion: 15
     });
   });
 
-  it('leaves a healthy incumbent recorder alone', async () => {
+  it('never replaces an incumbent recorder inside the same document', async () => {
     live = await harness();
     const window = live.window as any;
-    window.chrome.runtime.id = 'clf-extension-id';
-    let successor: any = null;
-    window.CLF_TEST_HOOK = (api: any) => {
-      successor = api;
-    };
-
-    window.eval(contentSource);
-    await settle();
-
-    expect(successor).toBeNull();
-  });
-
-  it('supersedes a recorder orphaned by an extension reload', async () => {
-    live = await harness();
-    const window = live.window as any;
-    window.chrome.runtime.id = 'clf-extension-id';
-    // The extension reloads. The old script keeps running, and keeps its globals.
+    const incumbent = window.__CLF_CONTENT_RECORDER__;
+    // Model extension Reload: the old isolated world remains but its runtime identity is gone.
     delete window.chrome.runtime.id;
     let successor: any = null;
     window.CLF_TEST_HOOK = (api: any) => {
@@ -10454,46 +10613,44 @@ describe('one live isolated-world recorder per document', () => {
     window.eval(contentSource);
     await settle();
 
-    expect(successor).toBeTruthy();
-    expect(successor).not.toBe(live.hook);
-    // And the replacement is the one that observes from here on.
-    const before = live.sent.length;
-    successor.observe();
-    await settle();
-    expect(live.sent.length).toBeGreaterThanOrEqual(before);
+    expect(successor).toBeNull();
+    expect(window.__CLF_CONTENT_RECORDER__).toBe(incumbent);
   });
 
-  it('silences the superseded recorder before later connector mutations can trigger Fiber scans', async () => {
+  it('self-quiesces an orphaned recorder before a later page mutation can scan history or Fiber', async () => {
     live = await harness();
     const window = live.window as any;
-    window.chrome.runtime.id = 'clf-extension-id';
-    // Model recovery deciding this incumbent is no longer authoritative while keeping a live
-    // runtime for the replacement. The predecessor's stop() must make its DOM observers inert;
-    // otherwise every extension reload leaves another observer that performs a MAIN-world Fiber
-    // round-trip for each connector mutation, multiplying work in long-running ChatGPT tabs.
-    window.__CLF_CONTENT_RECORDER__.healthy = () => false;
-    let successor: any = null;
-    window.CLF_TEST_HOOK = (api: any) => {
-      successor = api;
+    const api = window.CLF_DOM;
+    let turnReads = 0;
+    let presentationReads = 0;
+    const turns = api.turns;
+    const presentationTurns = api.presentationTurns;
+    api.turns = (...args: unknown[]) => {
+      turnReads += 1;
+      return turns(...args);
     };
-    window.eval(contentSource);
-    await settle(400);
-    expect(successor).toBeTruthy();
+    api.presentationTurns = (...args: unknown[]) => {
+      presentationReads += 1;
+      return presentationTurns(...args);
+    };
+    expect(live.listenerCounts()).toEqual({ runtime: 1, storage: 1 });
 
     const originalPost = window.postMessage.bind(window);
     let fiberAsks = 0;
     window.postMessage = (message: any, targetOrigin: string) => {
-      if (message && message.source === 'clf-fiber-ask') fiberAsks++;
+      if (message && message.source === 'clf-fiber-ask') fiberAsks += 1;
       return originalPost(message, targetOrigin);
     };
 
-    const section = assistantTurn(live.document, 'turn-after-recorder-takeover', []);
+    delete window.chrome.runtime.id;
+    const section = assistantTurn(live.document, 'turn-after-extension-reload', []);
     section.append(toolBlock(live.document, 'Called tool!'));
     await settle(50);
 
-    // Exactly the replacement is allowed to react. Before the fix the stopped predecessor's
-    // watchToolRows observer also called refreshFiber(), producing a second page-context scan.
-    expect(fiberAsks).toBe(1);
+    expect(fiberAsks).toBe(0);
+    expect(turnReads).toBe(0);
+    expect(presentationReads).toBe(0);
+    expect(live.listenerCounts()).toEqual({ runtime: 0, storage: 0 });
   });
 });
 

@@ -55,6 +55,8 @@ let base: string;
 let token: string | null = null;
 /** Every URL the app asked the OS to open. */
 const opened: string[] = [];
+/** Canonical compaction finals already seeded for the capture helper in this test history. */
+const recordedCompactionFinals = new Set<string>();
 
 function request(
   method: string,
@@ -125,8 +127,47 @@ async function press(conversationId = CHAT_A): Promise<{ token: string; prompt: 
 }
 
 /** Hands over the compaction turn's answer, the way the watching page does. */
-function capture(token: string, summary = BRIEF, conversationId = CHAT_A) {
-  return request('POST', '/compact', { body: { conversationId, token, summary } });
+async function capture(
+  token: string,
+  summary = BRIEF,
+  conversationId = CHAT_A,
+  turnId?: string,
+  recordCanonical = true
+) {
+  const exactTurnId =
+    turnId ?? `g-capture-${token.replace(/[^A-Za-z0-9._:-]/g, '').slice(0, 80) || 'unknown'}`;
+  const key = `${conversationId}\u0000${exactTurnId}`;
+  if (recordCanonical && !recordedCompactionFinals.has(key)) {
+    await recordCompactionFinal(exactTurnId, summary, conversationId);
+  }
+  return request('POST', '/compact', {
+    body: { conversationId, token, turnId: exactTurnId, summary }
+  });
+}
+
+/** Records the exact canonical final assistant message for one browser-local generation. */
+async function recordCompactionFinal(turnId: string, text: string, conversationId = CHAT_A): Promise<void> {
+  const at = Date.now();
+  const reply = await request('POST', '/events', {
+    body: {
+      conversationId,
+      events: [
+        { kind: 'turn_start', time: at, turnId },
+        {
+          kind: 'assistant_message',
+          time: at + 1,
+          turnId,
+          text,
+          messageId: `final-${turnId}`,
+          state: 'final',
+          final: true
+        },
+        { kind: 'turn_end', time: at + 2, turnId, outcome: 'completed' }
+      ]
+    }
+  });
+  expect(reply.status).toBe(200);
+  recordedCompactionFinals.add(`${conversationId}\u0000${turnId}`);
 }
 
 /** Redeems the queued replacement command as one page. */
@@ -176,6 +217,7 @@ beforeEach(async () => {
   await setSecret('bridgeToken', '');
   token = null;
   opened.length = 0;
+  recordedCompactionFinals.clear();
   setBrowserOpener(async (url) => {
     opened.push(url);
   });
@@ -233,6 +275,164 @@ describe('the whole move, when it works', () => {
     expect(pendingCommands()).toHaveLength(1);
     expect(opened).toHaveLength(1);
     expect(opened[0]).toContain('clf=');
+  });
+
+  it('carries the canonical generation-bound final message, not the DOM reader\'s last Markdown fragment', async () => {
+    await connect();
+    await record();
+    const { token: continuation } = await press();
+    const turnId = 'g-production-fragmented-brief-1';
+    const finalTail = 'verify/build/dist completes.';
+    const canonicalBrief = `TASK\n${'Preserve the complete handoff context. '.repeat(1_250)}\nNEXT\n${finalTail}`;
+    expect(canonicalBrief.length).toBeGreaterThan(40_000);
+    expect(canonicalBrief.slice(-finalTail.length)).toBe(finalTail);
+    const interim = await request('POST', '/events', {
+      body: {
+        conversationId: CHAT_A,
+        events: [
+          {
+            kind: 'assistant_message',
+            time: Date.now(),
+            turnId,
+            text: 'One moment while I assemble the handoff.',
+            messageId: `interim-${turnId}`,
+            state: 'streaming',
+            final: false
+          }
+        ]
+      }
+    });
+    expect(interim.status).toBe(200);
+    await recordCompactionFinal(turnId, canonicalBrief);
+
+    // Production 2026-08-29: ChatGPT rendered one 42,911-character final message as several
+    // `.markdown` fragments. The DOM fallback selected only the final 28-character fragment,
+    // while Fiber/the recorder already held the complete canonical final for this exact turn.
+    const stored = await capture(continuation, finalTail, CHAT_A, turnId);
+    expect(stored.status).toBe(200);
+    const handed = await redeem(stored.body.commandId as string, 'canonical-fragment-page');
+    expect(handed.body.command.text).toContain(canonicalBrief);
+    expect(handed.body.command.text).not.toBe(finalTail);
+    expect(handed.body.command.text).not.toContain('One moment while I assemble the handoff.');
+  });
+
+  it('waits retryably for the canonical final message instead of accepting or rejecting a DOM snapshot', async () => {
+    await connect();
+    const sessionId = await record();
+    const { token: continuation } = await press();
+    const turnId = 'g-canonical-final-late-1';
+
+    // The direct capture call can overtake the background journal batch that carries Fiber's
+    // final assistant revision. Missing canonical data is therefore a retryable ordering state,
+    // not permission to trust the page fragment and not a semantic cancellation.
+    const early = await capture(continuation, 'last fragment only', CHAT_A, turnId, false);
+    expect(early.status).toBe(503);
+    expect(early.body).toMatchObject({ error: 'brief_not_recorded_yet', retryable: true });
+    expect(await sessionForConversation(CHAT_A)).toBe(sessionId);
+    expect(pendingCommands()).toHaveLength(0);
+
+    await recordCompactionFinal(turnId, BRIEF);
+    const retried = await capture(continuation, 'last fragment only', CHAT_A, turnId);
+    expect(retried.status).toBe(200);
+    expect(retried.body.stored).toBe(true);
+  });
+
+  it('fails closed when one compaction generation has more than one canonical final message', async () => {
+    await connect();
+    const sessionId = await record();
+    const { token: continuation } = await press();
+    const turnId = 'g-ambiguous-canonical-final-1';
+    const at = Date.now();
+    const recorded = await request('POST', '/events', {
+      body: {
+        conversationId: CHAT_A,
+        events: [
+          { kind: 'turn_start', time: at, turnId },
+          {
+            kind: 'assistant_message',
+            time: at + 1,
+            turnId,
+            text: BRIEF,
+            messageId: 'ambiguous-final-one',
+            state: 'final',
+            final: true
+          },
+          {
+            kind: 'assistant_message',
+            time: at + 2,
+            turnId,
+            text: `${BRIEF}\nconflicting final`,
+            messageId: 'ambiguous-final-two',
+            state: 'final',
+            final: true
+          },
+          { kind: 'turn_end', time: at + 3, turnId, outcome: 'completed' }
+        ]
+      }
+    });
+    expect(recorded.status).toBe(200);
+
+    const refused = await capture(continuation, 'a plausible DOM answer', CHAT_A, turnId, false);
+    expect(refused.status).toBe(409);
+    expect(refused.body.error).toBe('brief_canonical_invalid');
+    expect(pendingCommands()).toHaveLength(0);
+    expect(await sessionForConversation(CHAT_A)).toBe(sessionId);
+    expect((await getSession(sessionId))?.lastHandoffId).toBeNull();
+  });
+
+  it('never borrows a complete final from an adjacent turn when the exact compaction generation is missing', async () => {
+    await connect();
+    const sessionId = await record();
+    const { token: continuation } = await press();
+    await recordCompactionFinal('g-adjacent-complete-turn', BRIEF);
+
+    const missing = await capture(
+      continuation,
+      'a DOM fragment from the intended turn',
+      CHAT_A,
+      'g-exact-compaction-turn-without-final',
+      false
+    );
+    expect(missing.status).toBe(503);
+    expect(missing.body).toMatchObject({ error: 'brief_not_recorded_yet', retryable: true });
+    expect(pendingCommands()).toHaveLength(0);
+    expect(await sessionForConversation(CHAT_A)).toBe(sessionId);
+    expect((await getSession(sessionId))?.lastHandoffId).toBeNull();
+  });
+
+  it('refuses a protocol-10 summary-only capture rather than restoring DOM prose as authority', async () => {
+    await connect();
+    const sessionId = await record();
+    const { token: continuation } = await press();
+
+    const refused = await request('POST', '/compact', {
+      body: { conversationId: CHAT_A, token: continuation, summary: BRIEF }
+    });
+    expect(refused.status).toBe(409);
+    expect(refused.body).toMatchObject({ error: 'capture_generation_required', retryable: true });
+    expect(pendingCommands()).toHaveLength(0);
+    expect(await sessionForConversation(CHAT_A)).toBe(sessionId);
+    expect((await getSession(sessionId))?.lastHandoffId).toBeNull();
+  });
+
+  it('recovers an over-wire canonical final and preserves both ends through the deliberate middle cut', async () => {
+    await connect();
+    await record();
+    const { token: continuation } = await press();
+    const turnId = 'g-overflow-canonical-final-1';
+    const head = 'TASK — preserve this exact beginning.\n';
+    const tail = '\nNEXT — preserve this exact ending.';
+    const canonicalBrief = `${head}${'x'.repeat(300_000)}${tail}`;
+    await recordCompactionFinal(turnId, canonicalBrief);
+
+    const stored = await capture(continuation, 'DOM fragment', CHAT_A, turnId);
+    expect(stored.status).toBe(200);
+    const handed = await redeem(stored.body.commandId as string, 'overflow-canonical-page');
+    const text = handed.body.command.text as string;
+    expect(text).toContain(head.trim());
+    expect(text).toContain(tail.trim());
+    expect(text).toContain('the middle of this brief was longer than the app carries across');
+    expect(text.length).toBeLessThan(canonicalBrief.length);
   });
 });
 

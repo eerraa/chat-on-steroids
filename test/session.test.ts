@@ -27,6 +27,7 @@ import {
 import {
   appendEvent,
   autoCompactionReady,
+  autoCompactionStallReady,
   claimAutoCompaction,
   createSession,
   deleteSession,
@@ -1067,6 +1068,39 @@ describe('session store', () => {
         outcome: 'interrupted'
       });
       expect(autoCompactionReady(await getSession(summary.id))).toBe(true);
+    } finally {
+      await saveConfig(base);
+    }
+  });
+
+  it('allows one near-threshold stalled rescue without making small stalls compact', async () => {
+    const base = defaultConfig();
+    await saveConfig({ ...base, compaction: { ...base.compaction, auto: true, autoTokens: 10_000 } });
+    try {
+      const near = await createSession({ title: 'near stalled', conversationId: 'conv-auto-near-stall' });
+      await appendEvent(near.id, {
+        time: 1,
+        source: 'extension',
+        kind: 'user_message',
+        messageId: 'near',
+        message: { text: 'n'.repeat(38_000), truncated: false, chars: 38_000 }
+      });
+      const nearSummary = await getSession(near.id);
+      expect(autoCompactionReady(nearSummary)).toBe(false);
+      expect(autoCompactionStallReady(nearSummary)).toBe(true);
+      expect(await claimAutoCompaction(near.id, 'conv-auto-near-stall', () => true, true)).toBe(true);
+
+      const small = await createSession({ title: 'small stalled', conversationId: 'conv-auto-small-stall' });
+      await appendEvent(small.id, {
+        time: 1,
+        source: 'extension',
+        kind: 'user_message',
+        messageId: 'small',
+        message: { text: 's'.repeat(20_000), truncated: false, chars: 20_000 }
+      });
+      const smallSummary = await getSession(small.id);
+      expect(autoCompactionStallReady(smallSummary)).toBe(false);
+      expect(await claimAutoCompaction(small.id, 'conv-auto-small-stall', () => true, true)).toBe(false);
     } finally {
       await saveConfig(base);
     }
@@ -2140,6 +2174,27 @@ describe('tool summaries', () => {
     expect(
       summarize('exec_command', { cmd: 'npm run verify' }, { exitCode: null, durationMs: 10_000 })
     ).toMatchObject({ title: 'Started npm run verify', metric: 'running', tone: 'neutral' });
+
+    const batchFailed = summarize(
+      'exec_command',
+      { cmds: ['Write-Output first', 'rg -n "needle" missing', 'Write-Output after'] },
+      { exitCode: 2, detail: 'Command failed (2 of 3): rg -n "needle" missing' },
+      'error'
+    );
+    expect(batchFailed).toMatchObject({
+      title: 'Command failed (2 of 3): rg -n "needle" missing',
+      metric: '✕ exit 2',
+      tone: 'bad'
+    });
+    expect(batchFailed.title).not.toContain('a command');
+
+    const benignBatch = summarize(
+      'exec_command',
+      { cmds: ['rg -n "present" src/app.ts', 'rg -n "absent" src/app.ts'] },
+      { exitCode: 1, benignExit: true, durationMs: 120 },
+      'ok'
+    );
+    expect(benignBatch).toMatchObject({ title: 'Ran 2-command batch', tone: 'good' });
   });
 
   it('says which way a session was interrupted', () => {
@@ -2150,6 +2205,22 @@ describe('tool summaries', () => {
     expect(summarize('write_stdin', { session_id: 'p1', signal: 'int' }).title).toBe('Interrupted session p1');
     expect(summarize('write_stdin', { session_id: 'p1', chars: 'y\n' }).title).toBe('Wrote to session p1');
     expect(summarize('write_stdin', { session_id: 'p1' }).title).toBe('Waited on session p1');
+  });
+
+  it('distinguishes a child command failure from failure to wait on the session', () => {
+    expect(
+      summarize('write_stdin', { session_id: 19783 }, { exitCode: 1, running: false }, 'error')
+    ).toMatchObject({
+      title: 'Command failed in session 19783',
+      metric: '✕ exit 1',
+      tone: 'bad'
+    });
+
+    // With no process exit evidence, the error really is in the collection/ownership path and
+    // the older "Could not wait" wording remains the truthful one.
+    expect(summarize('write_stdin', { session_id: 19783 }, {}, 'error').title).toBe(
+      'Could not wait on session 19783'
+    );
   });
 
   it('keeps the subject but not the claim when a call fails or is refused', () => {

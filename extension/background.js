@@ -24,7 +24,7 @@ const PORTS = [8765, 8766, 8767, 8768, 8769];
 const HELLO_TIMEOUT_MS = 1200;
 const REQUEST_TIMEOUT_MS = 10_000;
 /** Bumped only when the request/response shape changes; the app compares it. */
-const BRIDGE_PROTOCOL = 9;
+const BRIDGE_PROTOCOL = 10;
 
 /**
  * Journal caps. The byte figure is what actually matters — chrome.storage.session has a
@@ -2146,13 +2146,17 @@ const HANDLERS = {
         conversationId: message.conversationId,
         resume: message.resume !== false,
         cancel: message.cancel === true,
-        // The capture. `token` names the transaction the page was given when it marked the
-        // compaction turn, and `summary` is that turn's own answer. Both are forwarded
-        // verbatim and only together: the app refuses a brief whose token does not name an
-        // open continuation for this chat, which is what keeps some other tab's text from
-        // ever becoming this session's handoff.
-        ...(typeof message.token === 'string' && typeof message.summary === 'string'
-          ? { token: message.token, summary: message.summary }
+        // The capture. `token` names the transaction and `turnId` names the exact browser-local
+        // generation that answered it. The app resolves that turn's authoritative final bytes
+        // from the canonical Fiber/session record; `summary` is retained only to diagnose
+        // DOM/canonical disagreement and is never sufficient without the generation.
+        ...(typeof message.token === 'string' &&
+        (typeof message.turnId === 'string' || typeof message.summary === 'string')
+          ? {
+              token: message.token,
+              ...(typeof message.turnId === 'string' ? { turnId: message.turnId } : {}),
+              ...(typeof message.summary === 'string' ? { summary: message.summary } : {})
+            }
           : {})
       })
     });
@@ -2165,7 +2169,10 @@ const HANDLERS = {
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
     const result = await call('/compact/claim-auto', {
       method: 'POST',
-      body: JSON.stringify({ conversationId: message.conversationId })
+      body: JSON.stringify({
+        conversationId: message.conversationId,
+        ...(message.stalledNearThreshold === true ? { stalledNearThreshold: true } : {})
+      })
     });
     return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
   },
@@ -2719,22 +2726,15 @@ chrome.tabs.onUpdated.addListener((id, changeInfo) => {
 // -------------------------------------------------------------------- recovery
 
 /**
- * Restores the page half of the bridge after this extension itself is updated/reloaded.
- *
- * Chrome invalidates an extension's isolated content-script world when the extension is
- * reloaded, but it does not reload the user's already-open ChatGPT document. The dead
- * content.js then cannot send observations, request-id evidence or even the conversation's
- * first /events batch, while fiber.js can remain visibly alive in the page's MAIN world.
- * That exact split produces a healthy MCP tunnel plus a permanently growing Unattributed
- * session and no session at all for the ChatGPT tab.
- *
- * runtime.onInstalled fires for unpacked Reload as an update, so repair only at that real
- * lifecycle boundary — never from the service worker's ordinary wake/sleep cycle. The
- * isolated content script has its own one-instance guard because a newly loading page can
- * receive both its static manifest injection and this recovery injection.
+ * Existing ChatGPT documents are deliberately not repaired in place after an extension
+ * update/reload. Chromium can leave the old isolated world and page-owned React graph in a
+ * half-invalidated state, and repeated attempts to replace content.js/fiber.js inside that
+ * same document have produced renderer/desktop stalls on long WebCodex chats. A stale or
+ * missing recorder therefore fails safe: the page remains untouched and CoS resumes when a
+ * fresh eligible document receives the manifest's static content scripts.
  */
 const CHATGPT_TAB_URLS = ['https://chatgpt.com/*', 'https://chat.openai.com/*'];
-const PAGE_RECORDER_VERSION = 10;
+const PAGE_RECORDER_VERSION = 15;
 
 let deferredRecoveryWork = null;
 
@@ -2887,52 +2887,8 @@ function recoverDeferredRevivals() {
   return tracked;
 }
 
-async function restoreOpenChatgptTabs() {
-  let tabs = [];
-  try {
-    tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
-  } catch {
-    return;
-  }
-  for (const tab of tabs) {
-    const id = tab && typeof tab.id === 'number' ? tab.id : null;
-    if (id === null) continue;
-    try {
-      const live = await chrome.tabs.sendMessage(id, { type: 'clf-recorder-ping' });
-      if (live && live.ok === true && live.recorderVersion === PAGE_RECORDER_VERSION) {
-        // Healthy content.js does not prove the independently running MAIN-world helper is
-        // still present. Request-id ownership depends on fiber.js, and re-executing it is
-        // idempotent because the helper keeps one listener per protocol version.
-        try {
-          await chrome.scripting.executeScript({ target: { tabId: id }, world: 'MAIN', files: ['fiber.js'] });
-        } catch {
-          // The tab can navigate between the ping and repair. Static injection covers it.
-        }
-        continue;
-      }
-    } catch {
-      // No receiver is the expected signature of an already-open tab whose isolated world
-      // was invalidated by an extension reload. Fall through to deterministic recovery.
-    }
-    try {
-      // Rebuild the isolated-world DOM adapter before the recorder that consumes it.
-      await chrome.scripting.executeScript({ target: { tabId: id }, files: ['chatgpt-dom.js'] });
-      // Keep the React/Fiber reader in ChatGPT's own world, exactly like the static manifest
-      // declaration. An older helper may still answer too; the nonce/version gate in
-      // content.js makes those replies harmless, and a future version bump rejects them.
-      await chrome.scripting.executeScript({ target: { tabId: id }, world: 'MAIN', files: ['fiber.js'] });
-      await chrome.scripting.executeScript({ target: { tabId: id }, files: ['content.js'] });
-      await chrome.scripting.insertCSS({ target: { tabId: id }, files: ['overlay.css'] });
-    } catch {
-      // The tab can close or navigate between query and injection. Static content scripts
-      // cover the next eligible document, so there is nothing useful to retry here.
-    }
-  }
-}
-
 chrome.runtime.onInstalled.addListener(() => {
-  void restoreOpenChatgptTabs()
-    .then(() => recoverDeferredRevivals())
+  void recoverDeferredRevivals()
     .then(() => scheduleBrowserWorkerOpen())
     .catch(() => undefined);
   void load().then(() => {
@@ -2963,12 +2919,10 @@ if (chrome.alarms && chrome.alarms.onAlarm && typeof chrome.alarms.onAlarm.addLi
   });
 }
 
-// `chrome://extensions` Reload does not provide a dependable install/update event across
-// development/reload paths. The service worker itself *must* start, though. Ping first, so
-// ordinary worker wake-ups are one cheap message per ChatGPT tab and inject nothing; only a
-// dead or stale recorder pays the scripting cost.
-void restoreOpenChatgptTabs()
-  .then(() => recoverDeferredRevivals())
+// A service-worker cold start is ordinary MV3 lifecycle, not a reason to touch an already-open
+// ChatGPT document. Deferred worker revival can still reuse a recorder that proves itself current;
+// a missing/stale one remains untouched until the page naturally creates a fresh document.
+void recoverDeferredRevivals()
   .then(() => scheduleBrowserWorkerOpen())
   .catch(() => undefined);
 void load().then(() => {

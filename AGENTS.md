@@ -413,7 +413,10 @@ beside the port and stay explicit and tested against model-facing behavior. Ther
 known Ctrl+C vs. natural-exit race worth keeping a regression for. The local MCP adaptation
 also accepts `cmds` to run related commands sequentially in one labeled shell session, and an
 empty `write_stdin` poll returns on first output instead of holding Codex's full collection
-window. Start at `tools-core.ts`
+window. Activity summaries preserve the same distinction: a successful `write_stdin` collection
+whose child exits non-zero is a command failure *in that session*, not a failure to wait, and a
+failed `cmds` batch names the concrete failed section rather than collapsing to "a command".
+Start at `tools-core.ts`
 → `unified-exec.ts` → `shell.ts` → `ownership.ts` → `exec-output.ts`.
 
 **`apply_patch`.** Model syntax is Codex V4A. MCP cannot expose a true freeform tool, so
@@ -545,11 +548,28 @@ removal and navigation away. **Reload is not conversation close.** Content-scrip
 means *handed to the journal*, not *stored by the app*, and the journal must never silently
 lose something it already acknowledged as durable. Recovery must validate **every** context
 whose health it needs — proving the isolated recorder is alive says nothing about a dead
-MAIN-world Fiber helper. Recorder takeover is total ownership transfer: the predecessor must
-disconnect MutationObservers and DOM/window handlers **and** unregister extension-level
-`chrome.runtime.onMessage` / `chrome.storage.onChanged` listeners. An `alive=false` predecessor
-must never answer a health check, compete for a worker-revival command, or repaint Overwrite
-after the successor owns the document.
+MAIN-world Fiber helper. **Never hot-swap content.js/fiber.js into an already-open ChatGPT
+document after extension update/reload.** Chromium can preserve the old isolated/page worlds in a
+half-invalidated state, and same-document reinjection has repeatedly stalled long WebCodex tabs and
+even the desktop. A stale/missing recorder therefore fails safe until the user naturally reloads or
+opens a fresh eligible document, where manifest injection owns startup from scratch. An orphaned
+content script detects loss of `chrome.runtime.id` locally, sets itself inert, disconnects its
+MutationObservers / DOM-window / runtime / storage listeners and stops timers **without traversing,
+unpainting or reconstructing the transcript**. Ordinary MV3 service-worker cold starts must not
+inject anything into existing ChatGPT tabs. If a healthy content script later proves its MAIN-world
+Fiber helper is missing, the existing document-id-scoped `repair_fiber` request is the only
+programmatic reinjection path. On an actual fresh/reloaded document, spontaneous MutationObserver
+or polling observations must stay behind the startup identity handshake until `resumeOpenTurn()`
+has adopted the app's durable `activeTurnId` or learned that none exists; otherwise a live
+transcript mutation can mint a second local generation before recovery runs.
+Generation state is likewise **visible/actionable page state**, not raw DOM presence: a hidden,
+disabled or aria-hidden stale Stop control is not evidence ChatGPT is still generating. Explicit
+response Retry/error surfaces are terminal failure evidence and should be recognised from stable
+renderer structure where available, not by enumerating translated error copy.
+The page-recorder protocol is also an update boundary: when content-script lifecycle/DOM semantics
+change, bump `content.js::RECORDER_VERSION` and `background.js::PAGE_RECORDER_VERSION` together.
+`BRIDGE_PROTOCOL` is a different app/service-worker contract and does not authorize touching an
+already-open document whose recorder is stale or absent.
 
 **Tests.** `content-script.test.ts`, `fiber.test.ts`, `extension.test.ts`.
 
@@ -561,9 +581,19 @@ routes: `/status`, `/events`, `/closed`, `/activity`, `/compact/claim-auto`, `/c
 `/goal/draft`, `/goal/ack`, `/goal/objective`, `/goal/open`, `/settings` (GET and POST),
 `/commands/open`, `/commands/open/claim`, `/commands/redeem`, `/commands/ack`. The two
 `/commands/open*` routes are service-worker placement only: they expose an inert marker URL plus
-the exact prime conversation/window anchor, never bootstrap text or local capabilities. `/settings`
+the exact prime conversation/window anchor, never bootstrap text or local capabilities. Native
+fresh-chat opens preserve the proven browser family; Compact & Resume additionally inherits the
+source conversation's browser family and Project namespace through the durable continuation's
+exact `from` conversation rather than falling back to Chrome/global ChatGPT. `/settings`
 is the only pair the page may write, and
 its GET exists for the one composer with no conversation to read `/activity` for: a New Chat.
+
+Long settled chats must not pay a transcript-wide observation/presentation scan on the 1-second
+safety timer when nothing changed. Native transcript mutations and `/activity` are the primary
+change clocks; the periodic pass is a fallback for live generation, route/resume-identity
+transitions, and a queued native reconciliation. This is a responsiveness invariant: repeated
+full-history DOM/Fiber walks can pin a Chromium renderer and make an otherwise idle long chat
+unrecoverable until its tab is closed.
 
 **Must hold.** The token never enters the ChatGPT page — the service worker holds it in
 extension-owned state and the app keeps its counterpart out of config and log surfaces. The
@@ -598,6 +628,24 @@ durable write succeeds, publication is total in-memory map movement. Never imple
 compaction by creating a second session or copying history — the whole feature is continuity
 of one durable id. Automatic compaction is **edge-triggered and durable**: reopening an
 already-large old chat must not re-fire merely because its level sits above the threshold.
+Automatic compaction is context management, not a generic stall watchdog: a small chat that goes
+quiet must not be churned into a replacement conversation. But the local token estimate omits
+ChatGPT's hidden/system context, so an exact ten-minute stall **near the configured line** is an
+emergency context-pressure signal and may spend the same one-shot slightly early. Keep that rescue
+floor conservative (currently 90% of the configured threshold). ChatGPT Stop is one-way. Once the
+page has clicked the native Stop control for compaction it must retain ownership until that stop is
+actually visible (or the chat changes); a timer may change the UI wording, but it must never claim
+"nothing happened" and abandon a stop that ChatGPT can still honour later.
+
+The compaction page owns **which local generation** answered the handoff prompt; the durable
+canonical recorder owns **what that generation authored**. The capture crossing therefore carries
+the exact local `turnId`, and the bridge resolves the final assistant message for that turn from the
+canonical Fiber/session record before saving a handoff. Rendered `.markdown` is only lifecycle /
+stability evidence and legacy compatibility data — never the authoritative handoff bytes. One
+logical ChatGPT message may be split across many Markdown DOM fragments, so selecting, joining or
+guessing fragments at this boundary is forbidden. If the canonical final has not reached the app
+yet, capture remains retryable; ambiguity or permanently incomplete canonical storage fails closed
+while chat A keeps the session.
 
 **Tests.** `continuation.test.ts`, `resume.test.ts`.
 
@@ -628,6 +676,13 @@ its worker slot, so `maxWorkers` counts working workers only — a prime can cre
 while an older one sleeps and still wake that older worker afterwards. The same sleep happens without the tool call, from
 durable evidence that the worker stopped: a settled final assistant turn, or quiescence
 proven by `activeTurnId`/live-generating state rather than by a page heartbeat.
+An explicit failed/stopped/interrupted worker turn is also a stop, **not a completed result and
+not a terminal worker identity failure**. The browser closes that exact durable turn, then the
+broker sleeps the worker with `result:null`, frees its slot, and tells the prime that the assigned
+piece produced no final result. That sleeping state plus prime report must cross the critical
+swarm durability barrier before `/events` acknowledges the browser journal row; otherwise a crash
+can restore an `active` zombie after the only failure evidence was retired. A later proven worker
+tool call may wake the same chat and issue the normal corrective "awake again" report.
 
 **Ownership outlives the active run.** When no worker occupies a slot, the active incarnation is
 parked immediately and the one global execution claim is released. Its complete agent map becomes
@@ -793,7 +848,7 @@ Each has a different persistence boundary.
 | transcript duplicates / reorders / jumps | `chatgpt-dom.js`, `fiber.js`, `content.js`, `background.js`, `recorder.ts`, `chronology.ts` | `content-script`, `extension`, `session` |
 | turn ends early / false stall | `content.js` lifecycle + Fiber terminal evidence | `content-script`, `fiber` |
 | Overwrite vanishes / sticks / stale rows | `content.js` paint streams, `fiber.js`, `/activity` in `bridge.ts` | `content-script`, `bridge` |
-| extension dies after reload/update | `background.js::restoreOpenChatgptTabs`, content↔Fiber handshake | `extension`, `fiber` |
+| extension reloaded/updated with ChatGPT tabs open | existing document must stay untouched; fresh-document manifest injection, content orphan self-quiesce | `extension`, `content-script` |
 | navigation resurrects wrong chat | `background.js` tab registry, `content.js` epoch | `extension`, `content-script` |
 | bridge pairing / connect / stop | `bridge.ts`, `background.js`, `popup.*` | `bridge`, `extension` |
 | Compact & Resume split or lost | `continuation.ts`, `bridge.ts`, `store.ts`, `workspace.ts`, `agents.ts` | `continuation`, `resume` |

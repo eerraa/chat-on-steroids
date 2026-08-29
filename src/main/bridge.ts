@@ -56,6 +56,7 @@ import {
   claimAutoCompaction,
   findSessionByConversation,
   getSession,
+  readFinalAssistantTextForTurn,
   readRecentEvents,
   sessionDurableModifiedAt
 } from './session/store.js';
@@ -94,6 +95,7 @@ import {
   noteAgentContextTokens,
   persistCriticalSwarmNow,
   stageWorkerConversationFinish,
+  stageWorkerConversationSleep,
   workerConversationGone,
   workerRevivalDeliveredSince,
   type WorkerRevival
@@ -724,7 +726,11 @@ function parseObservations(input: unknown): ChatObservation[] {
     // Long final handoff-style answers are valid transcript content too. Keep this aligned
     // with the page-side assistant bound so the bridge does not silently become the next
     // truncation point after Fiber/content.js accepted the whole message.
-    if (typeof item['text'] === 'string') observation.text = item['text'].slice(0, 256_000);
+    // Canonical assistant raw text may be up to one Fiber turn (512 KiB). The recorder owns
+    // the smaller inline cap and spills the complete value to an asset; cutting it here would
+    // silently destroy the tail before that durable policy can run. The 2 MiB request cap still
+    // bounds the whole observation batch.
+    if (typeof item['text'] === 'string') observation.text = item['text'].slice(0, 512 * 1024);
     if (typeof item['messageId'] === 'string') observation.messageId = item['messageId'].slice(0, 100);
     if (typeof item['turnId'] === 'string') observation.turnId = item['turnId'].slice(0, 100);
     if (typeof item['renderedHtml'] === 'string') observation.renderedHtml = item['renderedHtml'].slice(0, 120_000);
@@ -778,7 +784,10 @@ async function workerFinalAcrossBatches(
     const end = [...recent]
       .reverse()
       .find((entry) => entry.kind === 'turn_end' && entry.turnId === turnId);
-    if (!end) continue;
+    // A worker result is authoritative only when the exact turn itself completed. A transport
+    // failure can leave partial assistant prose in canonical history; carrying that as the
+    // worker's result is worse than reporting no result at all.
+    if (!end || end.kind !== 'turn_end' || end.outcome !== 'completed') continue;
     // A replay of turn A after turn B has begun is history, not current completion evidence.
     if (recent.some((entry) => entry.kind === 'turn_start' && entry.turnId !== turnId && entry.seq > end.seq)) continue;
     const final = [...recent]
@@ -794,6 +803,40 @@ async function workerFinalAcrossBatches(
     if (!best || end.seq > best.endSeq) best = { endSeq: end.seq, text: final.message.text };
   }
   return best?.text ?? null;
+}
+
+/**
+ * Resolves an exact worker turn that durably ended without a completed final result.
+ *
+ * Like workerFinalAcrossBatches(), this is scoped to turn ids touched by the current browser
+ * request and refuses a historical replay once a newer turn_start exists. A turn_end itself is
+ * sufficient here: failed/stopped/interrupted/stalled/unknown all mean the worker is not
+ * currently doing this job, while none is permission to invent a model-authored result.
+ */
+async function workerStopAcrossBatches(
+  sessionId: string,
+  agent: string,
+  observations: readonly ChatObservation[]
+): Promise<{ outcome: string; detail: string } | null> {
+  const touched = new Set(
+    observations
+      .filter((entry) => entry.kind === 'turn_end' && entry.turnId)
+      .map((entry) => entry.turnId as string)
+  );
+  if (touched.size === 0) return null;
+
+  const recent = await readRecentEvents(sessionId, 256, { kinds: ['turn_start', 'turn_end'], agent });
+  let best: { seq: number; outcome: string; detail: string } | null = null;
+  for (const turnId of touched) {
+    const end = [...recent]
+      .reverse()
+      .find((entry) => entry.kind === 'turn_end' && entry.turnId === turnId);
+    if (!end || end.kind !== 'turn_end' || end.outcome === 'completed') continue;
+    // A replay of old turn A after turn B began is history, not permission to sleep B.
+    if (recent.some((entry) => entry.kind === 'turn_start' && entry.turnId !== turnId && entry.seq > end.seq)) continue;
+    if (!best || end.seq > best.seq) best = { seq: end.seq, outcome: end.outcome, detail: end.detail ?? '' };
+  }
+  return best ? { outcome: best.outcome, detail: best.detail } : null;
 }
 
 function conversationId(value: unknown): string | null {
@@ -1306,11 +1349,22 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // than treating one transport envelope as a lifecycle boundary.
       const workerAgent = typeof agent === 'string' && agent !== PRIME_ID ? agent : null;
       let finalText: string | null = null;
+      let stoppedWithoutResult: { outcome: string; detail: string } | null = null;
       if (workerAgent !== null && result.sessionId) {
         finalText = await workerFinalAcrossBatches(result.sessionId, workerAgent, observations);
+        if (!finalText) {
+          stoppedWithoutResult = await workerStopAcrossBatches(result.sessionId, workerAgent, observations);
+        }
       }
-      if (finalText && workerAgent) {
-        const staged = stageWorkerConversationFinish(id, finalText);
+      if ((finalText || stoppedWithoutResult) && workerAgent) {
+        const reason = stoppedWithoutResult
+          ? `Its ChatGPT turn ${stoppedWithoutResult.outcome} before producing a final worker result${
+              stoppedWithoutResult.detail ? `: ${stoppedWithoutResult.detail}` : '.'
+            }`
+          : '';
+        const staged = finalText
+          ? stageWorkerConversationFinish(id, finalText)
+          : stageWorkerConversationSleep(id, reason);
         if (staged?.report) {
           // The browser treats HTTP 200 as permission to retire this final observation from
           // its durable journal. The session transcript above is already durable, but the
@@ -1326,7 +1380,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           } catch (err) {
             staged.rollback();
             logWarn(
-              `bridge: final state for worker conversation ${id} is not durable yet — ${err instanceof Error ? err.message : String(err)}`
+              `bridge: terminal state for worker conversation ${id} is not durable yet — ${err instanceof Error ? err.message : String(err)}`
             );
             return json(res, 503, { error: 'worker_state_not_durable', retryable: true }, origin);
           }
@@ -1657,6 +1711,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     const id = conversationId(body['conversationId']);
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
+    const stalledNearThreshold = body['stalledNearThreshold'] === true;
     if (goalWorkerChat(id)) {
       return json(
         res,
@@ -1684,7 +1739,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // nothing left to carry across. Checked again inside the durable write, so a turn that
     // finishes while the claim is queued leaves the trigger unspent for the next one.
     if (!chatIsWorking(id)) return json(res, 200, { claimed: false, sessionId }, origin);
-    const claimed = await claimAutoCompaction(sessionId, id, () => chatIsWorking(id));
+    const claimed = await claimAutoCompaction(
+      sessionId,
+      id,
+      () => chatIsWorking(id),
+      stalledNearThreshold
+    );
     return json(res, 200, { claimed, sessionId }, origin);
   }
 
@@ -1748,15 +1808,106 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return json(res, 200, { cancelled, sessionId, job: resumeJobFor(sessionId) }, origin);
     }
 
-    // The capture. The page is the only party that can tell which output belongs to the
-    // compaction turn, and it says so by quoting the token it was given when that turn was
-    // marked. A brief for a continuation that has moved on is answered with what is already
-    // stored rather than written again — see attachSummary.
-    if (typeof body['summary'] === 'string') {
+    // The capture. The page owns *which generation* answered the one compaction prompt; the
+    // canonical session recorder owns *what that generation authored*. Do not collapse those
+    // responsibilities back into one DOM string. ChatGPT can render one logical final message
+    // as several `.markdown` fragments — production 2026-08-29 exposed a 42,911-character
+    // canonical final whose final DOM fragment was only 28 characters. The page therefore sends
+    // its exact local turn id and the app resolves the already-recorded canonical final for it.
+    // `summary` may accompany a protocol-10 capture as diagnostic evidence of what the DOM reader
+    // saw, but it is never authoritative. A summary with no turnId is rejected below.
+    const hasLegacySummary = typeof body['summary'] === 'string';
+    const captureTurnId = typeof body['turnId'] === 'string' ? body['turnId'] : '';
+    if (captureTurnId && !/^[A-Za-z0-9._:-]{1,200}$/.test(captureTurnId)) {
+      return json(res, 400, { error: 'bad_turn_id' }, origin);
+    }
+    if (hasLegacySummary && !captureTurnId) {
+      // Protocol 10 makes generation identity mandatory. A protocol-9 content script can read
+      // only a DOM fragment and therefore cannot safely author a handoff; the outer protocol
+      // gate normally rejects it before this route, while this guard keeps the capture boundary
+      // fail-closed even for a malformed/current-protocol caller.
+      return json(
+        res,
+        409,
+        {
+          error: 'capture_generation_required',
+          retryable: true,
+          message: 'This compaction capture did not identify the exact turn that wrote the handoff. Reload the current extension and retry; nothing was compacted.',
+          sessionId,
+          job: resumeJobFor(sessionId)
+        },
+        origin
+      );
+    }
+    if (hasLegacySummary || captureTurnId) {
       const token = typeof body['token'] === 'string' ? body['token'] : '';
       const entry = continuationByToken(token);
       if (!entry || entry.sessionId !== sessionId) return json(res, 409, { error: 'no_such_continuation' }, origin);
-      const brief = boundBrief(String(body['summary']));
+      let rawBrief = hasLegacySummary ? String(body['summary']) : '';
+      if (captureTurnId) {
+        const canonical = await readFinalAssistantTextForTurn(sessionId, captureTurnId);
+        if (canonical.status === 'missing') {
+          // `/compact` can overtake the background journal batch that carries Fiber's final
+          // message. Keep the token/capture alive and let the page retry after its next healthy
+          // activity round trip rather than accepting a fragment or cancelling a valid handoff.
+          return json(
+            res,
+            503,
+            {
+              error: 'brief_not_recorded_yet',
+              retryable: true,
+              message: 'The handoff turn finished on the page, but its canonical final message has not reached the recorder yet. Retrying…',
+              sessionId,
+              job: resumeJobFor(sessionId)
+            },
+            origin
+          );
+        }
+        if (canonical.status !== 'ready') {
+          // Multiple canonical finals or missing overflow bytes are not a page-rendering problem
+          // and cannot be repaired by trusting the DOM copy. Fail closed while A still owns S.
+          try {
+            await cancelResumeNow(sessionId);
+          } catch (err) {
+            logWarn(
+              `bridge: could not durably withdraw an unusable canonical compaction capture for ${sessionId} — ${err instanceof Error ? err.message : String(err)}`
+            );
+            return json(
+              res,
+              503,
+              {
+                error: 'resume_cancel_not_durable',
+                retryable: true,
+                message: 'The canonical handoff record was unusable, but cancelling this compaction was not stored yet. Retrying…',
+                sessionId,
+                job: resumeJobFor(sessionId)
+              },
+              origin
+            );
+          }
+          return json(
+            res,
+            409,
+            {
+              error: 'brief_canonical_invalid',
+              message:
+                canonical.status === 'ambiguous'
+                  ? 'The recorder found more than one final assistant message for the compaction turn, so it refused to guess which one to carry. Nothing was compacted — this chat still has its session.'
+                  : 'The recorder did not retain the complete final assistant message for the compaction turn. Nothing was compacted — this chat still has its session.',
+              sessionId,
+              job: resumeJobFor(sessionId)
+            },
+            origin
+          );
+        }
+        if (hasLegacySummary && String(body['summary']).trim().length !== canonical.text.trim().length) {
+          logWarn(
+            `bridge: compaction DOM snapshot length ${String(body['summary']).trim().length} disagreed with canonical turn ${captureTurnId} length ${canonical.text.trim().length}; using canonical text`
+          );
+        }
+        rawBrief = canonical.text;
+      }
+      const brief = boundBrief(rawBrief);
       // Refused here rather than deeper, because this is where the reason can still be said
       // in words the page will put on screen. A brief that cannot be a brief is a failed
       // compaction, and a failed compaction leaves the session exactly where it is — which
@@ -3694,16 +3845,28 @@ async function deliverOne(): Promise<void> {
   // A revival is the one command that must not open a fresh composer: it names the chat the
   // worker already has, so the page lands on it and the marker it redeems names it back.
   const targetConversation = command.spec.type === 'revive' ? command.spec.conversationId : null;
+  // A resume opens a *new* conversation, so `targetConversation` is intentionally null. Its
+  // browser/profile and Project namespace still belong to the source conversation, though.
+  // The Edge/Chrome affinity work originally covered worker bootstrap/revival only, which left
+  // Compact & Resume falling through to the historical Chrome default even when the source chat
+  // was proven to be in Edge. The continuation is the exact durable A -> B transaction, so its
+  // `from` conversation is the right authority for both affinities and survives app restart.
+  const resumeSourceConversation =
+    command.spec.type === 'resume' ? continuationByToken(command.spec.token)?.from ?? null : null;
   const targetProject = command.spec.type === 'worker'
     ? command.spec.projectPath
     : targetConversation
       ? conversationProjectPaths.get(targetConversation) ?? null
-      : null;
+      : resumeSourceConversation
+        ? conversationProjectPaths.get(resumeSourceConversation) ?? null
+        : null;
   const targetBrowserFamily = command.spec.type === 'worker'
     ? command.spec.browserFamily
     : targetConversation
       ? conversationBrowserFamilies.get(targetConversation) ?? null
-      : null;
+      : resumeSourceConversation
+        ? conversationBrowserFamilies.get(resumeSourceConversation) ?? null
+        : null;
   const url = commandUrl(command.id, targetConversation, targetProject);
   // The recorder can see a brand-new ChatGPT conversation before that page's content script has
   // redeemed this command. Arm the session-transfer gate before the browser gets any chance to

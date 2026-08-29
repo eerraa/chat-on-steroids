@@ -84,6 +84,7 @@ const {
   noteAgentContextTokens,
   noteWorkerRevived,
   offerMessages,
+  offerMessagesForConversation,
   pendingWorkerRevivals,
   repairPrimeConversationAfterRecovery,
   requestWorkerBootstraps,
@@ -1208,6 +1209,44 @@ describe('automatic compaction', () => {
       // And exactly once.
       expect((await request('POST', '/compact/claim-auto', { body: { conversationId } })).body.claimed).toBe(false);
       expect((await request('GET', `/activity?conversationId=${conversationId}`)).body.autoCompactReady).toBe(false);
+    });
+  });
+
+  it('accepts a browser-proven stall slightly below the normal threshold, but not far below it', async () => {
+    await pair();
+    await withThreshold(10_000, async () => {
+      const nearConversation = 'a1a1a1a1-0000-4000-8000-00000000ac05';
+      await request('POST', '/events', {
+        body: {
+          conversationId: nearConversation,
+          events: [
+            { kind: 'turn_start', time: Date.now(), turnId: 'near-stalled-live' },
+            { kind: 'user_message', time: Date.now(), text: 'n'.repeat(38_000), messageId: 'near-stall' }
+          ]
+        }
+      });
+      const nearActivity = await request('GET', `/activity?conversationId=${nearConversation}`);
+      expect(nearActivity.body.tokens).toBeLessThan(10_000);
+      expect(nearActivity.body.autoCompactReady).toBe(false);
+      const nearClaim = await request('POST', '/compact/claim-auto', {
+        body: { conversationId: nearConversation, stalledNearThreshold: true }
+      });
+      expect(nearClaim.body.claimed).toBe(true);
+
+      const smallConversation = 'a1a1a1a1-0000-4000-8000-00000000ac06';
+      await request('POST', '/events', {
+        body: {
+          conversationId: smallConversation,
+          events: [
+            { kind: 'turn_start', time: Date.now(), turnId: 'small-stalled-live' },
+            { kind: 'user_message', time: Date.now(), text: 's'.repeat(20_000), messageId: 'small-stall' }
+          ]
+        }
+      });
+      const smallClaim = await request('POST', '/compact/claim-auto', {
+        body: { conversationId: smallConversation, stalledNearThreshold: true }
+      });
+      expect(smallClaim.body.claimed).toBe(false);
     });
   });
 
@@ -2801,6 +2840,91 @@ describe('delivering a bootstrap', () => {
     expect(worker.result).toContain('one journal flush after its turn_end');
   });
 
+  it('immediately releases a worker slot when its exact ChatGPT turn durably ends in transport failure', async () => {
+    await pair();
+    spawn({ workers: [{ task: 'audit until transport fails' }], caller: { conversationId: PRIME_CHAT } });
+    const command = await redeem();
+    const conversationId = 'deadbeef-7654-3210-fedc-ba9876543210';
+    await request('POST', '/commands/ack', {
+      body: { id: command.id, status: 'sent', conversationId, agent: 'worker-1' }
+    });
+
+    const now = Date.now();
+    const failed = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [
+          { kind: 'turn_start', time: now, turnId: 'g-worker-delivery-timeout' },
+          {
+            kind: 'assistant_message',
+            time: now + 1,
+            turnId: 'g-worker-delivery-timeout',
+            messageId: 'assistant:partial-before-timeout',
+            text: 'Partial prose that must never become the worker result.',
+            final: true
+          },
+          {
+            kind: 'chat_error',
+            time: now + 2,
+            turnId: 'g-worker-delivery-timeout',
+            text: 'ChatGPT response delivery failed and exposed a Retry control.'
+          },
+          {
+            kind: 'turn_end',
+            time: now + 3,
+            turnId: 'g-worker-delivery-timeout',
+            outcome: 'failed',
+            detail: 'ChatGPT response delivery failed and exposed a Retry control.'
+          }
+        ]
+      }
+    });
+    expect(failed.status).toBe(200);
+
+    const worker = swarmStateForCaller({ conversationId: PRIME_CHAT }).agents.find((agent) => agent.id === 'worker-1')!;
+    expect(worker).toMatchObject({ state: 'sleeping', result: null, revivable: true });
+    expect((offerMessagesForConversation(PRIME_CHAT)?.messages ?? []).map((message) => message.text).join('\n')).toMatch(
+      /failed before producing a final worker result/i
+    );
+  });
+
+  it('does not retire a failed worker-turn observation before the sleeping state and prime report are durable', async () => {
+    await pair();
+    spawn({ workers: [{ task: 'fail behind the durability barrier' }], caller: { conversationId: PRIME_CHAT } });
+    const command = await redeem();
+    const conversationId = 'badc0ffe-7654-3210-fedc-ba9876543210';
+    await request('POST', '/commands/ack', {
+      body: { id: command.id, status: 'sent', conversationId, agent: 'worker-1' }
+    });
+
+    onSwarmPersistNow(async () => {
+      throw new Error('disk full at observed worker failure');
+    });
+    try {
+      const now = Date.now();
+      const recorded = await request('POST', '/events', {
+        body: {
+          conversationId,
+          events: [
+            { kind: 'turn_start', time: now, turnId: 'g-worker-failed-durable' },
+            {
+              kind: 'turn_end',
+              time: now + 1,
+              turnId: 'g-worker-failed-durable',
+              outcome: 'failed',
+              detail: 'localized delivery timeout'
+            }
+          ]
+        }
+      });
+      expect(recorded.status).toBe(503);
+      expect(recorded.body).toMatchObject({ error: 'worker_state_not_durable', retryable: true });
+      expect(swarmState().agents.find((agent) => agent.id === 'worker-1')?.state).toBe('active');
+    } finally {
+      onSwarmPersistNow((snapshot) => writeDurableNow('swarm', snapshot));
+    }
+  });
+
   it('does not acknowledge a worker final observation before its final report is durable', async () => {
     await pair();
     spawn({ workers: [{ task: 'finish durably' }], caller: { conversationId: PRIME_CHAT } });
@@ -3349,6 +3473,33 @@ describe('targeted open', () => {
     expect(opened).toEqual([commandUrl(command.id)]);
     expect(commandUrl(command.id)).toContain(`clf=${command.id}`);
     expect(resumeJobFor('session-open')).toBeNull();
+  });
+
+  it('opens a Compact & Resume replacement in the same browser family and Project as its source chat', async () => {
+    await pair();
+    const sourceConversation = '24242424-4646-6868-8080-242424242424';
+    const projectPath = '/g/g-p-6a86a24c609c819193e2bbb2fd52147d-webcodex';
+    const openedBrowsers: Array<string | null> = [];
+    setBrowserOpener(async (url, browserFamily) => {
+      opened.push(url);
+      openedBrowsers.push(browserFamily);
+    });
+    const mapped = await request('POST', '/correlations', {
+      body: {
+        conversationId: sourceConversation,
+        projectPath,
+        calls: [{ messageId: 'resume-edge-source', requestId: 'wfr-resume-edge-source' }]
+      },
+      userAgent: 'Mozilla/5.0 Chrome/152.0.0.0 Safari/537.36 Edg/152.0.0.0'
+    });
+    expect(mapped.status).toBe(200);
+    const continuation = await readyContinuation(mapped.body.sessionId, 'continue in the source browser', sourceConversation);
+
+    queueResume(mapped.body.sessionId, continuation);
+    await waitForOpened(1);
+
+    expect(openedBrowsers).toEqual(['edge']);
+    expect(new URL(opened[0]!).pathname).toBe(`${projectPath}/project`);
   });
 
   it('ends a browser-open rejection immediately rather than blocking the command queue', async () => {

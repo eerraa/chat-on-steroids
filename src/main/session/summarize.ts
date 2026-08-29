@@ -292,8 +292,11 @@ function build(
 
     // ---------------------------------------------------------- commands
     case 'exec_command': {
+      const commands = arr(args['cmds']).filter((item): item is string => typeof item === 'string' && item.length > 0);
+      const isBatch = commands.length > 0;
       const command = scriptLabel(str(args['cmd']));
-      const failed = evidence.timedOut || (evidence.exitCode !== null && evidence.exitCode !== 0);
+      const failed =
+        !evidence.benignExit && (evidence.timedOut || (evidence.exitCode !== null && evidence.exitCode !== 0));
       // `exec_command` deliberately returns after its yield window when the child is still
       // alive. New callers record that state explicitly. The second branch keeps older
       // in-memory/test evidence readable, but no new summary needs to infer process state
@@ -302,10 +305,13 @@ function build(
         evidence.running === true ||
         (evidence.running === null && !evidence.timedOut && evidence.exitCode === null && evidence.durationMs !== null);
       const took = evidence.durationMs ?? input.durationMs;
+      const batchFailure =
+        failed && isBatch && evidence.detail?.startsWith('Command failed (') ? evidence.detail : null;
+      const subject = isBatch ? `${commands.length}-command batch` : command;
       return {
         kind: 'run',
         tone: failed ? 'bad' : running ? 'neutral' : 'good',
-        title: failed ? `Command failed ${command}` : running ? `Started ${command}` : `Ran ${command}`,
+        title: batchFailure ?? (failed ? `Command failed ${subject}` : running ? `Started ${subject}` : `Ran ${subject}`),
         metric: running
           ? 'running'
           : evidence.timedOut
@@ -316,17 +322,33 @@ function build(
       };
     }
     case 'write_stdin': {
-      const id = str(args['session_id']) ?? '';
+      const rawId = args['session_id'];
+      const id = typeof rawId === 'string' || typeof rawId === 'number' ? String(rawId) : '';
       const signal = str(args['signal']);
+      const processFailed = evidence.timedOut || (evidence.exitCode !== null && evidence.exitCode !== 0);
+      const processFinished = evidence.running === false && evidence.exitCode !== null;
       const title =
-        signal === 'kill'
+        processFailed
+          ? `Command failed in session ${id}`.trim()
+          : signal === 'kill'
           ? `Stopped session ${id}`.trim()
           : signal === 'int'
             ? `Interrupted session ${id}`.trim()
             : str(args['chars'])
               ? `Wrote to session ${id}`.trim()
-              : `Waited on session ${id}`.trim();
-      return { kind: 'process', tone: signal === 'kill' ? 'warn' : 'neutral', title };
+              : processFinished
+                ? `Session ${id} finished`.trim()
+                : `Waited on session ${id}`.trim();
+      return {
+        kind: 'process',
+        tone: processFailed ? 'bad' : signal === 'kill' ? 'warn' : 'neutral',
+        title,
+        ...(processFailed
+          ? { metric: evidence.timedOut ? '✕ timed out' : `✕ exit ${evidence.exitCode}` }
+          : processFinished
+            ? { metric: `✓ exit ${evidence.exitCode}` }
+            : {})
+      };
     }
 
     // ------------------------------------------------------------ screen

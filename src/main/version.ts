@@ -53,5 +53,11 @@ export function extensionDownloadUrl(version = APP_VERSION): string {
  *     that one browser-open attempt, and the page still has to redeem/ACK the command normally.
  *     An older extension does not know those routes, so letting it appear protocol-compatible
  *     would strand worker commands that the app deliberately no longer foreground-opens.
+ * 10 — Compact & Resume capture authority moved from rendered DOM prose to the durable canonical
+ *      ChatGPT message record. The page now supplies the exact browser-local `turnId` that
+ *      answered its one handoff prompt; the app resolves that generation's final assistant bytes
+ *      from Fiber/session history. The auto-compaction stalled-rescue proof is also forwarded
+ *      through the service worker. A 9 peer silently drops these fields and can reproduce the
+ *      truncated-fragment handoff failure, so this change must fail loudly rather than degrade.
  */
-export const BRIDGE_PROTOCOL = 9;
+export const BRIDGE_PROTOCOL = 10;

@@ -71,13 +71,12 @@
   const TOOL = 'span[class*="tool-message"], div.pointer-events-none.contents';
   const OWN_SURFACES = '.clf-stream, .clf-stage, .clf-composer, .clf-boot';
   const MAX_RENDERED_HTML = 120_000;
-  // A 15k–20k-token compaction answer is routinely 60k–90k characters. Capping public
-  // assistant prose at 32k here made the canonical session transcript lose the back half
-  // even though Compact & Resume itself carried the full DOM answer. One event still stays
-  // comfortably below the 512 KiB bridge body cap alongside its bounded rendered HTML.
-  // Safety guard only. Compact & Resume is specified in tokens (up to 30k), so this must be
-  // comfortably larger than a normal handoff rather than acting as a second token budget.
+  // Rendered DOM/HTML is presentation evidence and stays tighter. Authored raw text is the
+  // canonical recovery source and gets the full per-turn allowance below: Compact & Resume may
+  // later bound an exceptional handoff to 256k while preserving both its head and actionable
+  // tail, which is impossible if Fiber already discarded the tail first.
   const MAX_RENDERED_TEXT = 256_000;
+  const MAX_AUTHORED_TEXT = 512 * 1024;
   /** Aggregate authored text/HTML copied through MAIN -> isolated world in one scan. */
   const MAX_RESPONSE_TEXT = MAX_TURNS * 512 * 1024;
   const MAX_TURN_TEXT = 512 * 1024;
@@ -318,7 +317,7 @@
    * Do not fall back to arbitrary object/string fields. This helper runs in the page world
    * and its allowlist is a privacy boundary: only the public text payload crosses worlds.
    */
-  function authoredText(message) {
+  function authoredText(message, maxChars = MAX_AUTHORED_TEXT) {
     const content = message && typeof message === 'object' ? message.content : null;
     if (!content || typeof content !== 'object' || content.content_type !== 'text') return null;
     if (Array.isArray(content.parts)) {
@@ -328,13 +327,13 @@
         if (typeof part !== 'string') continue;
         if (value) value += '\n';
         value += part;
-        if (value.length >= MAX_RENDERED_TEXT) break;
+        if (value.length >= maxChars) break;
       }
-      value = value.slice(0, MAX_RENDERED_TEXT);
+      value = value.slice(0, maxChars);
       return value.length > 0 ? value : null;
     }
     return typeof content.text === 'string' && content.text.length > 0
-      ? content.text.slice(0, MAX_RENDERED_TEXT)
+      ? content.text.slice(0, maxChars)
       : null;
   }
 
@@ -399,7 +398,7 @@
       if (!author || author.role !== 'assistant') continue;
       if (requestOf(message) || resultOf(message) || hiddenMessage(message)) continue;
       const id = str(message.id);
-      const rawText = budgetedText(authoredText(message), budget, MAX_RENDERED_TEXT);
+      const rawText = budgetedText(authoredText(message, MAX_AUTHORED_TEXT), budget, MAX_AUTHORED_TEXT);
       if (!id || !rawText) continue;
       if (seen.has(id)) continue;
       seen.add(id);
@@ -483,7 +482,7 @@
       const author = message.author;
       if (!author || author.role !== 'user') continue;
       const id = str(message.id);
-      const rawText = budgetedText(authoredText(message), budget, MAX_RENDERED_TEXT);
+      const rawText = budgetedText(authoredText(message, MAX_RENDERED_TEXT), budget, MAX_RENDERED_TEXT);
       if (!id || !rawText) continue;
       if (seen.has(id)) continue;
       seen.add(id);

@@ -199,6 +199,20 @@ type NewMessageEvent = MessageEvent extends infer Event
     : never
   : never;
 
+/**
+ * The canonical final assistant payload for one exact browser-local turn.
+ *
+ * Compact & Resume uses this result instead of re-parsing rendered Markdown. `missing` is an
+ * ordinary cross-process ordering state: the page can observe the turn end before the service
+ * worker has delivered Fiber's final canonical message batch. `ambiguous` and `incomplete` are
+ * fail-closed durable-record failures and must never be guessed through from DOM text.
+ */
+export type FinalAssistantTextResult =
+  | { status: 'ready'; text: string }
+  | { status: 'missing' }
+  | { status: 'ambiguous' }
+  | { status: 'incomplete' };
+
 /** Internal checkpoint field persisted beside the public summary projection. */
 const META_HISTORY_SEQ = '__historySeq';
 type PersistedSummary = SessionSummary & { [META_HISTORY_SEQ]?: number };
@@ -508,6 +522,44 @@ async function readCanonicalMessages(id: string): Promise<Map<string, MessageEve
   return out;
 }
 
+/**
+ * Reads the one canonical final assistant message owned by `turnId`, including overflow bytes.
+ *
+ * The browser-local turn id is the ownership join produced by content.js; the authored bytes are
+ * the Fiber/message-model record already stored here. Keeping those responsibilities separate is
+ * deliberate: DOM layout can fragment one authored answer into many `.markdown` nodes, while the
+ * canonical message model still exposes one complete logical message. The 2026-08-29 production
+ * compaction failure recorded 42,911 canonical characters for one turn while the DOM fallback
+ * returned only its final 28-character Markdown fragment.
+ */
+export async function readFinalAssistantTextForTurn(
+  sessionId: string,
+  turnId: string
+): Promise<FinalAssistantTextResult> {
+  assertSessionId(sessionId);
+  if (!turnId || turnId.length > 200) return { status: 'missing' };
+  // Canonical message writes share the session queue. Joining it is what turns "not here yet"
+  // into a real fact rather than a race with an in-flight /events append.
+  await flushSession(sessionId);
+  const active = open.get(sessionId);
+  const messages = active?.messages ?? (await readCanonicalMessages(sessionId));
+  const finals = [...messages.values()].filter(
+    (event) =>
+      event.kind === 'assistant_message' &&
+      event.turnId === turnId &&
+      event.final === true
+  );
+  if (finals.length === 0) return { status: 'missing' };
+  if (finals.length !== 1) return { status: 'ambiguous' };
+
+  const stored = finals[0]!.message;
+  if (!stored.truncated) return { status: 'ready', text: stored.text };
+  if (!stored.assetId) return { status: 'incomplete' };
+  const full = await readOverflowText(sessionId, stored.assetId);
+  if (full === null || full.length !== stored.chars) return { status: 'incomplete' };
+  return { status: 'ready', text: full };
+}
+
 async function writeCanonicalMessage(id: string, key: string, event: MessageEvent): Promise<void> {
   const dir = path.join(sessionDir(id), 'messages');
   await fs.mkdir(dir, { recursive: true });
@@ -780,6 +832,27 @@ export function autoCompactionReady(summary: SessionSummary | null | undefined):
 }
 
 /**
+ * Emergency context-pressure floor for a turn that has already gone silent.
+ *
+ * The recorder's token estimate excludes ChatGPT's system prompt, model-private reasoning and
+ * other server-side context, so the configured 400k line is not a hard equivalence to the
+ * provider's own context use. Session 2026-08-28-dff49461 stalled at 381,494 recorded tokens:
+ * close enough to the configured line that context pressure is a credible cause, but still low
+ * enough that the ordinary threshold quite correctly had not armed. A ten-minute *browser-proven*
+ * stall near the line is therefore allowed to spend the same one-shot slightly early. Keep the
+ * floor conservative so a small chat hit by a transient provider outage is never churned into a
+ * replacement conversation merely because Auto Compact is enabled.
+ */
+export const AUTO_COMPACTION_STALL_RATIO = 0.9;
+
+export function autoCompactionStallReady(summary: SessionSummary | null | undefined): boolean {
+  if (!summary || summary.autoCompactTriggeredAt !== null) return false;
+  const config = getConfig().compaction;
+  if (!config.auto || config.autoTokens <= 0) return false;
+  return summary.contextTokens >= Math.floor(config.autoTokens * AUTO_COMPACTION_STALL_RATIO);
+}
+
+/**
  * Atomically consumes the one automatic trigger before the browser starts doing anything.
  *
  * Consumption is durable and happens before ChatGPT is stopped or prompted. If the browser
@@ -789,11 +862,15 @@ export function autoCompactionReady(summary: SessionSummary | null | undefined):
 export async function claimAutoCompaction(
   sessionId: string,
   conversationId: string,
-  stillWorking: () => boolean = () => true
+  stillWorking: () => boolean = () => true,
+  stalledNearThreshold = false
 ): Promise<boolean> {
   const entry = await ensureOpen(sessionId);
   const claim = entry.queue.then(async () => {
-    if (entry.summary.conversationId !== conversationId || !autoCompactionReady(entry.summary)) return false;
+    const eligible =
+      autoCompactionReady(entry.summary) ||
+      (stalledNearThreshold && autoCompactionStallReady(entry.summary));
+    if (entry.summary.conversationId !== conversationId || !eligible) return false;
     // Asked here rather than by the caller beforehand, because the answer decides whether
     // the one-shot is spent. A turn that ended while this claim was queued must leave the
     // trigger untouched: under the level rule the chat stays over the line, so the next

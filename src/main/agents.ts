@@ -391,6 +391,10 @@ interface FinishStageState {
   agent: Agent;
   info: AgentInfo;
   report: AgentMessage;
+  /** Which authority produced this stop, so a ceiling crossing preserves its semantics. */
+  kind: 'reported-result' | 'observed-without-result';
+  /** App-owned explanation for an observed stop that carried no worker-authored result. */
+  observedReason: string | null;
   /**
    * Normal inbox rows whose delivery this finish observation itself proves.
    *
@@ -1925,6 +1929,41 @@ function planFinish(agent: Agent, result: string): { info: AgentInfo; report: Ag
 }
 
 /**
+ * Plans a browser-observed worker stop that produced no trustworthy worker result.
+ *
+ * A failed/stopped/interrupted ChatGPT turn proves the worker is not working now, but it is not
+ * a model-authored completion report. Sleeping is therefore the honest state: free the slot,
+ * keep the exact worker chat/workspace/inbox, and tell the prime explicitly that this part did
+ * not produce a result. A later authenticated tool call can wake the same worker and correct
+ * that report through the existing noteAgentAlive() path.
+ */
+function planObservedSleep(agent: Agent, reason: string): { info: AgentInfo; report: AgentMessage } {
+  const terminal = ceilingCrossed(agent.info);
+  const now = Date.now();
+  const info: AgentInfo = {
+    ...agent.info,
+    state: terminal ? 'finished' : 'sleeping',
+    finishedAt: terminal ? now : null,
+    sleptAt: now,
+    detachedAt: null,
+    // No assistant final was observed, so inventing a worker result here would make a failed
+    // audit indistinguishable from completed work in status/history.
+    result: null,
+    revivable: !terminal
+  };
+  const explanation = reason.slice(0, MAX_MESSAGE_CHARS);
+  const capacity = terminal
+    ? ' Its chat has also reached the context limit, so it cannot be woken again. Spawn a replacement worker or do that part yourself.'
+    : ` Its worker slot is free and its chat is intact. Wake it with agents action=message to="${agent.info.id}" if you want it to retry/continue, or do that part yourself.`;
+  const report = newMessage(
+    agent.info.id,
+    PRIME_ID,
+    `[${agent.info.id} stopped without a result] ${explanation}${capacity} Do not treat this worker's assigned task as completed.`
+  );
+  return { info, report };
+}
+
+/**
  * Upgrades a finish that is still behind its immediate durability barrier when session
  * accounting proves the worker crossed the 400k ceiling in the meantime.
  *
@@ -1945,7 +1984,10 @@ function upgradeStagedFinishAtCeiling(agent: Agent): boolean {
   ) {
     return false;
   }
-  const terminal = planFinish(agent, stage.info.result ?? '');
+  const terminal =
+    stage.kind === 'observed-without-result'
+      ? planObservedSleep(agent, stage.observedReason ?? 'Its ChatGPT turn stopped without a final worker result.')
+      : planFinish(agent, stage.info.result ?? '');
   stage.info.state = 'finished';
   stage.info.finishedAt = stage.info.sleptAt ?? terminal.info.finishedAt ?? Date.now();
   stage.info.revivable = false;
@@ -2005,6 +2047,8 @@ function stageFinish(agent: Agent, result: string, acknowledgedMessageIds: reado
     run,
     agent,
     ...planned,
+    kind: 'reported-result',
+    observedReason: null,
     acknowledgedMessageIds: [...new Set(acknowledgedMessageIds)],
     settled: false
   };
@@ -2049,6 +2093,57 @@ function stageFinish(agent: Agent, result: string, acknowledgedMessageIds: reado
     // context ceiling while the fsync is in flight; upgradeStagedFinishAtCeiling() then updates
     // these same objects so both the durable snapshot and the eventual tool/bridge result say
     // what actually committed.
+    info: stage.info,
+    report: stage.report,
+    repeat: false,
+    commit: () => settle(true),
+    rollback: () => settle(false)
+  };
+}
+
+/**
+ * Browser-owned transactional sleep for an exact worker turn that ended without a result.
+ *
+ * This uses the same critical staged overlay as a worker final: `/events` may return 200 only
+ * after one durable swarm generation contains both the freed slot and the prime report. Unlike
+ * a successful final, it acknowledges no offered inbox row — a failed turn is not proof that a
+ * preceding MCP result carrying those words reached the model.
+ */
+export function stageWorkerConversationSleep(conversationId: string, reason: string): StagedFinish | null {
+  if (!run || !conversationId) return null;
+  const agent = agentForConversationId(conversationId);
+  if (!agent || agent.info.role !== 'worker' || hasStopped(agent.info.state)) return null;
+  if (activeFinishStages.has(agent)) {
+    throw new AgentError(
+      `FINISH_IN_PROGRESS: ${agent.info.id} is already crossing its durable stop barrier. Retry after that observation settles.`
+    );
+  }
+  const planned = planObservedSleep(agent, reason);
+  const stage: FinishStageState = {
+    run,
+    agent,
+    ...planned,
+    kind: 'observed-without-result',
+    observedReason: reason,
+    acknowledgedMessageIds: [],
+    settled: false
+  };
+  activeFinishStages.set(agent, stage);
+  changed();
+
+  const settle = (accepted: boolean): void => {
+    if (stage.settled) return;
+    stage.settled = true;
+    if (activeFinishStages.get(agent) === stage) activeFinishStages.delete(agent);
+    if (!runProjectionStillOwned(stage.run) || stage.run.agents.get(agent.info.id) !== agent) return;
+    if (accepted) {
+      publishFinish(agent, stage.info, stage.report, 'telemetry');
+      return;
+    }
+    // Supersede any failed immediate snapshot with the still-authoritative pre-sleep state.
+    changed();
+  };
+  return {
     info: stage.info,
     report: stage.report,
     repeat: false,
