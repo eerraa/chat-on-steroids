@@ -4,9 +4,10 @@ This repository is a fork of [`totec448-spec/chat-on-steroids`](https://github.c
 It keeps upstream history intact and carries focused compatibility fixes that are useful before
 they are available upstream.
 
-## Current fixes over upstream v2.0.2
+## Current fixes over upstream main
 
-Base: upstream tag `v2.0.2`, commit `e254b954eb6570c52f2e7cc059700deff1214a9b`.
+Base: upstream `main`, commit `9e27c0fafc20bf2c81509844d5f92868678b4168` (including the
+`v2.0.2` base and the subsequent resume-shadow / stale-Fiber attribution fixes).
 
 ### ChatGPT Project conversation attribution
 
