@@ -57,6 +57,28 @@ export interface Workspace {
 }
 
 const workspaces = new Map<string, Workspace>();
+/**
+ * Absolute-path work learned before this request's page identity arrived.
+ *
+ * Keyed by the exact normalized x-request-id and promoted only when that request id is later
+ * proven for one conversation. It is convenience state, never authority; expiry simply means
+ * the chat has to spell one absolute path again.
+ */
+const PENDING_WORKSPACE_TTL_MS = 60_000;
+const MAX_PENDING_WORKSPACES = 256;
+const pendingWorkspaces = new Map<string, Workspace>();
+
+function prunePending(now = Date.now()): void {
+  const cutoff = now - PENDING_WORKSPACE_TTL_MS;
+  for (const [requestId, held] of pendingWorkspaces) {
+    if (held.at < cutoff) pendingWorkspaces.delete(requestId);
+  }
+  while (pendingWorkspaces.size > MAX_PENDING_WORKSPACES) {
+    const oldest = pendingWorkspaces.keys().next().value;
+    if (typeof oldest !== 'string') break;
+    pendingWorkspaces.delete(oldest);
+  }
+}
 
 /**
  * Who this call is, for workspace purposes only.
@@ -127,6 +149,17 @@ export function setCurrentWorkspace(workspace: Omit<Workspace, 'at'>): boolean {
   const key = workspaceKey();
   if (!key) return false;
   setWorkspaceFor(key, workspace);
+  return true;
+}
+
+/** Promotes only workspace evidence gathered by this exact request id. */
+export function adoptWorkspaceForRequest(requestId: string | null | undefined, conversationId: string): boolean {
+  if (!requestId || !conversationId) return false;
+  prunePending();
+  const pending = pendingWorkspaces.get(requestId);
+  if (!pending) return false;
+  pendingWorkspaces.delete(requestId);
+  setWorkspaceFor(`chat:${conversationId}`, { virtual: pending.virtual, real: pending.real });
   return true;
 }
 
@@ -296,6 +329,7 @@ export function clearChatWorkspace(conversationId: string | null): boolean {
 /** Forgets everything. Tests, and a full disconnect. */
 export function resetWorkspaces(): void {
   workspaces.clear();
+  pendingWorkspaces.clear();
 }
 
 /**
@@ -399,7 +433,9 @@ export async function projectFolderOf(
  * already proven it can reach.
  */
 export async function learnWorkspace(resolved: { real: string; virtual: string; root: Root }): Promise<void> {
-  if (!workspaceKey()) return;
+  const key = workspaceKey();
+  const requestId = currentCall()?.caller.requestId ?? null;
+  if (!key && !requestId) return;
   let rootReal: string;
   try {
     rootReal = await fs.realpath(resolved.root.path);
@@ -407,5 +443,11 @@ export async function learnWorkspace(resolved: { real: string; virtual: string; 
     return;
   }
   const folder = await projectFolderOf(resolved, rootReal);
-  setCurrentWorkspace(folder);
+  if (key) {
+    setCurrentWorkspace(folder);
+    return;
+  }
+  prunePending();
+  pendingWorkspaces.set(requestId as string, { ...folder, at: Date.now() });
+  prunePending();
 }

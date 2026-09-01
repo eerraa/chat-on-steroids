@@ -62,12 +62,18 @@ function stage(name, state, meta) {
 /** How the app describes what it placed a call on, in its own words. */
 const ATTRIBUTION = {
   request_id: 'exact request id',
+  openai_session: 'proven ChatGPT session continuity',
   unattributed: 'request id not resolved',
   agent: 'agent key',
   turn: 'tool block on the page',
   generation: 'the only chat generating',
   inferred: 'not placed in a chat'
 };
+
+/** Both are deterministic conversation identity; only request_id is page-local proof. */
+function processedAttribution(value) {
+  return value === 'request_id' || value === 'openai_session';
+}
 
 /**
  * The three stages, from evidence each layer produced independently.
@@ -146,8 +152,8 @@ function pipeline(info, ready) {
   }
 
   const calls = Array.isArray(page.trace) ? page.trace : [];
-  const placed = calls.filter((call) => call.app === 'request_id').length;
-  const missed = calls.filter((call) => call.app && call.app !== 'request_id');
+  const placed = calls.filter((call) => processedAttribution(call.app)).length;
+  const missed = calls.filter((call) => call.app && !processedAttribution(call.app));
   if (missed.length > 0) {
     return {
       read: readStage,
@@ -163,7 +169,14 @@ function pipeline(info, ready) {
     read: readStage,
     sent: sentStage,
     proc: ['done', calls.length ? `${placed}/${calls.length}` : ''],
-    why: ['', calls.length ? 'Every tool call matched end to end.' : 'Recording into the app.']
+    why: [
+      '',
+      calls.length
+        ? calls.some((call) => call.app === 'openai_session')
+          ? 'Every tool call was placed by proven identity; page-less calls used ChatGPT session continuity.'
+          : 'Every tool call matched end to end.'
+        : 'Recording into the app.'
+    ]
   };
 }
 
@@ -180,7 +193,7 @@ function paintCalls(page) {
     for (const state of [
       entry.read ? 'on' : '',
       entry.sent ? 'on' : '',
-      entry.app ? (entry.app === 'request_id' ? 'on' : 'bad') : ''
+      entry.app ? (processedAttribution(entry.app) ? 'on' : 'bad') : ''
     ]) {
       const pip = document.createElement('span');
       pip.className = `pip ${state}`;

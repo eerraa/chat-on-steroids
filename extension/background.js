@@ -24,7 +24,7 @@ const PORTS = [8765, 8766, 8767, 8768, 8769];
 const HELLO_TIMEOUT_MS = 1200;
 const REQUEST_TIMEOUT_MS = 10_000;
 /** Bumped only when the request/response shape changes; the app compares it. */
-const BRIDGE_PROTOCOL = 10;
+const BRIDGE_PROTOCOL = 11;
 
 /**
  * Journal caps. The byte figure is what actually matters — chrome.storage.session has a
@@ -145,6 +145,9 @@ let browserWorkerOpenTimer = null;
 let browserWorkerOpenAgain = false;
 let browserWorkerOpenLastAt = 0;
 const BROWSER_WORKER_OPEN_MIN_MS = 750;
+/** Settled sleeping-worker conversations waiting for best-effort inactive-tab cleanup. */
+const workerTabCleanupQueue = new Set();
+let workerTabCleanupWork = null;
 
 /**
  * Which ChatGPT conversation each browser tab currently represents.
@@ -640,6 +643,77 @@ async function notifyActivityDirty(value) {
   return delivered;
 }
 
+/**
+ * Closes at most one inactive tab for an exactly named sleeping worker.
+ *
+ * The app's `/events` ACK is the durable transcript + broker-sleep boundary. Before touching a
+ * browser tab we still re-check the broker, because the prime may have queued a revival after
+ * that ACK. This is housekeeping only: neither the local tab registry nor this response is ever
+ * used as caller authority. Active/pinned tabs are left alone, and any remaining journal/command
+ * ACK for the conversation keeps the tab open until a later settled turn gives us another chance.
+ */
+async function closeSettledWorkerTab(value) {
+  const conversationId = cleanConversationId(value);
+  if (!conversationId) return false;
+  if (journalCountForConversation(conversationId) > 0) return false;
+  if (commandAckOutbox.some((entry) => entry && entry.conversationId === conversationId)) return false;
+  if (deferredRevivals.some((entry) => entry && entry.conversationId === conversationId)) return false;
+
+  const check = await call(`/worker-tab-cleanup?conversationId=${encodeURIComponent(conversationId)}`);
+  const claim = typeof check.data?.claim === 'string' ? check.data.claim : '';
+  if (!check.ok || check.data?.eligible !== true || !claim) return false;
+  try {
+    let tabs = [];
+    try {
+      tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+    } catch {
+      return false;
+    }
+    const candidate = tabs.find(
+      (tab) =>
+        tab &&
+        typeof tab.id === 'number' &&
+        conversationForTab(tab) === conversationId &&
+        tab.active === false &&
+        tab.pinned !== true
+    );
+    if (!candidate || typeof chrome.tabs.remove !== 'function') return false;
+    try {
+      await chrome.tabs.remove(candidate.id);
+      return true;
+    } catch {
+      return false;
+    }
+  } finally {
+    // The app-side claim prevents `agents message` or a proven sleeping-worker call from
+    // transitioning to waking/active between eligibility and this browser action. Release is
+    // best-effort; the app also expires a lost claim after a few seconds.
+    await call(
+      `/worker-tab-cleanup/release?conversationId=${encodeURIComponent(conversationId)}&claim=${encodeURIComponent(claim)}`
+    );
+  }
+}
+
+function scheduleWorkerTabCleanup(value) {
+  const conversationId = cleanConversationId(value);
+  if (!conversationId) return;
+  workerTabCleanupQueue.add(conversationId);
+  if (workerTabCleanupWork) return;
+  const work = (async () => {
+    while (workerTabCleanupQueue.size > 0) {
+      const next = workerTabCleanupQueue.values().next().value;
+      if (typeof next !== 'string') break;
+      workerTabCleanupQueue.delete(next);
+      await closeSettledWorkerTab(next);
+    }
+  })();
+  const tracked = work.finally(() => {
+    if (workerTabCleanupWork === tracked) workerTabCleanupWork = null;
+    if (workerTabCleanupQueue.size > 0) scheduleWorkerTabCleanup(workerTabCleanupQueue.values().next().value);
+  });
+  workerTabCleanupWork = tracked;
+}
+
 /** Finds the next deliverable conversation and its first batch in one journal pass. */
 function nextJournalBatch(preferredConversationId = null) {
   const blocked = new Set();
@@ -676,6 +750,7 @@ function nextJournalBatch(preferredConversationId = null) {
 async function drainOnce(preferredConversationId = null) {
   await load();
   if (journal.length === 0 || !token) return { ok: true, pending: journal.length };
+  const cleanupCandidates = new Set();
   let guard = 0;
   while (journal.length > 0 && guard++ < 20) {
     // A command page deliberately holds its page-local observations until its final ACK is
@@ -706,6 +781,7 @@ async function drainOnce(preferredConversationId = null) {
       if (!retry.ok) break;
       const sent = new Set(half);
       journal = journal.filter((entry) => !sent.has(entry));
+      if (retry.data?.closeWorkerTab === true) cleanupCandidates.add(conversationId);
       void notifyActivityDirty(conversationId);
       continue;
     }
@@ -744,9 +820,11 @@ async function drainOnce(preferredConversationId = null) {
     }
     const sent = new Set(mine);
     journal = journal.filter((entry) => !sent.has(entry));
+    if (result.data?.closeWorkerTab === true) cleanupCandidates.add(conversationId);
     void notifyActivityDirty(conversationId);
   }
   await persistJournal();
+  for (const conversationId of cleanupCandidates) scheduleWorkerTabCleanup(conversationId);
   if (journal.length > 0) scheduleRetry();
   else clearRetryIfIdle();
   return { ok: true, pending: journal.length };
@@ -2734,7 +2812,7 @@ chrome.tabs.onUpdated.addListener((id, changeInfo) => {
  * fresh eligible document receives the manifest's static content scripts.
  */
 const CHATGPT_TAB_URLS = ['https://chatgpt.com/*', 'https://chat.openai.com/*'];
-const PAGE_RECORDER_VERSION = 15;
+const PAGE_RECORDER_VERSION = 17;
 
 let deferredRecoveryWork = null;
 

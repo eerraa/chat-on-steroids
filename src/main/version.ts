@@ -59,5 +59,9 @@ export function extensionDownloadUrl(version = APP_VERSION): string {
  *      from Fiber/session history. The auto-compaction stalled-rescue proof is also forwarded
  *      through the service worker. A 9 peer silently drops these fields and can reproduce the
  *      truncated-fragment handoff failure, so this change must fail loudly rather than degrade.
+ * 11 — a durable worker-turn ACK may ask the extension to close that exact sleeping worker's
+ *      inactive tab, and `/worker-tab-cleanup` re-checks broker eligibility immediately before
+ *      the close. A 10 extension ignores the response and keeps accumulating tabs, so keep the
+ *      bundled extension/app pair explicit rather than silently accepting the older policy.
  */
-export const BRIDGE_PROTOCOL = 10;
+export const BRIDGE_PROTOCOL = 11;

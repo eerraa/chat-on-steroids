@@ -221,6 +221,7 @@ src/main/codex/apply-patch/*  V4A parser / matcher / runtime / shell interceptio
 src/main/session/store.ts     durable sessions, messages, assets, handoffs
 src/main/session/recorder.ts  merges MCP truth with browser observations
 src/main/session/correlation.ts  requestId → conversationId proof registry
+src/main/session/openai-session.ts process-local PC↔mobile continuity learned from exact page proof
 src/main/session/continuation.ts transactional Compact & Resume rebind
 src/main/session/handoff-prompt.ts  the brief injected into the old chat
 src/main/session/summarize.ts human-readable activity summaries
@@ -330,10 +331,11 @@ hidden acceptance. A deliberate reconnect is the clean boundary for changing the
 ```text
 tunnel request
  → server.ts    loopback Host/Origin, secret tokenized path, bounded body,
-                x-request-id read + normalized (split before '/')
+                x-request-id normalized; x-openai-session hashed in request-local state
  → tools.ts     build only the requested surface
  → kernel.ts    AsyncLocalStorage call context
-                resolve exact caller from correlation evidence
+                resolve exact page caller from correlation evidence first
+                otherwise use only a previously page-proven surface/OpenAI-session mapping
                 resolve agent identity if a swarm is active
                 wait for identity when the operation genuinely needs it
                 enforce the live capability / read-only guard
@@ -346,8 +348,9 @@ tunnel request
 
 `server.ts` manually reads and bounds chunked / no-`Content-Length` POST bodies before
 handing parsed JSON to the MCP adapter. **Do not regress that to a `Content-Length`-only
-guard.** `inbound.ts` captures the raw header because the MCP library's higher-level
-context has not reliably exposed it.
+guard.** `inbound.ts` captures the normalized request id because the MCP library's higher-level
+context has not reliably exposed that header, and hashes only ChatGPT's `x-openai-session`
+counterpart for continuity; raw vendor-session values are not retained or logged.
 
 `call-context.ts` keeps **two** in-flight counters: handlers currently executing, and MCP
 requests still in dispatch (including the identity wait and the durable recording that
@@ -443,8 +446,8 @@ over optimistic decoding.**
 
 ## 11. Identity — the spine of the whole project
 
-An MCP payload contains **no trustworthy ChatGPT conversation id**. There is exactly one
-accepted proof chain:
+An MCP tool argument contains **no trustworthy ChatGPT conversation id or model-carried
+credential**. The strongest and only first-use proof chain is:
 
 ```text
 HTTP x-request-id                       (inbound.ts, normalized before '/')
@@ -457,8 +460,30 @@ HTTP x-request-id                       (inbound.ts, normalized before '/')
   → consumed by: kernel · recorder · agents · workspace · terminal ownership
 ```
 
+Current ChatGPT also sends a non-model-controlled vendor session pair on MCP ingress:
+`params._meta['openai/session']` and HTTP `x-openai-session`. Live PC→mobile and mobile→PC
+tests on distinct conversations showed that pair stays stable for one conversation across
+devices, differs between conversations, and differs between Core and Desktop surfaces. It is
+therefore usable only as **learned continuity**, under these rules:
+
+- the key is surface-scoped and requires both vendor-session values;
+- a key receives a conversation only on a call whose exact request-id/page chain above already
+  proved that same conversation; an unseen mobile session has no caller authority;
+- raw values are hashed immediately and stay only in process memory — no recorder, diagnostic,
+  durable state or model-visible schema/result contains them;
+- app restart revokes the learned map because cross-app-restart stability has not been measured;
+- contradictory proof makes the key sticky-ambiguous for that process; never last-writer-wins;
+- learned continuity proves the **conversation only**. A page-less mobile call has no authority
+  over this PC document's local `turnId`, so presentation must never time-attach an
+  `openai_session` tool call to the most recent browser turn. Overwrite leaves that response
+  native unless exact page-local message/turn evidence independently proves a replacement;
+- destructive worker retirement and Compact & Resume source retirement revoke mobile continuity
+  for the old conversation, while fresh exact page evidence remains the stronger identity proof;
+- Compact & Resume never copies A's vendor-session mapping onto B. B learns its own only from B's
+  own exact page proof.
+
 **Never substitute** active tab, timing, tool name, most-recent chat, only-generating chat,
-worker payload, or arrival order. If proof is missing the safe state is **Unattributed**,
+worker payload, user agent, `openai/subject`, or arrival order. If proof is missing the safe state is **Unattributed**,
 no workspace, or refusal for identity-sensitive work. Guessing is worse than losing
 attribution: it routes commands, files, messages and history into the *wrong* chat.
 
@@ -474,13 +499,14 @@ content.js            did refreshFiber receive it and emit tool_evidence?
 background.js         was it journalled and delivered?
 bridge.ts             was it accepted for the intended conversation?
 correlation.ts        was requestId→conversationId stored, and restored after restart?
-kernel.ts/recorder.ts did the call wait for, find and use the exact proof?
+openai-session.ts     if page-less, was this surface/session pair learned earlier from page proof?
+kernel.ts/recorder.ts did the call use the right proof source without upgrading continuity into request-id proof?
 ```
 
 Agent routing is *downstream* of this. Do not start there.
 
-**Tests.** `correlation.test.ts`, `mcp-inbound.test.ts`, `fiber.test.ts`,
-`content-script.test.ts`, `swarm.test.ts`.
+**Tests.** `correlation.test.ts`, `openai-session.test.ts`, `mcp-inbound.test.ts`, `fiber.test.ts`,
+`content-script.test.ts`, `mcp.test.ts`, `swarm.test.ts`.
 
 ## 12. Session recording — `recorder.ts`, `store.ts`
 
@@ -571,6 +597,24 @@ change, bump `content.js::RECORDER_VERSION` and `background.js::PAGE_RECORDER_VE
 `BRIDGE_PROTOCOL` is a different app/service-worker contract and does not authorize touching an
 already-open document whose recorder is stale or absent.
 
+Overwrite is a **lossless presentation transform**, not authority to replace whatever happens to
+sit in an assistant-labelled React section. Whole-turn replacement may hide native ChatGPT only
+when the synthetic stream can account for every user-visible authored object in that concrete
+section. In particular, the local activity stream does not render user messages, so a section that
+contains any native user-authored message remains native even when its assistant/tool rows are all
+otherwise reconstructable. This is what keeps cross-device content invisible until ChatGPT itself
+loads it, while guaranteeing that a user reload which hydrates that content cannot have it hidden
+again by Overwrite. Split/dedupe sections obey the same completeness fence; an earlier sibling's
+valid synthetic root never grants permission to hide a later lossy section.
+
+Presentation ownership is also **stable while ChatGPT is generating**. Native transcript mutations
+still revoke the exact stale overwrite immediately, and the live response stays native, but settled
+historical streams do not reconcile on every activity/Fiber skew while another response is in
+flight. They reconcile once generation ends. This prevents native↔synthetic height oscillation from
+moving the reader while they follow a thinking/tool-using response. CoS-owned synthetic/replaced
+assistant surfaces are excluded from Chromium automatic scroll anchoring; stable native user turns
+remain eligible, while `content.js` preserves viewport/bottom intent explicitly around each batch.
+
 **Tests.** `content-script.test.ts`, `fiber.test.ts`, `extension.test.ts`.
 
 ## 14. The browser bridge — `bridge.ts`
@@ -656,15 +700,19 @@ Experimental, enabled on fresh installs while existing configs preserve their st
 `worker ← prime → worker`. Workers never message each other.
 
 **Identity.** The prime is the conversation that successfully called `agents action=spawn`
-with proven caller identity. While that paired Chromium profile is present, fresh worker tabs are
+with proven caller identity. A PC/browser call establishes that identity through the exact
+request-id chain in §11; a later page-less mobile call may recover the same conversation only
+through a surface-scoped OpenAI-session mapping previously learned from that exact proof. While
+that paired Chromium profile is present, fresh worker tabs are
 created by its extension service worker with `active:false` in the exact window containing the
 prime conversation; the app's recorded browser-family launcher is only the browser-absent fallback.
 Once the page has a real conversation id the extension reports it and the broker binds that
 exact conversation before normal worker work proceeds. **Conversation identity is the
 routing credential** — established from the same evidence as recorder attribution — so no
 secret token rides in model arguments and **sender identity never comes from a model
-argument**. There is no credential and no recovery action: a worker whose binding was lost
-is rebound by the extension reporting its chat, never by something a model can present.
+argument**. Learned mobile continuity is transport evidence held by the app, not a credential
+the model can copy or claim. A worker whose browser binding was never proven is still rebound
+by the extension reporting its chat, never by something a model can present.
 
 **Messaging is at-least-once until acknowledged**: queued durably → offered on a tool result
 → acknowledged by the next authenticated tool call. Offering on a result is **not** proof
@@ -722,7 +770,9 @@ conversation even if parking happens on that same finish. Once no worker holds a
 incarnation releases immediately; pending reports remain in the dormant prime's inbox and retain
 the same at-least-once offer/ack semantics. Dormant worker conversations remain authority fences,
 including terminal rows, so stale tabs cannot fall through as ordinary unidentified chats while a
-different prime is active. Orphan cleanup uses durable quiescence plus the wider in-flight
+different prime is active. Dormant ownership is exact-conversation state, **not a global lease**:
+the mere existence of retained worker history must not block an unrelated page-less ordinary
+chat's self-contained read/explicit-workdir command. Orphan cleanup uses durable quiescence plus the wider in-flight
 MCP/observation counters — not a heartbeat guess. Compact & Resume moves active **or dormant**
 prime ownership together with session/workspace state; normal commit and recovery repair transfer
 the same complete worker history to the child conversation or move nothing.

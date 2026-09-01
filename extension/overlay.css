@@ -691,6 +691,15 @@
   display: none !important;
 }
 
+/* CoS already preserves viewport intent explicitly around a presentation pass. Do not also let
+   Chromium choose the synthetic/replaced assistant surface as its automatic scroll anchor: the
+   two corrections can land on adjacent layout frames and produce a visible up/down nudge while
+   rows are being reconciled. Stable native user turns remain eligible anchors. */
+[data-clf-turn-replaced='1'],
+.clf-stream {
+  overflow-anchor: none;
+}
+
 /* A previously rendered sibling may stay mounted solely to preserve its exact chronological
    insertion point while recorder/Fiber revisions catch up. It owns no presentation in this
    state; native ChatGPT is visible until content.js proves the replacement complete again. */

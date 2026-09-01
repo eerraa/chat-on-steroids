@@ -38,8 +38,8 @@ describe('extension release metadata', () => {
     expect(lock.version).toBe(APP_VERSION);
     expect(lock.packages?.['']?.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
-    expect(BRIDGE_PROTOCOL).toBe(10);
-    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 10;');
+    expect(BRIDGE_PROTOCOL).toBe(11);
+    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 11;');
   });
 
   /**
@@ -109,10 +109,11 @@ describe('extension release metadata', () => {
 
   it('ships Overwrite on by default and exposes one persistent toggle that refreshes immediately', async () => {
     const dir = path.join(process.cwd(), 'extension');
-    const [content, html, js] = await Promise.all([
+    const [content, html, js, css] = await Promise.all([
       fs.readFile(path.join(dir, 'content.js'), 'utf8'),
       fs.readFile(path.join(dir, 'popup.html'), 'utf8'),
-      fs.readFile(path.join(dir, 'popup.js'), 'utf8')
+      fs.readFile(path.join(dir, 'popup.js'), 'utf8'),
+      fs.readFile(path.join(dir, 'overlay.css'), 'utf8')
     ]);
     expect(content).toContain("const RENDER_STREAM_KEY = 'renderStreamEnabled';");
     expect(content).toContain("const SHOW_TIMES_KEY = 'showStreamTimes';");
@@ -127,7 +128,9 @@ describe('extension release metadata', () => {
     expect(js).toContain("type: 'overwriteNow'");
     expect(backgroundSource).toContain('async overwriteNow()');
     expect(backgroundSource).toContain("chrome.tabs.sendMessage(id, { type: 'clf-overwrite-now' })");
+    expect(css).toMatch(/\.clf-stream\s*\{[^}]*overflow-anchor:\s*none/s);
   });
+
 });
 
 // ---------------------------------------------------------------------- DOM
@@ -503,7 +506,7 @@ function loadWorker(options: {
   session: FakeStorageArea;
   fetch?: (input: string, init?: Record<string, unknown>) => Promise<ReturnType<typeof response>>;
   tabsGet?: (tabId: number) => Promise<{ id?: number; url?: string; pendingUrl?: string; status?: string }>;
-  tabsQuery?: () => Promise<Array<{ id?: number; windowId?: number; url?: string; pendingUrl?: string }>>;
+  tabsQuery?: () => Promise<Array<{ id?: number; windowId?: number; url?: string; pendingUrl?: string; active?: boolean; pinned?: boolean }>>;
   tabsSendMessage?: (tabId: number, message: Record<string, unknown>) => Promise<unknown>;
 }): WorkerHarness {
   let listener: ((message: any, sender: any, sendResponse: (value: any) => void) => boolean) | null = null;
@@ -895,7 +898,7 @@ describe('extension command delivery', () => {
       session,
       fetch,
       tabsQuery: async () => [{ id: 41, windowId: 73, url: `https://chatgpt.com/c/${prime}` }],
-      tabsSendMessage: async () => ({ ok: true, recorderVersion: 15 })
+      tabsSendMessage: async () => ({ ok: true, recorderVersion: 17 })
     });
 
     // status is only a wake; placement comes from the exact conversation returned by the app,
@@ -1102,7 +1105,7 @@ describe('extension revival delivery', () => {
     worker.tabsSendMessage.mockImplementation(async (id: number, message: { type: string }) => {
       order.push(`${message.type}:${id}`);
       return message.type === 'clf-recorder-ping'
-        ? { ok: true, recorderVersion: 15 }
+        ? { ok: true, recorderVersion: 17 }
         : { ok: true, claimed: true };
     });
 
@@ -1127,7 +1130,7 @@ describe('extension revival delivery', () => {
     const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch: quiet() });
     worker.tabsQuery.mockResolvedValue([{ id: 4, windowId: 7, url: `https://chatgpt.com/c/${CHAT}` }]);
     worker.tabsSendMessage.mockImplementation(async (_id: number, message: { type: string }) => {
-      if (message.type === 'clf-recorder-ping') return { ok: true, recorderVersion: 15 };
+      if (message.type === 'clf-recorder-ping') return { ok: true, recorderVersion: 17 };
       // The app-opened fallback loaded faster and redeemed while background was pinging this
       // existing tab. The existing document truthfully reports that it did not get the lease.
       return { ok: true, claimed: false };
@@ -1196,7 +1199,7 @@ describe('extension revival delivery', () => {
     worker.tabsSendMessage.mockImplementation(async (id: number, message: { type: string }) => {
       if (id === 4) throw new Error('stale recorder');
       return message.type === 'clf-recorder-ping'
-        ? { ok: true, recorderVersion: 15 }
+        ? { ok: true, recorderVersion: 17 }
         : { ok: true, claimed: true };
     });
 
@@ -1218,7 +1221,7 @@ describe('extension revival delivery', () => {
     worker.tabsQuery.mockResolvedValue([{ id: 4, windowId: 7, url: `https://chat.openai.com/c/${CHAT}` }]);
     worker.tabsSendMessage.mockImplementation(async (_id: number, message: { type: string }) =>
       message.type === 'clf-recorder-ping'
-        ? { ok: true, recorderVersion: 15 }
+        ? { ok: true, recorderVersion: 17 }
         : { ok: true, claimed: true }
     );
 
@@ -1237,7 +1240,7 @@ describe('extension revival delivery', () => {
     worker.tabsQuery.mockResolvedValue([{ id: 4, windowId: 7, url: `https://chatgpt.com/c/${CHAT}` }]);
     worker.tabsSendMessage.mockImplementation(async (_id: number, message: { type: string }) =>
       message.type === 'clf-recorder-ping'
-        ? { ok: true, recorderVersion: 15 }
+        ? { ok: true, recorderVersion: 17 }
         : { ok: true, claimed: true }
     );
 
@@ -1264,7 +1267,7 @@ describe('extension revival delivery', () => {
     worker.tabsSendMessage.mockImplementation(async (id: number, message: { type: string }) => {
       expect(id).toBe(4);
       return message.type === 'clf-recorder-ping'
-        ? { ok: true, recorderVersion: 15 }
+        ? { ok: true, recorderVersion: 17 }
         : { ok: true, claimed: true };
     });
 
@@ -1368,7 +1371,7 @@ describe('extension revival delivery', () => {
       tabsSendMessage: async (_tabId, message) => {
         if (message.type === 'clf-recorder-ping') {
           if (!recorderReady) throw new Error('receiver not ready yet');
-          return { ok: true, recorderVersion: 15 };
+          return { ok: true, recorderVersion: 17 };
         }
         if (message.type === 'clf-run-command') return { ok: true, claimed: true };
         return { ok: true };
@@ -1421,7 +1424,7 @@ describe('extension revival delivery', () => {
       tabsSendMessage: async (tabId, message) => {
         if (message.type === 'clf-recorder-ping') {
           if (tabId === 4 && !recorderReady) throw new Error('original recorder is still starting');
-          return { ok: true, recorderVersion: 15 };
+          return { ok: true, recorderVersion: 17 };
         }
         if (message.type === 'clf-run-command') {
           if (tabId !== 4) throw new Error('fallback must never receive the revival command');
@@ -1497,7 +1500,7 @@ describe('extension revival delivery', () => {
       tabsSendMessage: async (tabId, message) => {
         if (message.type === 'clf-recorder-ping') {
           if (tabId === 4) throw new Error('surviving worker recorder is remounting');
-          return { ok: true, recorderVersion: 15 };
+          return { ok: true, recorderVersion: 17 };
         }
         if (message.type === 'clf-run-command') {
           if (tabId !== 4) throw new Error('the current fallback must never steal this wake');
@@ -1642,6 +1645,118 @@ describe('extension observation journal', () => {
       type: 'clf-activity-dirty',
       conversationId
     });
+  });
+
+  it('closes an inactive sleeping worker tab only after the durable events ACK and a fresh broker re-check', async () => {
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const conversationId = '20202020-3030-4040-8050-606060606060';
+    const order: string[] = [];
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/events') {
+        order.push('/events');
+        return response(200, { sessionId: 'worker-session', stored: 2, closeWorkerTab: true });
+      }
+      if (url.pathname === '/worker-tab-cleanup') {
+        order.push('/worker-tab-cleanup');
+        expect(url.searchParams.get('conversationId')).toBe(conversationId);
+        return response(200, { eligible: true, claim: 'cleanup-claim-1' });
+      }
+      if (url.pathname === '/worker-tab-cleanup/release') {
+        order.push('/worker-tab-cleanup/release');
+        expect(url.searchParams.get('conversationId')).toBe(conversationId);
+        expect(url.searchParams.get('claim')).toBe('cleanup-claim-1');
+        return response(200, { released: true });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local,
+      session,
+      fetch,
+      tabsQuery: async () => [
+        { id: 47, windowId: 7, active: false, pinned: false, url: `https://chatgpt.com/c/${conversationId}` }
+      ]
+    });
+
+    const result = await worker.send({
+      type: 'events',
+      conversationId,
+      entries: [
+        { conversationId, event: { kind: 'assistant_message', time: 1, messageId: 'worker-final', text: 'done' } },
+        { conversationId, event: { kind: 'turn_end', time: 2, turnId: 'worker-turn' } }
+      ]
+    }, 47);
+    expect(result).toMatchObject({ ok: true, pending: 0 });
+    for (let turn = 0; turn < 6; turn += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(order).toEqual(['/events', '/worker-tab-cleanup', '/worker-tab-cleanup/release']);
+    expect(journalOf(session)).toEqual([]);
+    expect(worker.tabsRemove).toHaveBeenCalledTimes(1);
+    expect(worker.tabsRemove).toHaveBeenCalledWith(47);
+  });
+
+  it('never auto-closes the tab the user is actively viewing, even when the worker is settled', async () => {
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const conversationId = '30303030-4040-4050-8060-707070707070';
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/events') return response(200, { sessionId: 'worker-session', stored: 2, closeWorkerTab: true });
+      if (url.pathname === '/worker-tab-cleanup') return response(200, { eligible: true, claim: 'cleanup-active-claim' });
+      if (url.pathname === '/worker-tab-cleanup/release') return response(200, { released: true });
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local,
+      session,
+      fetch,
+      tabsQuery: async () => [
+        { id: 48, windowId: 7, active: true, pinned: false, url: `https://chatgpt.com/c/${conversationId}` }
+      ]
+    });
+
+    await worker.send({
+      type: 'events',
+      conversationId,
+      entries: [{ conversationId, event: { kind: 'turn_end', time: 1, turnId: 'worker-turn' } }]
+    }, 48);
+    for (let turn = 0; turn < 6; turn += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(worker.tabsRemove).not.toHaveBeenCalled();
+  });
+
+  it('re-checks a sleeping worker before closing so a concurrent revival keeps the tab open', async () => {
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const conversationId = '40404040-5050-4060-8070-808080808080';
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/events') return response(200, { sessionId: 'worker-session', stored: 2, closeWorkerTab: true });
+      if (url.pathname === '/worker-tab-cleanup') return response(200, { eligible: false });
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local,
+      session,
+      fetch,
+      tabsQuery: async () => [
+        { id: 49, windowId: 7, active: false, pinned: false, url: `https://chatgpt.com/c/${conversationId}` }
+      ]
+    });
+
+    await worker.send({
+      type: 'events',
+      conversationId,
+      entries: [{ conversationId, event: { kind: 'turn_end', time: 1, turnId: 'worker-turn' } }]
+    }, 49);
+    for (let turn = 0; turn < 6; turn += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(worker.tabsRemove).not.toHaveBeenCalled();
   });
 
   it('does not push activity-dirty while a batch is only journalled locally and the app rejects it', async () => {

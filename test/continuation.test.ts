@@ -71,6 +71,13 @@ const { createSession, getSession, initSessionStore, resetSessionStoreForTests, 
 );
 const store = await import('../src/main/session/store.js');
 const { recordChatObservations, resetRecorderForTests, sessionForConversation } = await import('../src/main/session/recorder.js');
+const {
+  learnOpenAiSession,
+  openAiHttpSessionDigest,
+  openAiMetaSessionDigest,
+  resetOpenAiSessionsForTests,
+  resolveOpenAiSession
+} = await import('../src/main/session/openai-session.js');
 const { resetWorkspaces, setWorkspaceFor, workspaceEntries } = await import('../src/main/workspace.js');
 const {
   goalObjectiveFor,
@@ -114,6 +121,7 @@ beforeEach(async () => {
   resetContinuationsForTests();
   resetAgentsForTests();
   resetRecorderForTests();
+  resetOpenAiSessionsForTests();
   resetWorkspaces();
   resetGoalStateForTests();
   await resetSessionStoreForTests();
@@ -340,6 +348,30 @@ describe('committing', () => {
     expect(workspaceEntries().map((held) => held.key)).toEqual([`chat:${CHAT_B}`]);
     expect(goalObjectiveFor(CHAT_A)).toBe('');
     expect(goalObjectiveFor(CHAT_B)).toBe('finish the overnight release');
+  });
+
+  it('retires chat A OpenAI-session continuity without rebinding it to chat B', async () => {
+    const sourceEvidence = {
+      surface: 'core' as const,
+      metaDigest: openAiMetaSessionDigest('openai-session-chat-a'),
+      httpDigest: openAiHttpSessionDigest('openai-http-chat-a')
+    };
+    const destinationEvidence = {
+      surface: 'core' as const,
+      metaDigest: openAiMetaSessionDigest('openai-session-chat-b'),
+      httpDigest: openAiHttpSessionDigest('openai-http-chat-b')
+    };
+    expect(learnOpenAiSession(sourceEvidence, CHAT_A).status).toBe('stored');
+    // A replacement page can prove B before the durable commit finishes. That is B's own
+    // evidence and remains valid; A's key must never be copied or aliased into it.
+    expect(learnOpenAiSession(destinationEvidence, CHAT_B).status).toBe('stored');
+
+    const { token } = await readyContinuation();
+    await claimContinuationNow(token, 'replacement-tab');
+    expect(await commitContinuation(token, CHAT_B)).toBe(true);
+
+    expect(resolveOpenAiSession(sourceEvidence).error).toContain('CALLER_IDENTITY_RETIRED');
+    expect(resolveOpenAiSession(destinationEvidence)).toEqual({ conversationId: CHAT_B, error: null });
   });
 
   it('refuses a chat B that is not a distinct conversation', async () => {

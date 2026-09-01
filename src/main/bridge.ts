@@ -69,6 +69,7 @@ import {
   agentInfoForOwnedConversation,
   agentForOwnedConversation,
   bindConversation,
+  claimWorkerTabCleanup,
   claimWorkerRevival,
   currentRunId,
   failAgent,
@@ -84,6 +85,7 @@ import {
   primeConversationGone,
   requestWorkerRevivals,
   rollbackWorkerRevivalClaim,
+  releaseWorkerTabCleanup,
   releaseQuiescentRun,
   retiredWorkerForConversation,
   sleepSilentDetachedWorkers,
@@ -1394,7 +1396,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           releaseQuiescentRun();
         }
       }
-      return json(res, 200, { sessionId: result.sessionId, stored: result.stored }, origin);
+      const settledWorker = agentInfoForOwnedConversation(id);
+      const closeWorkerTab =
+        settledWorker?.role === 'worker' && settledWorker.state === 'sleeping' && settledWorker.revivable === true;
+      return json(
+        res,
+        200,
+        { sessionId: result.sessionId, stored: result.stored, ...(closeWorkerTab ? { closeWorkerTab: true } : {}) },
+        origin
+      );
     } finally {
       observationWritesInFlight -= 1;
     }
@@ -1428,6 +1438,24 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       }
     }
     return json(res, 200, { ok: true }, origin);
+  }
+
+  // Best-effort browser housekeeping only. This grants no command/conversation authority: the
+  // short claim merely serializes Chrome's query/remove window against a worker revival. If a
+  // revival won first the worker is no longer sleeping and no claim is issued; while a claim is
+  // live, revival/tool activity for that exact worker fails transiently rather than racing close.
+  if (route === '/worker-tab-cleanup') {
+    const id = conversationId(url.searchParams.get('conversationId'));
+    if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
+    const claim = claimWorkerTabCleanup(id);
+    return json(res, 200, { eligible: claim !== null, ...(claim ? { claim } : {}) }, origin);
+  }
+
+  if (route === '/worker-tab-cleanup/release') {
+    const id = conversationId(url.searchParams.get('conversationId'));
+    const claim = (url.searchParams.get('claim') ?? '').slice(0, 100);
+    if (!id || !claim) return json(res, 400, { error: 'bad_cleanup_claim' }, origin);
+    return json(res, 200, { released: releaseWorkerTabCleanup(id, claim) }, origin);
   }
 
   // The activity feed the extension uses to relabel ChatGPT's tool blocks. It only

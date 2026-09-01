@@ -97,7 +97,9 @@ import { childEnv } from '../exec.js';
 import { locateRipgrep } from '../ripgrep.js';
 import { ensureDevToolchain } from '../toolchain.js';
 import {
+  AgentError,
   agentForCaller,
+  dormantWorkerNotice,
   noteAgentContextTokens,
   persistCriticalSwarmNow,
   PRIME_ID,
@@ -122,11 +124,13 @@ import {
 } from './call-context.js';
 import {
   awaitFreshCallOrigin,
+  freshCallOrigin,
   recordAgentMessage
 } from '../session/recorder.js';
 import { findSessionByConversation } from '../session/store.js';
 import {
   adoptAgent,
+  adoptCurrentPageConversation,
   fail,
   formatFileInfo,
   friendlyError,
@@ -769,7 +773,10 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
                 owner = await awaitFreshCallOrigin('exec_command', call.startedAt, IDENTITY_EVIDENCE_MS, {
                   requestId: call.caller.requestId
                 });
-                if (owner) call.caller.conversationId = owner;
+                if (owner) {
+                  const identityError = adoptCurrentPageConversation(owner);
+                  if (identityError) return fail(identityError);
+                }
               }
               noteExecOwner(output.processId, owner);
             }
@@ -871,7 +878,10 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             asking = await awaitFreshCallOrigin('write_stdin', call.startedAt, IDENTITY_EVIDENCE_MS, {
               requestId: call.caller.requestId
             });
-            if (asking) call.caller.conversationId = asking;
+            if (asking) {
+              const identityError = adoptCurrentPageConversation(asking);
+              if (identityError) return fail(identityError);
+            }
           }
           if (execOwnershipDenied(input.session_id, asking)) {
             return fail(
@@ -1083,7 +1093,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           const staged = stageSpawn({
             workers: input.workers,
             context: input.context ?? null,
-            caller: await callerNow(startedAt, { exact: true })
+            caller: await callerForAgentControl(startedAt, { exact: true })
           });
           let accepted = false;
           try {
@@ -1154,7 +1164,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           if (items.length === 0) return fail('agents action=message requires to and text, or a messages array.');
           // Before any slot is reserved: a sleeping worker whose chat has since crossed the
           // context ceiling is not revivable, and this is the call that would otherwise wake it.
-          const caller = await callerNow(startedAt);
+          const caller = await callerForAgentControl(startedAt);
           await measureSleepingWorkers(caller);
           // One call, one identity resolution, one all-or-nothing delivery: a prime
           // redirecting its whole run cannot end up with two of its three messages sent.
@@ -1261,7 +1271,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
         // and `identify` is what decides whether this caller is one of them. An unrelated
         // chat is told AGENTS_BUSY and nothing else — not who the prime is, not how many
         // workers there are, not what any of them are doing.
-        const caller = await callerNow(startedAt);
+        const caller = await callerForAgentControl(startedAt);
         await measureSleepingWorkers(caller);
         const status = statusForCaller(caller);
         const me = status.self;
@@ -1356,7 +1366,9 @@ async function callerNow(startedAt: number, options: { exact?: boolean } = {}): 
   // model cannot absorb, so it gets the longer ceiling; every other `agents` action can be
   // declined and asked again on the next tool call.
   const window = base.requestId ? (options.exact ? SPAWN_EVIDENCE_MS : IDENTITY_EVIDENCE_MS) : PRIME_EVIDENCE_MS;
+  const exactNow = base.requestId ? freshCallOrigin('agents', startedAt, base.requestId) : null;
   const resolved =
+    exactNow ??
     base.conversationId ??
     (await awaitFreshCallOrigin('agents', startedAt, window, {
       ...options,
@@ -1369,8 +1381,8 @@ async function callerNow(startedAt: number, options: { exact?: boolean } = {}): 
     conversationId: resolved
   };
   if (resolved) {
-    const call = currentCall();
-    if (call) call.caller.conversationId = resolved;
+    const identityError = adoptCurrentPageConversation(resolved);
+    if (identityError) throw new AgentError(identityError);
     // A pre-fix Compact & Resume can leave this exact app-opened replacement chat with its own
     // shadow session while the reusable-worker run is still bound to the source chat. Repair
     // only that durably-proven historical failure before membership is evaluated; unrelated
@@ -1385,6 +1397,22 @@ async function callerNow(startedAt: number, options: { exact?: boolean } = {}): 
     );
   }
   await adoptAgent(agentForCaller(caller));
+  return caller;
+}
+
+/**
+ * Identity for `agents` actions that may inspect or mutate a run, except finish retry.
+ *
+ * Kernel ingress can reject a dormant worker immediately when page evidence is already present,
+ * but `callerNow()` is intentionally able to learn the exact request/conversation mate later in
+ * the same MCP call. Re-apply the durable worker-ownership fence after that stronger lookup so a
+ * late-proven old worker cannot become a new prime, send as a prime, or inspect owner state. A
+ * terminal worker's idempotent `finish` retry deliberately keeps using callerNow() directly.
+ */
+async function callerForAgentControl(startedAt: number, options: { exact?: boolean } = {}): Promise<Caller> {
+  const caller = await callerNow(startedAt, options);
+  const notice = dormantWorkerNotice(caller.conversationId);
+  if (notice) throw new AgentError(notice);
   return caller;
 }
 

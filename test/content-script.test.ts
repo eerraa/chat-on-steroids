@@ -3460,6 +3460,57 @@ describe('the app-owned chronological stream', () => {
     expect(prose.textContent).toBe('Here is the answer.');
   });
 
+  it('never replaces a native assistant section that also carries a user-authored message', async () => {
+    const reloadActivity = () => ({
+      ok: true,
+      data: {
+        entries: [],
+        stream: [
+          { seq: 1, time: 100, kind: 'assistant_message', turnId: null, agent: null, messageId: 'site-mobile-reload-answer', text: 'Answer created on mobile', final: true, state: 'final' }
+        ],
+        job: null
+      }
+    });
+    live = await harness(undefined, { activity: reloadActivity });
+    renderingOn();
+
+    // ChatGPT can hydrate a cross-device/reloaded response into one React-owned assistant
+    // section that also carries the user-authored message which caused it. The local stream
+    // deliberately does not render user messages, so replacing this whole section would be
+    // lossy even when the assistant message itself is byte-for-byte reconstructable.
+    const section = assistantTurn(live.document, 'page-mobile-reload', []);
+    const user = live.document.createElement('div');
+    user.setAttribute('data-message-id', 'site-mobile-reload-user');
+    user.setAttribute('data-message-author-role', 'user');
+    const userBody = live.document.createElement('div');
+    userBody.className = 'whitespace-pre-wrap';
+    userBody.textContent = 'Question created on mobile';
+    user.append(userBody);
+    const prose = live.document.createElement('div');
+    prose.className = 'markdown';
+    prose.textContent = 'Answer created on mobile';
+    section.append(user, prose);
+
+    await bindFiberTurns([{ section, turn: {
+      turnId: 'page-mobile-reload',
+      endMessageId: 'site-mobile-reload-answer',
+      messages: [{
+        messageId: 'site-mobile-reload-answer',
+        rawMessageId: 'site-mobile-reload-answer',
+        stable: true,
+        rawText: 'Answer created on mobile',
+        renderedHtml: ''
+      }]
+    } }]);
+    await live.hook.pullActivity();
+    live.hook.renderStreams();
+
+    expect(section.getAttribute('data-clf-turn-replaced')).toBeNull();
+    expect(overwriteStream(section)).toBeNull();
+    expect(userBody.textContent).toBe('Question created on mobile');
+    expect(prose.textContent).toBe('Answer created on mobile');
+  });
+
   it('aligns durable app turns to visible assistant turns after a page reload even when DOM ids differ', async () => {
     const reloadedActivity = () => ({
       ok: true,
@@ -3822,6 +3873,57 @@ describe('the app-owned chronological stream', () => {
     expect(second.getAttribute('data-clf-turn-replaced')).toBe('1');
   });
 
+  it('keeps a split duplicate section native when it contains authored user content', async () => {
+    const splitActivity = () => ({
+      ok: true,
+      data: {
+        entries: [],
+        userAnchors: [{ seq: 1, time: 100, messageId: 'm-user-lossless-split' }],
+        stream: [
+          { seq: 2, time: 110, kind: 'turn_start', turnId: 'g-lossless-split', agent: null },
+          { seq: 3, time: 120, kind: 'assistant_message', turnId: 'g-lossless-split', agent: null, messageId: 'site-lossless-split', text: 'Recorded answer', final: true, state: 'final' },
+          { seq: 4, time: 130, kind: 'turn_end', turnId: 'g-lossless-split', agent: null, outcome: 'completed', detail: '' }
+        ],
+        job: null
+      }
+    });
+    live = await harness(undefined, { activity: splitActivity });
+    renderingOn();
+    userTurn(live.document, 'user-lossless-split', 'original question');
+    const first = assistantTurn(live.document, 'lossless-split-a', []);
+    const second = assistantTurn(live.document, 'lossless-split-b', []);
+    first.removeAttribute('data-turn-id');
+    second.removeAttribute('data-turn-id');
+
+    const hydratedUser = live.document.createElement('div');
+    hydratedUser.setAttribute('data-message-id', 'site-hydrated-user');
+    hydratedUser.setAttribute('data-message-author-role', 'user');
+    const hydratedBody = live.document.createElement('div');
+    hydratedBody.className = 'whitespace-pre-wrap';
+    hydratedBody.textContent = 'user content introduced by reload hydration';
+    hydratedUser.append(hydratedBody);
+    second.append(hydratedUser);
+
+    const message = {
+      messageId: 'site-lossless-split',
+      rawMessageId: 'site-lossless-split',
+      stable: true,
+      rawText: 'Recorded answer',
+      renderedHtml: ''
+    };
+    await bindFiberTurns([
+      { section: first, turn: { turnId: null, messages: [message] } },
+      { section: second, turn: { turnId: null, messages: [message] } }
+    ]);
+    await live.hook.pullActivity();
+    live.hook.renderStreams();
+
+    expect(overwriteStream(first)).not.toBeNull();
+    expect(first.getAttribute('data-clf-turn-replaced')).toBe('1');
+    expect(second.getAttribute('data-clf-turn-replaced')).toBeNull();
+    expect(hydratedBody.textContent).toBe('user content introduced by reload hydration');
+  });
+
   it('does not merge a genuine reissue after the same user message when its request id changed', async () => {
     const reissueActivity = () => ({
       ok: true,
@@ -4069,6 +4171,202 @@ describe('the app-owned chronological stream', () => {
     expect(laterRoot.textContent).toContain('Truly later assistant transcription');
     expect(Boolean(user.compareDocumentPosition(laterRoot) & live.window.Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true);
     expect(section.getAttribute('data-clf-stream-key')).not.toBe(oldKey);
+  });
+
+  it('freezes settled overwrite ownership while another response is generating', async () => {
+    const pageTurnId = 'request-freeze-during-thinking';
+    let phase: 'old' | 'updated' = 'old';
+    const activity = () => ({
+      ok: true,
+      data: {
+        entries: [],
+        stream: [
+          { seq: 1, time: 100, kind: 'turn_start', turnId: 'g-freeze-old', agent: null },
+          {
+            seq: 2,
+            time: 120,
+            kind: 'assistant_message',
+            turnId: 'g-freeze-old',
+            messageId: 'site-freeze-old',
+            text: phase === 'old' ? 'Settled answer before thinking' : 'Settled answer revised while thinking',
+            final: phase === 'updated'
+          },
+          { seq: 3, time: 140, kind: 'turn_end', turnId: 'g-freeze-old', agent: null, outcome: 'completed', detail: '' }
+        ],
+        job: null
+      }
+    });
+    live = await harness(undefined, { activity });
+    renderingOn();
+    const section = assistantTurn(live.document, pageTurnId, []);
+    await bindFiberTurns([{
+      section,
+      turn: {
+        turnId: pageTurnId,
+        messages: [{ messageId: 'site-freeze-old', stable: true, rawText: 'Settled answer before thinking', renderedHtml: '' }]
+      }
+    }]);
+    await live.hook.pullActivity();
+    live.hook.renderStreams();
+
+    const root = overwriteStream(section)!;
+    expect(section.getAttribute('data-clf-turn-replaced')).toBe('1');
+    expect(root.textContent).toContain('Settled answer before thinking');
+    expect(root.getAttribute('data-clf-stream-inactive')).toBeNull();
+
+    // A different ChatGPT response begins. The app feed can advance before the matching Fiber
+    // frame, but that skew must not make unrelated settled history switch native -> synthetic ->
+    // native while the reader is following the live response.
+    startGenerating(live.document);
+    phase = 'updated';
+    await live.hook.pullActivity();
+    expect(section.getAttribute('data-clf-turn-replaced')).toBe('1');
+    expect(root.getAttribute('data-clf-stream-inactive')).toBeNull();
+    expect(root.textContent).toContain('Settled answer before thinking');
+    expect(root.textContent).not.toContain('Settled answer revised while thinking');
+
+    // Once generation ends, normal fail-closed reconciliation resumes. The stale projection is
+    // released immediately, then exact Fiber parity can reclaim the same settled turn once.
+    stopGenerating(live.document);
+    await live.hook.pullActivity();
+    expect(section.getAttribute('data-clf-turn-replaced')).toBeNull();
+    expect(root.getAttribute('data-clf-stream-inactive')).toBe('1');
+
+    await bindFiberTurns([{
+      section,
+      turn: {
+        turnId: pageTurnId,
+        messages: [{ messageId: 'site-freeze-old', stable: true, rawText: 'Settled answer revised while thinking', renderedHtml: '' }]
+      }
+    }]);
+    live.hook.renderStreams();
+    expect(section.getAttribute('data-clf-turn-replaced')).toBe('1');
+    expect(overwriteStream(section)?.textContent).toContain('Settled answer revised while thinking');
+  });
+
+  it('never assigns a page-less OpenAI-session mobile call to the previous PC turn', async () => {
+    const activity = () => ({
+      ok: true,
+      data: {
+        entries: [],
+        userAnchors: [
+          { seq: 1, time: 100, messageId: 'm-pc-user-before-mobile' },
+          { seq: 10, time: 200, messageId: 'm-mobile-user' }
+        ],
+        stream: [
+          { seq: 2, time: 110, kind: 'turn_start', turnId: 'g-pc-before-mobile', agent: null },
+          {
+            seq: 3,
+            time: 120,
+            kind: 'assistant_message',
+            turnId: 'g-pc-before-mobile',
+            agent: null,
+            messageId: 'site-pc-before-mobile',
+            text: 'PC answer before the device switch',
+            final: true,
+            state: 'final'
+          },
+          { seq: 4, time: 130, kind: 'turn_end', turnId: 'g-pc-before-mobile', agent: null, outcome: 'completed', detail: '' },
+          {
+            // Mobile has no browser page in this PC document. `openai_session` proves the
+            // conversation, but it deliberately carries no page-local generation ownership.
+            seq: 20,
+            time: 220,
+            kind: 'tool_call',
+            turnId: null,
+            agent: null,
+            tool: 'read_file',
+            callId: 'mobile-page-less-call',
+            requestId: 'wfr-mobile-page-less',
+            attribution: 'openai_session',
+            outcome: 'ok',
+            durationMs: 2,
+            summary: { kind: 'read', tone: 'neutral', title: 'Read from mobile' }
+          },
+          {
+            seq: 21,
+            origin: 21,
+            time: 230,
+            kind: 'assistant_message',
+            turnId: null,
+            agent: null,
+            messageId: 'site-mobile-final',
+            text: 'Mobile final answer',
+            final: true,
+            state: 'final'
+          }
+        ],
+        job: null
+      }
+    });
+    live = await harness(undefined, { activity });
+    renderingOn();
+
+    userTurn(live.document, 'pc-user-before-mobile', 'PC question before switching devices');
+    const previous = assistantTurn(live.document, 'page-pc-before-mobile', []);
+    const previousNative = live.document.createElement('div');
+    previousNative.className = 'markdown';
+    previousNative.textContent = 'PC answer before the device switch';
+    previous.append(previousNative);
+
+    userTurn(live.document, 'mobile-user', 'Question sent from mobile');
+    const mobile = assistantTurn(live.document, 'page-mobile-final', []);
+    const mobileNative = live.document.createElement('div');
+    mobileNative.className = 'markdown';
+    mobileNative.textContent = 'Mobile final answer';
+    mobile.append(mobileNative);
+
+    await bindFiberTurns([
+      {
+        section: previous,
+        turn: {
+          turnId: 'page-pc-before-mobile',
+          endMessageId: 'site-pc-before-mobile',
+          messages: [{
+            messageId: 'site-pc-before-mobile',
+            rawMessageId: 'site-pc-before-mobile',
+            stable: true,
+            rawText: 'PC answer before the device switch',
+            renderedHtml: ''
+          }]
+        }
+      },
+      {
+        section: mobile,
+        turn: {
+          turnId: 'page-mobile-final',
+          endMessageId: 'site-mobile-final',
+          calls: [{
+            messageId: 'fiber-mobile-page-less',
+            tool: 'read_file',
+            order: 0,
+            answered: true,
+            requestId: 'wfr-mobile-page-less'
+          }],
+          messages: [{
+            messageId: 'site-mobile-final',
+            rawMessageId: 'site-mobile-final',
+            stable: true,
+            rawText: 'Mobile final answer',
+            renderedHtml: ''
+          }]
+        }
+      }
+    ]);
+    await live.hook.pullActivity();
+    live.hook.renderStreams();
+
+    const previousRoot = overwriteStream(previous);
+    expect(previousRoot).toBeTruthy();
+    expect(previousRoot?.textContent).toContain('PC answer before the device switch');
+    expect(previousRoot?.textContent).not.toContain('Read from mobile');
+    expect(previousRoot?.textContent).not.toContain('Mobile final answer');
+
+    // With no PC-page proof for the mobile generation, Overwrite must fail closed to the
+    // native ChatGPT answer rather than spend conversation continuity as turn identity.
+    expect(mobile.getAttribute('data-clf-turn-replaced')).toBeNull();
+    expect(overwriteStream(mobile)).toBeNull();
+    expect(mobileNative.textContent).toBe('Mobile final answer');
   });
 
   it('never reuses an older sibling root for a request-only React-reused turn', async () => {
@@ -10653,7 +10951,7 @@ describe('one live isolated-world recorder per document', () => {
 
     await expect(live.runtimeMessage({ type: 'clf-recorder-ping' })).resolves.toEqual({
       ok: true,
-      recorderVersion: 15
+      recorderVersion: 17
     });
   });
 

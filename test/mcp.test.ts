@@ -16,7 +16,7 @@
 
 import http from 'node:http';
 import { randomBytes } from 'node:crypto';
-import { promises as fs } from 'node:fs';
+import { existsSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -29,6 +29,7 @@ import {
   appendEvent,
   createSession,
   initSessionStore,
+  readEvents,
   upsertMessageEvent,
   writeOverflowText
 } from '../src/main/session/store.js';
@@ -44,6 +45,8 @@ import {
   type CallContext
 } from '../src/main/mcp/call-context.js';
 import { observeRequestCorrelation } from '../src/main/session/correlation.js';
+import { flushRecorder } from '../src/main/session/recorder.js';
+import { resetOpenAiSessionsForTests, retireOpenAiSessionsForConversation } from '../src/main/session/openai-session.js';
 import { execOwner, noteExecOwner, resetExecOwnershipForTests } from '../src/main/codex/ownership.js';
 import { unifiedExecManager } from '../src/main/codex/manager.js';
 import { locateRipgrep } from '../src/main/ripgrep.js';
@@ -160,6 +163,7 @@ const desktop = (method: string, params: unknown = {}): Promise<any> => call('de
 const PROTOCOL_2026 = '2026-07-28';
 const META_VERSION = 'io.modelcontextprotocol/protocolVersion';
 const META_CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities';
+const META_CLIENT_INFO = 'io.modelcontextprotocol/clientInfo';
 
 /**
  * A 2026-07-28 request: the per-request _meta envelope plus the SEP-2243 standard
@@ -191,6 +195,37 @@ async function modern(
     headers['Mcp-Name'] = params['name'];
   }
   const res = await rawPost(endpoint.urls.core, JSON.stringify(body), headers);
+  return { status: res.status, body: decode(res) };
+}
+
+async function openAiModern(
+  surface: SurfaceId,
+  method: string,
+  params: Record<string, unknown>,
+  options: { requestId: string; metaSession: string; httpSession?: string | null; clientName?: string }
+): Promise<any> {
+  const body = {
+    jsonrpc: '2.0',
+    id: nextId++,
+    method,
+    params: {
+      ...params,
+      _meta: {
+        [META_VERSION]: PROTOCOL_2026,
+        [META_CAPABILITIES]: { experimental: {}, extensions: {} },
+        [META_CLIENT_INFO]: { name: options.clientName ?? 'openai-mcp', version: '1.0.0' },
+        'openai/session': options.metaSession
+      }
+    }
+  };
+  const headers: Record<string, string> = {
+    'MCP-Protocol-Version': PROTOCOL_2026,
+    'Mcp-Method': method,
+    'x-request-id': `${options.requestId}/attempt`
+  };
+  if (options.httpSession) headers['x-openai-session'] = options.httpSession;
+  if (method === 'tools/call' && typeof params['name'] === 'string') headers['Mcp-Name'] = params['name'];
+  const res = await rawPost(endpoint.urls[surface], JSON.stringify(body), headers);
   return { status: res.status, body: decode(res) };
 }
 
@@ -274,6 +309,7 @@ afterAll(async () => {
 beforeEach(async () => {
   if (endpoint) await endpoint.stop();
   resetWorkspaces();
+  resetOpenAiSessionsForTests();
   ctx.caps = withCaps({});
   ctx.readOnly = true;
   ctx.roots = [{ name: 'workspace', path: approved }];
@@ -951,6 +987,367 @@ describe('2026-07-28 clients', () => {
       'Mcp-Name': 'apply_patch'
     });
     expect(reply.status).toBe(400);
+  });
+});
+
+describe('ChatGPT openai/session continuity at the MCP boundary', () => {
+  it('learns continuity when exact PC page evidence arrives only in the recorder grace window', async () => {
+    ctx.caps = withCaps({ read: true });
+    const conversationId = 'conversation-openai-session-late-proof';
+    const session = await createSession({ conversationId, title: 'Late OpenAI session proof' });
+    const metaSession = 'meta-session-late-proof';
+    const httpSession = 'http-session-late-proof';
+    const requestId = 'wfr_openai_late_pc_proof';
+
+    // No correlation exists while the fast absolute read runs. Kernel therefore returns before
+    // page attribution is known and the recorder owns the existing late-proof grace window.
+    const pc = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/src/app.ts'] } },
+      { requestId, metaSession, httpSession }
+    );
+    expect(failed(pc), textOf(pc)).toBe(false);
+    expect(textOf(pc)).toContain('export const name = "app";');
+
+    expect(
+      observeRequestCorrelation({
+        requestId,
+        conversationId,
+        sessionId: session.id,
+        messageId: 'message-openai-late-pc-proof',
+        tool: 'read',
+        observedAt: Date.now()
+      })
+    ).toBe('stored');
+    await flushRecorder();
+
+    const mobile = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'read', arguments: { paths: ['lib/util.ts'] } },
+      { requestId: 'wfr_openai_late_mobile', metaSession, httpSession }
+    );
+    expect(failed(mobile), textOf(mobile)).toBe(false);
+    expect(textOf(mobile)).toContain('export const helper = 1;');
+  });
+
+  it('learns from exact PC proof, restores a mobile workspace, and records the real proof source', async () => {
+    ctx.caps = withCaps({ read: true });
+    const conversationId = 'conversation-openai-session-a';
+    const session = await createSession({ conversationId, title: 'OpenAI session A' });
+    const metaSession = 'meta-session-a';
+    const httpSession = 'http-session-a';
+    const pcRequestId = 'wfr_openai_pc_a';
+
+    expect(
+      observeRequestCorrelation({
+        requestId: pcRequestId,
+        conversationId,
+        sessionId: session.id,
+        messageId: 'message-openai-pc-a',
+        tool: 'read',
+        observedAt: Date.now()
+      })
+    ).toBe('stored');
+
+    const pc = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/src/app.ts'] } },
+      { requestId: pcRequestId, metaSession, httpSession }
+    );
+    expect(failed(pc), textOf(pc)).toBe(false);
+    expect(textOf(pc)).toContain('export const name = "app";');
+
+    // No page/Fiber evidence for this request: the learned vendor session must recover A and
+    // therefore A's workspace learned by the absolute PC read above.
+    const mobileRequestId = 'wfr_openai_mobile_a';
+    const mobile = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'read', arguments: { paths: ['lib/util.ts'] } },
+      { requestId: mobileRequestId, metaSession, httpSession }
+    );
+    expect(failed(mobile), textOf(mobile)).toBe(false);
+    expect(textOf(mobile)).toContain('export const helper = 1;');
+
+    const calls = (await readEvents(session.id)).filter(
+      (event) => event.kind === 'tool_call' && [pcRequestId, mobileRequestId].includes(event.call.requestId ?? '')
+    );
+    expect(calls).toHaveLength(2);
+    const pcCall = calls.find((event) => event.kind === 'tool_call' && event.call.requestId === pcRequestId);
+    const mobileCall = calls.find((event) => event.kind === 'tool_call' && event.call.requestId === mobileRequestId);
+    expect(pcCall?.kind === 'tool_call' ? pcCall.call.attributionMethod : null).toBe('request_id');
+    expect(mobileCall?.kind === 'tool_call' ? mobileCall.call.attributionMethod : null).toBe('openai_session');
+
+    const unknown = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'read', arguments: { paths: ['lib/util.ts'] } },
+      { requestId: 'wfr_openai_unknown_y', metaSession: 'meta-session-y', httpSession: 'http-session-y' }
+    );
+    expect(failed(unknown)).toBe(true);
+    expect(textOf(unknown)).not.toContain('export const helper = 1;');
+  });
+
+  it('makes a session proven for a different conversation ambiguous before the handler can run', async () => {
+    ctx.caps = withCaps({ read: true });
+    const metaSession = 'meta-session-conflict';
+    const httpSession = 'http-session-conflict';
+
+    const sessionA = await createSession({ conversationId: 'conversation-session-conflict-a', title: 'A' });
+    expect(
+      observeRequestCorrelation({
+        requestId: 'wfr_session_conflict_a',
+        conversationId: 'conversation-session-conflict-a',
+        sessionId: sessionA.id,
+        messageId: 'message-session-conflict-a',
+        tool: 'read',
+        observedAt: Date.now()
+      })
+    ).toBe('stored');
+    const learned = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/src/app.ts'] } },
+      { requestId: 'wfr_session_conflict_a', metaSession, httpSession }
+    );
+    expect(failed(learned)).toBe(false);
+
+    const sessionB = await createSession({ conversationId: 'conversation-session-conflict-b', title: 'B' });
+    expect(
+      observeRequestCorrelation({
+        requestId: 'wfr_session_conflict_b',
+        conversationId: 'conversation-session-conflict-b',
+        sessionId: sessionB.id,
+        messageId: 'message-session-conflict-b',
+        tool: 'read',
+        observedAt: Date.now()
+      })
+    ).toBe('stored');
+    const conflict = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/src/app.ts'] } },
+      { requestId: 'wfr_session_conflict_b', metaSession, httpSession }
+    );
+    expect(failed(conflict)).toBe(true);
+    expect(textOf(conflict)).toContain('CALLER_IDENTITY_CONFLICT');
+    expect(textOf(conflict)).not.toContain('export const name');
+
+    const retry = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/src/app.ts'] } },
+      { requestId: 'wfr_session_conflict_retry', metaSession, httpSession }
+    );
+    expect(failed(retry)).toBe(true);
+    expect(textOf(retry)).toContain('CALLER_IDENTITY_CONFLICT');
+  });
+
+  it('lets late exact request proof own the record and withholds a result already run under contradictory continuity', async () => {
+    ctx.caps = withCaps({ read: true, command: true });
+    ctx.readOnly = false;
+    const metaSession = 'meta-session-late-conflict';
+    const httpSession = 'http-session-late-conflict';
+    const conversationA = 'conversation-session-late-conflict-a';
+    const conversationB = 'conversation-session-late-conflict-b';
+    const sessionA = await createSession({ conversationId: conversationA, title: 'Late conflict A' });
+    const sessionB = await createSession({ conversationId: conversationB, title: 'Late conflict B' });
+    const learnedRequestId = 'wfr_session_late_conflict_learn';
+    expect(
+      observeRequestCorrelation({
+        requestId: learnedRequestId,
+        conversationId: conversationA,
+        sessionId: sessionA.id,
+        messageId: 'message-session-late-conflict-learn',
+        tool: 'read',
+        observedAt: Date.now()
+      })
+    ).toBe('stored');
+    expect(
+      failed(
+        await openAiModern(
+          'core',
+          'tools/call',
+          { name: 'read', arguments: { paths: ['/workspace/src/app.ts'] } },
+          { requestId: learnedRequestId, metaSession, httpSession }
+        )
+      )
+    ).toBe(false);
+
+    const requestId = 'wfr_session_late_conflict_b';
+    const startedPath = path.join(approved, 'late-session-conflict-started.txt');
+    await fs.rm(startedPath, { force: true });
+    const command = IS_WINDOWS
+      ? "Set-Content -LiteralPath 'late-session-conflict-started.txt' -Value started; Start-Sleep -Milliseconds 500; Write-Output 'late-result'"
+      : "printf 'started\\n' > late-session-conflict-started.txt; sleep 0.5; printf 'late-result\\n'";
+
+    try {
+      const running = openAiModern(
+        'core',
+        'tools/call',
+        {
+          name: 'exec_command',
+          arguments: { cmd: command, workdir: '/workspace', yield_time_ms: 1_000 }
+        },
+        { requestId, metaSession, httpSession }
+      );
+      // The marker proves local work really started under the previously learned A mapping. Only
+      // then publish B's exact page evidence, reproducing the ordering the post-handler precedence
+      // check must handle rather than the cheaper pre-handler conflict case above.
+      await vi.waitFor(() => expect(existsSync(startedPath)).toBe(true), { timeout: 5_000, interval: 10 });
+      expect(
+        observeRequestCorrelation({
+          requestId,
+          conversationId: conversationB,
+          sessionId: sessionB.id,
+          messageId: 'message-session-late-conflict-b',
+          tool: 'exec_command',
+          observedAt: Date.now()
+        })
+      ).toBe('stored');
+
+      const conflict = await running;
+      expect(failed(conflict)).toBe(true);
+      expect(textOf(conflict)).toContain('CALLER_IDENTITY_CONFLICT');
+      expect(textOf(conflict)).toContain('Local work may already have run');
+      expect(textOf(conflict)).not.toContain('late-result');
+      await flushRecorder();
+
+      const callsA = (await readEvents(sessionA.id)).filter(
+        (event) => event.kind === 'tool_call' && event.call.requestId === requestId
+      );
+      const callsB = (await readEvents(sessionB.id)).filter(
+        (event) => event.kind === 'tool_call' && event.call.requestId === requestId
+      );
+      expect(callsA).toHaveLength(0);
+      expect(callsB).toHaveLength(1);
+      expect(callsB[0]?.kind === 'tool_call' ? callsB[0].call.attributionMethod : null).toBe('request_id');
+
+      const retry = await openAiModern(
+        'core',
+        'tools/call',
+        { name: 'read', arguments: { paths: ['/workspace/src/app.ts'] } },
+        { requestId: 'wfr_session_late_conflict_retry', metaSession, httpSession }
+      );
+      expect(failed(retry)).toBe(true);
+      expect(textOf(retry)).toContain('CALLER_IDENTITY_CONFLICT');
+      expect(textOf(retry)).not.toContain('export const name');
+    } finally {
+      await fs.rm(startedPath, { force: true });
+      await unifiedExecManager.terminateAllProcesses();
+      resetExecOwnershipForTests();
+    }
+  });
+
+  it('does not accept the vendor session from another MCP client or without the HTTP counterpart', async () => {
+    ctx.caps = withCaps({ read: true });
+    const conversationId = 'conversation-openai-client-fence';
+    const session = await createSession({ conversationId, title: 'Client fence' });
+    const requestId = 'wfr_openai_client_fence_pc';
+    const metaSession = 'meta-openai-client-fence';
+    const httpSession = 'http-openai-client-fence';
+    expect(
+      observeRequestCorrelation({
+        requestId,
+        conversationId,
+        sessionId: session.id,
+        messageId: 'message-openai-client-fence',
+        tool: 'read',
+        observedAt: Date.now()
+      })
+    ).toBe('stored');
+    const learned = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/src/app.ts'] } },
+      { requestId, metaSession, httpSession }
+    );
+    expect(failed(learned)).toBe(false);
+
+    const forgedClient = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'read', arguments: { paths: ['lib/util.ts'] } },
+      {
+        requestId: 'wfr_openai_other_client',
+        metaSession,
+        httpSession,
+        clientName: 'not-openai-mcp'
+      }
+    );
+    expect(failed(forgedClient)).toBe(true);
+    expect(textOf(forgedClient)).not.toContain('export const helper = 1;');
+
+    const missingHttp = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'read', arguments: { paths: ['lib/util.ts'] } },
+      { requestId: 'wfr_openai_missing_http', metaSession, httpSession: null }
+    );
+    expect(failed(missingHttp)).toBe(true);
+    expect(textOf(missingHttp)).not.toContain('export const helper = 1;');
+  });
+
+  it('keeps an exact browser request-id proof stronger than retired session continuity', async () => {
+    ctx.caps = withCaps({ read: true });
+    const conversationId = 'conversation-openai-retired-page';
+    const session = await createSession({ conversationId, title: 'Retired page proof' });
+    const metaSession = 'meta-openai-retired-page';
+    const httpSession = 'http-openai-retired-page';
+    const firstRequestId = 'wfr_openai_retired_page_first';
+    expect(
+      observeRequestCorrelation({
+        requestId: firstRequestId,
+        conversationId,
+        sessionId: session.id,
+        messageId: 'message-openai-retired-page-first',
+        tool: 'read',
+        observedAt: Date.now()
+      })
+    ).toBe('stored');
+    expect(
+      failed(
+        await openAiModern(
+          'core',
+          'tools/call',
+          { name: 'read', arguments: { paths: ['/workspace/src/app.ts'] } },
+          { requestId: firstRequestId, metaSession, httpSession }
+        )
+      )
+    ).toBe(false);
+    expect(retireOpenAiSessionsForConversation(conversationId)).toBe(1);
+
+    const mobile = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/src/app.ts'] } },
+      { requestId: 'wfr_openai_retired_page_mobile', metaSession, httpSession }
+    );
+    expect(failed(mobile)).toBe(true);
+    expect(textOf(mobile)).toContain('CALLER_IDENTITY_RETIRED');
+
+    const exactRequestId = 'wfr_openai_retired_page_exact';
+    expect(
+      observeRequestCorrelation({
+        requestId: exactRequestId,
+        conversationId,
+        sessionId: session.id,
+        messageId: 'message-openai-retired-page-exact',
+        tool: 'read',
+        observedAt: Date.now()
+      })
+    ).toBe('stored');
+    const exact = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/src/app.ts'] } },
+      { requestId: exactRequestId, metaSession, httpSession }
+    );
+    expect(failed(exact), textOf(exact)).toBe(false);
+    expect(textOf(exact)).toContain('export const name = "app";');
   });
 });
 
@@ -2797,7 +3194,6 @@ describe('exec_command and write_stdin', () => {
       required: ['wall_time_seconds', 'output'],
       additionalProperties: false
     });
-
     expect(Object.keys(stdin.inputSchema.properties)).toEqual([
       'session_id',
       'chars',
@@ -3089,6 +3485,126 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(owner.body.result?.isError).not.toBe(true);
     expect(textOf(owner)).toContain('echo=bye');
     expect(textOf(owner)).toContain('Process exited with code 0');
+  });
+
+  it('keeps a PC-owned exec session under the same conversation when that OpenAI session continues on mobile', async () => {
+    const conversationId = 'conv-openai-session-exec-owner';
+    const metaSession = 'meta-openai-session-exec-owner';
+    const httpSession = 'http-openai-session-exec-owner';
+    const pcRequestId = 'wfr_openai_exec_owner_pc';
+    expect(prove(pcRequestId, conversationId)).toBe('stored');
+
+    await fs.writeFile(
+      path.join(approved, 'mobile-owned-stdin.cjs'),
+      "const readline=require('node:readline'); const rl=readline.createInterface({input:process.stdin,crlfDelay:Infinity}); rl.on('line',(line)=>{ console.log('mobile='+line); if(line==='bye') rl.close(); });\n",
+      'utf8'
+    );
+
+    const started = await openAiModern(
+      'core',
+      'tools/call',
+      {
+        name: 'exec_command',
+        arguments: { cmd: 'node mobile-owned-stdin.cjs', workdir: '/workspace', tty: true, yield_time_ms: 25 }
+      },
+      { requestId: pcRequestId, metaSession, httpSession }
+    );
+    expect(started.body.result?.isError).not.toBe(true);
+    const sessionId = Number(textOf(started).match(/Process running with session ID (\d+)/)?.[1]);
+    expect(Number.isInteger(sessionId)).toBe(true);
+
+    const mobile = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'write_stdin', arguments: { session_id: sessionId, chars: 'same-chat\r', yield_time_ms: 1_000 } },
+      { requestId: 'wfr_openai_exec_owner_mobile', metaSession, httpSession }
+    );
+    expect(mobile.body.result?.isError, textOf(mobile)).not.toBe(true);
+    expect(textOf(mobile)).toContain('mobile=same-chat');
+
+    const otherMobile = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'write_stdin', arguments: { session_id: sessionId, chars: 'wrong-chat\r', yield_time_ms: 250 } },
+      {
+        requestId: 'wfr_openai_exec_owner_other_mobile',
+        metaSession: 'meta-openai-session-other-chat',
+        httpSession: 'http-openai-session-other-chat'
+      }
+    );
+    expect(otherMobile.body.result?.isError).toBe(true);
+    expect(textOf(otherMobile)).toContain('is not proven to belong to this ChatGPT conversation');
+    expect(textOf(otherMobile)).not.toContain('mobile=wrong-chat');
+
+    const closed = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'write_stdin', arguments: { session_id: sessionId, chars: 'bye\r', yield_time_ms: 5_000 } },
+      { requestId: 'wfr_openai_exec_owner_close', metaSession, httpSession }
+    );
+    expect(closed.body.result?.isError, textOf(closed)).not.toBe(true);
+    expect(textOf(closed)).toContain('mobile=bye');
+    expect(textOf(closed)).toContain('Process exited with code 0');
+  });
+
+  it('late PC page proof promotes both OpenAI continuity and the running exec owner before mobile stdin', async () => {
+    const conversationId = 'conv-openai-session-exec-late-owner';
+    const localSession = await createSession({ conversationId, title: 'Late exec owner' });
+    const metaSession = 'meta-openai-session-exec-late-owner';
+    const httpSession = 'http-openai-session-exec-late-owner';
+    const pcRequestId = 'wfr_openai_exec_late_owner_pc';
+
+    await fs.writeFile(
+      path.join(approved, 'mobile-late-owned-stdin.cjs'),
+      "const readline=require('node:readline'); const rl=readline.createInterface({input:process.stdin,crlfDelay:Infinity}); rl.on('line',(line)=>{ console.log('late='+line); if(line==='bye') rl.close(); });\n",
+      'utf8'
+    );
+
+    // The command is allowed to start from its explicit approved workdir before the browser
+    // reports the request-id mate. It returns a live process while still unattributed.
+    const started = await openAiModern(
+      'core',
+      'tools/call',
+      {
+        name: 'exec_command',
+        arguments: { cmd: 'node mobile-late-owned-stdin.cjs', workdir: '/workspace', tty: true, yield_time_ms: 25 }
+      },
+      { requestId: pcRequestId, metaSession, httpSession }
+    );
+    expect(started.body.result?.isError, textOf(started)).not.toBe(true);
+    const sessionId = Number(textOf(started).match(/Process running with session ID (\d+)/)?.[1]);
+    expect(Number.isInteger(sessionId)).toBe(true);
+
+    expect(
+      observeRequestCorrelation({
+        requestId: pcRequestId,
+        conversationId,
+        sessionId: localSession.id,
+        messageId: 'message-openai-exec-late-owner',
+        tool: 'exec_command',
+        observedAt: Date.now()
+      })
+    ).toBe('stored');
+    await flushRecorder();
+    expect(execOwner(sessionId)).toBe(conversationId);
+
+    const mobile = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'write_stdin', arguments: { session_id: sessionId, chars: 'same-chat\r', yield_time_ms: 1_000 } },
+      { requestId: 'wfr_openai_exec_late_owner_mobile', metaSession, httpSession }
+    );
+    expect(mobile.body.result?.isError, textOf(mobile)).not.toBe(true);
+    expect(textOf(mobile)).toContain('late=same-chat');
+
+    const closed = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'write_stdin', arguments: { session_id: sessionId, chars: 'bye\r', yield_time_ms: 5_000 } },
+      { requestId: 'wfr_openai_exec_late_owner_close', metaSession, httpSession }
+    );
+    expect(closed.body.result?.isError, textOf(closed)).not.toBe(true);
+    expect(textOf(closed)).toContain('late=bye');
   });
 
   it('kills the exact conversation-owned managed process when ChatGPT Stop is relayed', async () => {

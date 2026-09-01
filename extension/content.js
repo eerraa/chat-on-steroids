@@ -30,7 +30,7 @@
   // React/Fiber readers in that half-invalidated document has repeatedly stalled long WebCodex
   // tabs. A stale document therefore degrades to "CoS unavailable until reload/new document".
   // The old recorder self-quiesces as soon as it notices its extension context is gone.
-  const RECORDER_VERSION = 15;
+  const RECORDER_VERSION = 17;
   const recorderHandle = {
     version: RECORDER_VERSION,
     healthy: () => false,
@@ -4149,14 +4149,25 @@
       // transcript.
       const owner = entry.turnId ? byTurn.get(entry.turnId) : null;
       if (owner) owner.entries.push(entry);
-      else if (entry.kind === 'tool_call' && entry.requestId) timedRequestTools.push(entry);
+      else if (
+        entry.kind === 'tool_call' &&
+        entry.requestId &&
+        // OpenAI-session continuity proves which *conversation* made a page-less mobile call,
+        // not which generation in this PC document made it. Spending that proof as local-turn
+        // ownership attaches mobile work to whichever PC turn happened to start most recently;
+        // Overwrite can then reuse that older turn's sibling root and hide the real mobile
+        // answer at its correct native position. Keep page-less continuity calls orphaned here.
+        entry.attribution !== 'openai_session'
+      ) timedRequestTools.push(entry);
     }
 
-    // Request-id proves which conversation owns a tool call. ChatGPT's own creation/start
-    // timestamps then decide where that already-owned event sits in the conversation's
-    // chronology when a local turn id was lost to reload/lifecycle churn. This is ordering,
-    // not identity: calls with no exact request id stay ungrouped, and there is no seq/DOM/
-    // "nearest turn" fallback. A call before the first known turn likewise stays ungrouped.
+    // Exact page-correlated request evidence proves which conversation owns a tool call.
+    // ChatGPT's own creation/start timestamps then decide where that already-owned event sits
+    // in the conversation's chronology when a local turn id was lost to reload/lifecycle churn.
+    // This is ordering, not identity: calls with no exact request id stay ungrouped, and there
+    // is no seq/DOM/"nearest turn" fallback. Proven OpenAI-session continuity deliberately
+    // stays ungrouped too because it identifies the conversation across devices, not a turn in
+    // this browser document. A call before the first known turn likewise stays ungrouped.
     for (const entry of timedRequestTools) {
       const at = Number(entry.time);
       if (!Number.isFinite(at)) continue;
@@ -4559,6 +4570,15 @@
   function completeReplacementForTurn(turn, entries) {
     const descriptor = fiberTurnFor(turn);
     if (!descriptor) return false;
+    // Whole-turn replacement is allowed only when the synthetic stream can account for every
+    // user-visible authored object inside the native section it is about to hide. The app feed
+    // intentionally does not render user_message rows. ChatGPT can hydrate a cross-device turn
+    // after reload with the originating user message physically inside an assistant-labelled
+    // React section; hiding that section would therefore delete content the replacement cannot
+    // reproduce. This is a losslessness fence, not a mobile/reload heuristic: any native
+    // user-authored message makes the whole section native-authoritative.
+    const nativeMessages = CLF_DOM.messagesIn(turn);
+    if (nativeMessages.some((message) => message && message.role === 'user')) return false;
     // A Fiber descriptor is a snapshot, not automatically the current page revision. Native
     // activity and prose can mutate under the same stable website ids after that scan. Every
     // concrete section must still be exactly at the native revision that the accepted Fiber
@@ -4615,7 +4635,7 @@
     // its latest authored text to equal the latest canonical Fiber revision too. This extends
     // native authority across finishGeneration()'s async final reconciliation without making
     // Fiber latency part of answer visibility.
-    const nativeAssistantMessages = CLF_DOM.messagesIn(turn).filter(
+    const nativeAssistantMessages = nativeMessages.filter(
       (message) => message && message.role === 'assistant' && message.text
     );
     if (nativeAssistantMessages.length > 0) {
@@ -4930,6 +4950,20 @@
     const liveGenerationNodes = liveGenerationTurn
       ? liveGenerationTurn.nodes || (liveGenerationTurn.node ? [liveGenerationTurn.node] : [])
       : [];
+    // Do not reconcile settled history while ChatGPT is authoring any response. The recorder
+    // feed and MAIN-world Fiber scan are intentionally independent and can lead one another by a
+    // frame. Re-running whole-turn ownership on every such edge makes an unrelated historical
+    // response alternate synthetic -> native -> synthetic, changing transcript height while the
+    // reader is following the live answer. Native safety does not depend on this reconciliation:
+    // watchTranscript() releases a concrete turn immediately when ChatGPT actually mutates it,
+    // and the exact local live generation is released below as well. Freeze the already-settled
+    // presentation until generation ends, then one ordinary pass catches everything up.
+    const pageGenerating = generating || Boolean(CLF_DOM.generating());
+    if (enabled && pageGenerating) {
+      if (liveGenerationTurn) releaseTurnPresentationToNative(liveGenerationTurn);
+      if (!batched) restorePresentationViewport(viewportAnchor);
+      return;
+    }
     // Which reconstructions have already been painted in this pass. See the dedupe below.
     const painted = new Set();
     const seenStreamKeys = new Set();
@@ -4998,6 +5032,7 @@
             (entry) => localId !== null && entry.turnId === localId
           );
       const rendered = visibleStream(raw, group ? group.id : localId || turn.id);
+      const replacementComplete = rendered.length > 0 && completeReplacementForTurn(turn, rendered);
       // The reconstruction this section is about to show, named by what it reconstructs
       // rather than by the section showing it. Deliberately not `turn.id`: a section with no
       // id of its own still reconstructs a specific response, and that is the thing that
@@ -5072,6 +5107,20 @@
       // back to native, which would put ChatGPT's copy of prose the stream above already
       // carries right back on the page.
       if (streamKey && painted.has(streamKey)) {
+        // A duplicate native section may share the previous section's synthetic root, but that
+        // does not grant permission to hide native content the stream cannot reproduce. In
+        // particular, reload hydration can reuse/split a response section around a user-authored
+        // message. Leave this section native without deactivating the already-correct sibling
+        // root owned by the earlier section.
+        if (!replacementComplete) {
+          for (const node of nodes) {
+            if (node && node.dataset) delete node.dataset.clfStreamKey;
+          }
+          CLF_DOM.replaceTurn(turn, null, false);
+          CLF_DOM.hideProgress(turn, false);
+          for (const block of CLF_DOM.toolBlocks(turn)) block.removeAttribute('data-clf-native-hidden');
+          continue;
+        }
         for (const node of nodes) if (node && node.dataset) node.dataset.clfStreamKey = streamKey;
         CLF_DOM.hideProgress(turn, false);
         for (const block of CLF_DOM.toolBlocks(turn)) block.removeAttribute('data-clf-native-hidden');
@@ -5079,7 +5128,7 @@
         continue;
       }
 
-      if (rendered.length === 0 || !completeReplacementForTurn(turn, rendered)) {
+      if (!replacementComplete) {
         // Completeness is an ownership fence, not a debounce. Once Fiber says the current page
         // model and the recorder projection differ, keeping an older synthetic root mounted for
         // a timer hides the only fresh answer. Fall back to native immediately. The old sibling

@@ -68,6 +68,7 @@ import { writeDurableNow, writeDurableSoon } from '../durable.js';
 import { prepareHandoff, resumeBootstrapMatches } from './handoff.js';
 import { ensureHandoffRecorded, recordHandoff, rebindConversation } from './recorder.js';
 import { endResumeClaim, noteResumeClaim, resetResumeGate } from './resume-gate.js';
+import { retireOpenAiSessionsForConversation } from './openai-session.js';
 import {
   ensureCommittedResumeHandoff,
   findSessionByConversation,
@@ -705,6 +706,11 @@ function publishCommittedProjection(
   swarm: 'absent' | 'frozen' | 'recovery'
 ): void {
   rebindConversation(entry.sessionId, entry.from, toConversationId);
+  // Chat A is no longer a frontend for this local session. Never rebind its learned OpenAI
+  // session key to B: live testing only proved that the key names one ChatGPT conversation.
+  // Retire A for the rest of this app process; B becomes mobile-capable only after B's own
+  // exact browser request-id proof learns B's separate session key.
+  retireOpenAiSessionsForConversation(entry.from);
   moveChatWorkspace(entry.from, toConversationId);
   moveGoalObjective(entry.from, toConversationId);
   if (swarm === 'frozen') {

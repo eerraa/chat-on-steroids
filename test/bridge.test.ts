@@ -2719,6 +2719,18 @@ describe('delivering a bootstrap', () => {
       }
     });
     expect(recorded.status).toBe(200);
+    expect(recorded.body).toMatchObject({ closeWorkerTab: true });
+    const cleanup = await request('GET', `/worker-tab-cleanup?conversationId=${encodeURIComponent(conversationId)}`);
+    expect(cleanup.status).toBe(200);
+    expect(cleanup.body).toMatchObject({ eligible: true });
+    expect(cleanup.body.claim).toMatch(/^[0-9a-f-]{36}$/i);
+    const duplicateCleanup = await request('GET', `/worker-tab-cleanup?conversationId=${encodeURIComponent(conversationId)}`);
+    expect(duplicateCleanup.body).toMatchObject({ eligible: false });
+    const release = await request(
+      'GET',
+      `/worker-tab-cleanup/release?conversationId=${encodeURIComponent(conversationId)}&claim=${encodeURIComponent(cleanup.body.claim)}`
+    );
+    expect(release.body).toMatchObject({ released: true });
     // The browser final is the last slot-consuming edge. The active global incarnation should
     // disappear immediately, while the owning prime still sees the exact sleeping worker in
     // its dormant history.
@@ -2727,6 +2739,7 @@ describe('delivering a bootstrap', () => {
     expect(worker.state).toBe('sleeping');
     expect(worker.revivable).toBe(true);
     expect(worker.result).toContain('Final audit: request IDs are the authority');
+
   });
 
   it('keeps page observations attributed to the exact dormant worker while another prime is active', async () => {
@@ -2813,6 +2826,7 @@ describe('delivering a bootstrap', () => {
       }
     });
     expect(ended.status).toBe(200);
+    expect(ended.body).not.toHaveProperty('closeWorkerTab');
     expect(swarmState().agents.find((agent) => agent.id === 'worker-1')?.state).toBe('active');
 
     // finishGeneration() can enqueue turn_end immediately while its final Fiber refresh is
@@ -2834,6 +2848,7 @@ describe('delivering a bootstrap', () => {
       }
     });
     expect(final.status).toBe(200);
+    expect(final.body).toMatchObject({ closeWorkerTab: true });
     expect(swarmState().running).toBe(false);
     const worker = swarmStateForCaller({ conversationId: PRIME_CHAT }).agents.find((agent) => agent.id === 'worker-1')!;
     expect(worker.state).toBe('sleeping');
@@ -2881,6 +2896,7 @@ describe('delivering a bootstrap', () => {
       }
     });
     expect(failed.status).toBe(200);
+    expect(failed.body).toMatchObject({ closeWorkerTab: true });
 
     const worker = swarmStateForCaller({ conversationId: PRIME_CHAT }).agents.find((agent) => agent.id === 'worker-1')!;
     expect(worker).toMatchObject({ state: 'sleeping', result: null, revivable: true });

@@ -87,6 +87,7 @@ import type { AgentInfo, AgentMessage, AgentState, SwarmState } from '../shared/
 import { getConfig } from './config.js';
 import { logInfo, logWarn } from './logger.js';
 import { inheritWorkspace, releasePrimeWorkspace } from './workspace.js';
+import { retireOpenAiSessionsForConversation } from './session/openai-session.js';
 
 export const PRIME_ID = 'prime';
 
@@ -352,6 +353,16 @@ let retiredPersist: (() => void) | null = null;
 let retiredPersistNow: ((snapshot: RetiredWorkersSnapshot) => Promise<void>) | null = null;
 const RETIRED_WORKER_TTL_MS = 30 * 60_000;
 const retiredWorkers = new Map<string, RetiredChat>();
+/**
+ * Brief browser-housekeeping lock around closing one sleeping worker tab.
+ *
+ * Without this, `/worker-tab-cleanup` could answer eligible and the prime could transition the
+ * worker to `waking` before Chrome actually removed the tab. The bridge holds this claim only
+ * across query/remove and releases it immediately; the TTL is the crash/service-worker-loss
+ * escape hatch so housekeeping can never strand a worker.
+ */
+export const WORKER_TAB_CLEANUP_CLAIM_MS = 5_000;
+const workerTabCleanupClaims = new Map<string, { token: string; expiresAt: number }>();
 /** Worker objects created by a spawn whose public durable acceptance has not succeeded yet. */
 const unpublishedAgents = new WeakSet<Agent>();
 /** A brand-new run is itself unpublished until its staged spawn crosses the acceptance barrier. */
@@ -954,7 +965,10 @@ function endRun(reason: string): void {
       reason,
       retiredAt: Date.now()
     }));
-  for (const worker of retired) retiredWorkers.set(worker.conversationId, worker);
+  for (const worker of retired) {
+    retiredWorkers.set(worker.conversationId, worker);
+    retireOpenAiSessionsForConversation(worker.conversationId);
+  }
   retiredPersist?.();
   const what = `${run.runId} (${[...run.agents.keys()].join(', ')})`;
   run = null;
@@ -1146,7 +1160,7 @@ export function requestWorkerBootstraps(ids: readonly string[]): number {
  *
  *   1. the request itself is valid (all of it, not the prefix that happened to parse);
  *   2. this app has *proven* which conversation is calling;
- *   3. that conversation is not a worker of the active run;
+ *   3. that conversation is not a worker of the active run or any retained dormant history;
  *   4. no other conversation holds the one swarm;
  *   5. only then is the prime bound and the workers created.
  *
@@ -1191,6 +1205,18 @@ export function spawn(input: SpawnInput, options: SpawnOptions = {}): SpawnResul
         'connected and this conversation has to be showing its connector activity; wait a moment and call ' +
         'agents action=spawn again.'
     );
+  }
+
+  // A parked worker chat is still a worker identity even though its owner releases the one
+  // global execution slot. This check belongs in the broker rather than only in MCP ingress:
+  // request-id evidence can arrive after the dispatcher's cheap pre-handler lookup, and spawn's
+  // own callerNow() deliberately waits longer for that exact proof. Without re-checking durable
+  // ownership here, a late-proven sleeping/terminal worker could create a brand-new run and make
+  // itself prime. Exact dormant primes are handled separately below and remain entitled to resume
+  // their own history.
+  const dormantCaller = dormantAgentForConversation(conversationId)?.agent ?? null;
+  if (dormantCaller?.info.role === 'worker') {
+    throw new AgentError(dormantWorkerNotice(conversationId) ?? `${dormantCaller.info.id} is a dormant worker and cannot become a prime agent.`);
   }
 
   if (run) {
@@ -1557,6 +1583,12 @@ function stageMessagesActive(
       if (!to.info.conversationId) {
         throw new AgentError(
           `${toId} is asleep but this app never learned which chat it is in, so it cannot be woken${where}.`
+        );
+      }
+      if (workerTabCleanupClaimed(to.info.conversationId)) {
+        throw new AgentError(
+          `WORKER_TAB_CLEANUP_IN_PROGRESS: ${toId}'s inactive sleeping tab is being closed right now${where}. ` +
+            'Nothing was sent. Retry this message in a moment; the same worker conversation remains revivable.'
         );
       }
       // Waking is the one send that needs capacity, because the recipient is not running. The
@@ -2526,6 +2558,7 @@ export function stageQueuedWorkerRevivals(ids: readonly string[]): {
       agent.info.state !== 'sleeping' ||
       !agent.info.revivable ||
       !agent.info.conversationId ||
+      workerTabCleanupClaimed(agent.info.conversationId) ||
       ceilingCrossed(agent.info)
     ) {
       continue;
@@ -2914,8 +2947,9 @@ export interface AliveResult {
  * First-hand liveness, and the revival it can justify.
  *
  * Fed by the two things that prove a conversation still exists, and by nothing else: an MCP
- * call this app *proved* came from it (the request-id join), and its own page reporting to
- * the bridge. Both mean the same thing here, which is why there is one clock rather than a
+ * call this app *proved* came from it (exact request-id proof, or a ChatGPT session mapping that
+ * exact proof learned earlier), and its own page reporting to the bridge. Both mean the same
+ * thing here, which is why there is one clock rather than a
  * browser one and a connector one that disagree — a worker whose tab is open is never on the
  * silence clock at all, because its page keeps stamping this.
  *
@@ -3245,20 +3279,6 @@ export function dormantWorkerNotice(conversationId: string | null | undefined): 
   );
 }
 
-/** Any dormant worker conversation remains an identity fence, reusable or terminal. */
-export function hasDormantWorkerLeases(): boolean {
-  for (const dormant of dormantRuns.values()) {
-    if (
-      [...dormant.agents.values()].some(
-        (agent) => agent.info.role === 'worker' && Boolean(agent.info.conversationId)
-      )
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
 /**
  * Recovery-only repair for the one crash ordering normal transfer cannot represent.
  *
@@ -3380,6 +3400,43 @@ export function agentInfoForOwnedConversation(conversationId: string): AgentInfo
   return dormant ? { ...dormant.info } : null;
 }
 
+function liveWorkerTabCleanupClaim(conversationId: string, now = Date.now()): { token: string; expiresAt: number } | null {
+  const claim = workerTabCleanupClaims.get(conversationId);
+  if (!claim) return null;
+  if (claim.expiresAt > now) return claim;
+  workerTabCleanupClaims.delete(conversationId);
+  return null;
+}
+
+/** True only during the tiny browser query/remove window for this exact sleeping worker. */
+export function workerTabCleanupClaimed(conversationId: string | null | undefined, now = Date.now()): boolean {
+  return Boolean(conversationId && liveWorkerTabCleanupClaim(conversationId, now));
+}
+
+/**
+ * Claims exclusive housekeeping ownership of one exact sleeping/revivable worker tab.
+ *
+ * This is not conversation authority and never persists. Its sole purpose is to serialize a
+ * browser close against the two paths that can wake a worker (`agents message` and its own proven
+ * tool call). If either path won first the worker is no longer sleeping and this returns null.
+ */
+export function claimWorkerTabCleanup(conversationId: string, now = Date.now()): string | null {
+  if (!conversationId || liveWorkerTabCleanupClaim(conversationId, now)) return null;
+  const worker = agentInfoForOwnedConversation(conversationId);
+  if (!worker || worker.role !== 'worker' || worker.state !== 'sleeping' || worker.revivable !== true) return null;
+  const token = randomUUID();
+  workerTabCleanupClaims.set(conversationId, { token, expiresAt: now + WORKER_TAB_CLEANUP_CLAIM_MS });
+  return token;
+}
+
+/** Releases only the exact claim the extension was handed; stale releases cannot unlock a newer close. */
+export function releaseWorkerTabCleanup(conversationId: string, token: string): boolean {
+  const claim = liveWorkerTabCleanupClaim(conversationId);
+  if (!claim || !token || claim.token !== token) return false;
+  workerTabCleanupClaims.delete(conversationId);
+  return true;
+}
+
 /**
  * Binds a worker to the ChatGPT conversation it is running in, and starts it.
  *
@@ -3487,6 +3544,7 @@ export function resetSwarm(): void {
         reason,
         retiredAt
       });
+      retireOpenAiSessionsForConversation(agent.info.conversationId);
       retiredDormant = true;
     }
   }
@@ -3955,6 +4013,7 @@ export function resetAgentsForTests(): void {
   activeSpawnStage = null;
   activeFinishStages.clear();
   retiredWorkers.clear();
+  workerTabCleanupClaims.clear();
   livenessFloor = 0;
   spawnRequest = null;
   reviveRequest = null;

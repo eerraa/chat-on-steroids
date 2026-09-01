@@ -112,14 +112,16 @@ export type ToolOutcome = 'ok' | 'error' | 'rejected';
 /**
  * How confident the recorder is that this call belongs to the session it landed in.
  *
- * Four grades, strongest first. `agent` is caller identity. `turn` is per-call evidence
- * out of the page's own message model, or a connector block it drew. `generation` is the
+ * `request_id` is the strongest direct caller proof. `openai_session` is a process-lifetime
+ * continuation learned only from such a direct proof. Older attribution grades remain for
+ * historical records and presentation: `agent` is caller identity, `turn` is per-call evidence
+ * out of the page's own message model or a connector block it drew, and `generation` is the
  * one ChatGPT chat that was demonstrably mid-turn when the call arrived. `inferred` means
  * nothing identified the caller — those calls are stored in the unattributed stream rather
  * than guessed into somebody's history. The extension refuses to rewrite ChatGPT's UI for
  * an inferred call.
  */
-export type CallAttribution = 'request_id' | 'unattributed' | 'turn' | 'agent' | 'generation' | 'inferred';
+export type CallAttribution = 'request_id' | 'openai_session' | 'unattributed' | 'turn' | 'agent' | 'generation' | 'inferred';
 
 /**
  * What each grade of attribution actually rests on, in the words shown to the user.
@@ -142,6 +144,7 @@ export type CallAttribution = 'request_id' | 'unattributed' | 'turn' | 'agent' |
  */
 export const ATTRIBUTION_LABELS: Record<CallAttribution, string> = {
   request_id: 'exact request id',
+  openai_session: 'proven ChatGPT session continuity',
   unattributed: 'request id not resolved',
   agent: 'agent key',
   turn: 'tool block on the page',
@@ -157,8 +160,8 @@ export interface ToolCallRecord {
   requestId: string | null;
   /** Conversation proven by that request id, or null when ownership was unresolved. */
   conversationId: string | null;
-  /** New 1.8 calls use only these two deterministic outcomes. */
-  attributionMethod: 'request_id' | 'unattributed';
+  /** Deterministic caller proof used for this call; OpenAI session mappings are never rebuilt as request-id proof. */
+  attributionMethod: 'request_id' | 'openai_session' | 'unattributed';
   /** Exact arguments as JSON. Cut inline past the cap, with the whole text in an asset. */
   args: StoredText;
   result: StoredText;

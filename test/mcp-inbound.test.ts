@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { inboundRequestId, requestIdFromHeader, withInboundRequestId } from '../src/main/mcp/inbound.js';
+import {
+  inboundOpenAiSessionDigest,
+  inboundRequestId,
+  requestIdFromHeader,
+  withInboundRequest,
+  withInboundRequestId
+} from '../src/main/mcp/inbound.js';
+import { openAiHttpSessionDigest } from '../src/main/session/openai-session.js';
 
 describe('MCP inbound request id boundary', () => {
   it('normalizes the raw x-request-id to the page join key once at ingress', () => {
@@ -30,5 +37,28 @@ describe('MCP inbound request id boundary', () => {
 
     expect(seen).toEqual(['wfr_a', 'wfr_b']);
     expect(inboundRequestId()).toBeNull();
+  });
+
+  it('keeps only a one-way x-openai-session digest in request context', () => {
+    const secret = 'mobile-conversation-shaped-value';
+    const inside = withInboundRequest('wfr_scoped', {
+      authorization: 'Bearer ignored-by-this-boundary',
+      cookie: 'session=ignored-by-this-boundary',
+      'x-openai-session': secret,
+      'user-agent': 'openai-mcp-test'
+    }, () => ({
+      requestId: inboundRequestId(),
+      sessionDigest: inboundOpenAiSessionDigest()
+    }));
+    expect(inside.requestId).toBe('wfr_scoped');
+    expect(inside.sessionDigest).toBe(openAiHttpSessionDigest(secret));
+    expect(inside.sessionDigest).toMatch(/^[0-9a-f]{64}$/);
+    expect(inside.sessionDigest).not.toContain(secret);
+    expect(inboundOpenAiSessionDigest()).toBeNull();
+
+    const ambiguous = withInboundRequest('wfr_duplicate', { 'x-openai-session': ['a', 'b'] }, () =>
+      inboundOpenAiSessionDigest()
+    );
+    expect(ambiguous).toBeNull();
   });
 });

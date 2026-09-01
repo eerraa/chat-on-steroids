@@ -1,4 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import type { IncomingHttpHeaders } from 'node:http';
+import { openAiHttpSessionDigest } from '../session/openai-session.js';
 
 /**
  * The id ChatGPT puts on the HTTP request that carries a tool call.
@@ -15,6 +17,22 @@ import { AsyncLocalStorage } from 'node:async_hooks';
  * the tool dispatch reads it back.
  */
 const store = new AsyncLocalStorage<string | null>();
+const openAiSessionStore = new AsyncLocalStorage<string | null>();
+
+function openAiSessionFromHeaders(headers: IncomingHttpHeaders): string | null {
+  const value = headers['x-openai-session'];
+  if (Array.isArray(value) && value.length !== 1) return null;
+  return openAiHttpSessionDigest(Array.isArray(value) ? value[0] : value);
+}
+
+/** Runs `body` with request-id plus the one ChatGPT session header used by continuity. */
+export function withInboundRequest<T>(
+  requestId: string | null,
+  headers: IncomingHttpHeaders,
+  body: () => T
+): T {
+  return openAiSessionStore.run(openAiSessionFromHeaders(headers), () => store.run(requestId, body));
+}
 
 /** Runs `body` with the request id of the HTTP request currently being served. */
 export function withInboundRequestId<T>(requestId: string | null, body: () => T): T {
@@ -24,6 +42,11 @@ export function withInboundRequestId<T>(requestId: string | null, body: () => T)
 /** The request id of the HTTP request this call is being served on, if it had one. */
 export function inboundRequestId(): string | null {
   return store.getStore() ?? null;
+}
+
+/** SHA-256 of this request's x-openai-session value, when unambiguous and present. */
+export function inboundOpenAiSessionDigest(): string | null {
+  return openAiSessionStore.getStore() ?? null;
 }
 
 /**

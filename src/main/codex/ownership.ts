@@ -26,8 +26,10 @@ const owners = new Map<number, string | null>();
  * command on browser evidence.
  */
 export function provenConversation(requestId: string | null, conversationId: string | null): string | null {
-  if (conversationId) return conversationId;
-  return requestCorrelation(requestId)?.conversationId ?? null;
+  // `conversationId` may come from a previously page-proven OpenAI session continuity mapping.
+  // If this live request's exact browser correlation has arrived since ingress, it is the
+  // stronger source and must win before a still-running terminal session receives an owner.
+  return requestCorrelation(requestId)?.conversationId ?? conversationId;
 }
 
 /** Records the conversation that opened a still-running exec session. */

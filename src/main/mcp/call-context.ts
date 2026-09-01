@@ -15,6 +15,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { AssetRef, FileChange, ToolOutcome } from '../../shared/session.js';
 import { awaitRequestCorrelation, requestCorrelation } from '../session/correlation.js';
+import type { OpenAiSessionEvidence } from '../session/openai-session.js';
 
 export interface CallEvidence {
   changes: FileChange[];
@@ -82,6 +83,10 @@ export interface CallContext {
   abortController?: AbortController;
   /** Who this call was proven to be, for the broker tools to route by. */
   caller: CallCaller;
+  /** Non-model-controlled ChatGPT session evidence carried by this request, hashed immediately. */
+  openAiSession?: OpenAiSessionEvidence;
+  /** Which authority established caller.conversationId for this call. */
+  callerProof?: 'page' | 'openai_session' | null;
   /**
    * Set by the tool guard, which is the only code that can tell a refusal apart from
    * a genuine failure — both come back to the model as an error result.

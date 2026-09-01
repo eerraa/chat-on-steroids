@@ -30,6 +30,7 @@ const {
   acknowledgeOffers,
   acknowledgeOffersForConversation,
   bindConversation,
+  claimWorkerTabCleanup,
   clearAgent,
   claimWorkerRevival,
   currentRunId,
@@ -67,6 +68,7 @@ const {
   persistCriticalSwarmNow,
   resetAgentsForTests,
   resetSwarm,
+  releaseWorkerTabCleanup,
   restoreSwarm,
   sendMessage,
   stageQueuedWorkerRevivals,
@@ -82,6 +84,8 @@ const {
   swarmStateForCaller,
   statusForCaller,
   workerConversationGone,
+  workerTabCleanupClaimed,
+  WORKER_TAB_CLEANUP_CLAIM_MS,
   workerRevivalClaimed
 } = await import('../src/main/agents.js');
 const { startMcpServer } = await import('../src/main/mcp/server.js');
@@ -91,6 +95,13 @@ const { findSessionByConversation, initSessionStore, readRecentEvents, resetSess
   '../src/main/session/store.js'
 );
 const { recordChatObservations, resetRecorderForTests } = await import('../src/main/session/recorder.js');
+const {
+  learnOpenAiSession,
+  openAiHttpSessionDigest,
+  openAiMetaSessionDigest,
+  resetOpenAiSessionsForTests,
+  resolveOpenAiSession
+} = await import('../src/main/session/openai-session.js');
 const { resetWorkspaces, setWorkspaceFor, workspaceForChat } = await import('../src/main/workspace.js');
 const { DEFAULT_CAPABILITIES } = await import('../src/shared/types.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
@@ -119,6 +130,7 @@ afterAll(async () => {
 beforeEach(() => {
   resetAgentsForTests();
   resetRecorderForTests();
+  resetOpenAiSessionsForTests();
   resetWorkspaces();
   // The real app wires the broker's immediate persistence sink during startup. MCP endpoint
   // tests exercise that production contract rather than an intentionally half-wired broker;
@@ -568,6 +580,38 @@ describe('a worker whose chat never opened', () => {
 });
 
 describe('a worker whose chat closed', () => {
+  it('serializes sleeping-tab cleanup against revival, then releases without losing the worker', () => {
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    finishAgent(worker.caller, 'sleep before tab cleanup');
+    expect(releaseQuiescentRun()).toBe(true);
+
+    const now = Date.now();
+    const claim = claimWorkerTabCleanup('c-worker-1', now);
+    expect(claim).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(workerTabCleanupClaimed('c-worker-1', now + 1)).toBe(true);
+    expect(() => sendMessage(prime, 'worker-1', 'wake during browser close')).toThrow(/WORKER_TAB_CLEANUP_IN_PROGRESS/);
+    expect(swarmStateForCaller(prime).agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
+      state: 'sleeping',
+      pending: 0
+    });
+
+    expect(releaseWorkerTabCleanup('c-worker-1', claim!)).toBe(true);
+    expect(workerTabCleanupClaimed('c-worker-1')).toBe(false);
+    expect(sendMessage(prime, 'worker-1', 'wake after close')).toMatchObject({ to: 'worker-1' });
+    expect(swarmState().agents.find((agent) => agent.id === 'worker-1')?.state).toBe('waking');
+  });
+
+  it('expires an abandoned sleeping-tab cleanup claim instead of stranding revival', () => {
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    finishAgent(worker.caller, 'sleep before lost cleanup ACK');
+    expect(releaseQuiescentRun()).toBe(true);
+    expect(claimWorkerTabCleanup('c-worker-1', 10_000)).toBeTruthy();
+    expect(workerTabCleanupClaimed('c-worker-1', 10_000 + WORKER_TAB_CLEANUP_CLAIM_MS - 1)).toBe(true);
+    expect(workerTabCleanupClaimed('c-worker-1', 10_000 + WORKER_TAB_CLEANUP_CLAIM_MS + 1)).toBe(false);
+  });
+
   it('detaches the exact bound worker rather than ending it: the turn is not the tab', () => {
     startSwarm(1);
     startWorker('worker-1');
@@ -1097,6 +1141,12 @@ describe('a worker that is sleeping', () => {
   it('explicit Clear swarm destroys parked histories and leaves their worker conversations fenced', () => {
     startSwarm(1);
     const worker = startWorker('worker-1', 'c-worker-clear-dormant');
+    const sessionEvidence = {
+      surface: 'core' as const,
+      metaDigest: openAiMetaSessionDigest('worker-clear-meta-session'),
+      httpDigest: openAiHttpSessionDigest('worker-clear-http-session')
+    };
+    expect(learnOpenAiSession(sessionEvidence, 'c-worker-clear-dormant').status).toBe('stored');
     finishAgent(worker.caller, 'park before explicit clear');
     expect(releaseQuiescentRun()).toBe(true);
     expect(swarmStateForCaller(prime).agents.find((agent) => agent.id === 'worker-1')).toBeTruthy();
@@ -1110,6 +1160,7 @@ describe('a worker that is sleeping', () => {
       id: 'worker-1',
       conversationId: 'c-worker-clear-dormant'
     });
+    expect(resolveOpenAiSession(sessionEvidence).error).toContain('CALLER_IDENTITY_RETIRED');
   });
 
   it('counts only working workers against the limit, so a third runs and the first is woken after', () => {
@@ -1827,6 +1878,10 @@ describe('restart', () => {
 describe('through the MCP endpoint', () => {
   let endpoint: Awaited<ReturnType<typeof startMcpServer>>;
   let nextId = 1;
+  const PROTOCOL_2026 = '2026-07-28';
+  const META_PROTOCOL = 'io.modelcontextprotocol/protocolVersion';
+  const META_CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities';
+  const META_CLIENT_INFO = 'io.modelcontextprotocol/clientInfo';
 
   const post = (body: unknown, extraHeaders: Record<string, string> = {}): Promise<any> =>
     new Promise((resolve, reject) => {
@@ -1901,6 +1956,68 @@ describe('through the MCP endpoint', () => {
       { jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: { name, arguments: args } },
       { 'x-request-id': `${requestId}/relay` }
     );
+
+  const openAiToolWithSession = (
+    requestId: string,
+    name: string,
+    args: Record<string, unknown>,
+    metaSession: string,
+    httpSession: string
+  ): Promise<any> =>
+    post(
+      {
+        jsonrpc: '2.0',
+        id: nextId++,
+        method: 'tools/call',
+        params: {
+          name,
+          arguments: args,
+          _meta: {
+            [META_PROTOCOL]: PROTOCOL_2026,
+            [META_CAPABILITIES]: { experimental: {}, extensions: {} },
+            [META_CLIENT_INFO]: { name: 'openai-mcp', version: '1.0.0' },
+            'openai/session': metaSession
+          }
+        }
+      },
+      {
+        'MCP-Protocol-Version': PROTOCOL_2026,
+        'Mcp-Method': 'tools/call',
+        'Mcp-Name': name,
+        'x-request-id': `${requestId}/relay`,
+        'x-openai-session': httpSession
+      }
+    );
+
+  const openAiAgentsWithSession = (
+    requestId: string,
+    action: string,
+    metaSession: string,
+    httpSession: string,
+    args: Record<string, unknown> = {}
+  ): Promise<any> => openAiToolWithSession(requestId, 'agents', { action, ...args }, metaSession, httpSession);
+
+  const openAiAgentsAsChat = async (
+    conversationId: string,
+    metaSession: string,
+    httpSession: string,
+    action: string,
+    args: Record<string, unknown> = {}
+  ): Promise<any> => {
+    const seq = ++evidenceSeq;
+    const requestId = `wfr_openai_session_${seq}`;
+    const pending = openAiAgentsWithSession(requestId, action, metaSession, httpSession, args);
+    await recordChatObservations(conversationId, [
+      { kind: 'turn_start', time: Date.now(), turnId: `t-openai-${seq}` },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        turnId: `t-openai-${seq}`,
+        calls: [{ messageId: `m-openai-${seq}`, tool: 'agents', order: 0, answered: false, requestId }]
+      }
+    ]);
+    return pending;
+  };
 
   const textOfReply = (reply: any): string =>
     ((reply.result?.content ?? []) as Array<{ text?: string }>).map((part) => part.text ?? '').join('\n');
@@ -2013,6 +2130,35 @@ describe('through the MCP endpoint', () => {
     expect(identify({ conversationId: 'c-ahead' }).id).toBe(PRIME_ID);
   });
 
+  it('learns a PC-proven OpenAI session and restores prime agents control on a page-less mobile call', async () => {
+    startSwarm(1);
+    const metaSession = 'openai-session-prime-a';
+    const httpSession = 'openai-http-prime-a';
+
+    const pc = await openAiAgentsAsChat(PRIME_CHAT, metaSession, httpSession, 'status');
+    expect(textOfReply(pc)).toContain('You are prime.');
+
+    const mobile = await openAiAgentsWithSession(
+      'wfr_mobile_prime_session',
+      'status',
+      metaSession,
+      httpSession
+    );
+    expect(textOfReply(mobile)).toContain('You are prime.');
+    expect(textOfReply(mobile)).not.toContain('WORKER_IDENTITY_LOST');
+  });
+
+  it('keeps agents control fail-closed for an OpenAI session that no PC call has proven', async () => {
+    startSwarm(1);
+    const mobile = await openAiAgentsWithSession(
+      'wfr_unknown_mobile_session',
+      'status',
+      'never-proven-meta-session',
+      'never-proven-http-session'
+    );
+    expect(textOfReply(mobile)).toContain('WORKER_IDENTITY_LOST');
+  });
+
   it('refuses a spawn whose conversation this app cannot prove, and creates nothing', async () => {
     const text = await agents('spawn', { workers: [{ task: 'anything' }] });
     expect(text).toMatch(/UNIDENTIFIED_CALLER|could not/i);
@@ -2117,27 +2263,108 @@ describe('through the MCP endpoint', () => {
     expect(identify({ conversationId: 'c-prime-b' }).id).toBe(PRIME_ID);
   });
 
-  it('waits for late exact identity while dormant worker histories exist, then fences that worker', async () => {
+  it('restores a dormant worker from its proven OpenAI session and keeps the worker fence on mobile', async () => {
     startSwarm(1);
     const worker = startWorker('worker-1');
-    finishAgent(worker.caller, 'sleep before late evidence');
+    const metaSession = 'openai-session-worker-a';
+    const httpSession = 'openai-http-worker-a';
+
+    const learned = await openAiAgentsAsChat('c-worker-1', metaSession, httpSession, 'status');
+    expect(textOfReply(learned)).toContain('worker-1');
+    finishAgent(worker.caller, 'park after session proof');
     expect(releaseQuiescentRun()).toBe(true);
 
-    const requestId = 'wfr_dormant_worker_late';
-    const pending = ordinaryWithRequestId(requestId, 'read', { paths: ['/anything'] });
-    // Initial cheap correlation has already had a chance to miss. Deliver the exact page mate
-    // while the kernel is in its dormant-worker evidence window.
+    const cleanupClaim = claimWorkerTabCleanup('c-worker-1');
+    expect(cleanupClaim).toBeTruthy();
+    const duringCleanup = await openAiToolWithSession(
+      'wfr_mobile_worker_during_cleanup',
+      'read',
+      { paths: ['/anything'] },
+      metaSession,
+      httpSession
+    );
+    expect(textOfReply(duringCleanup)).toContain('WORKER_TAB_CLEANUP_IN_PROGRESS');
+    expect(textOfReply(duringCleanup)).toContain('No local tool was run');
+    expect(releaseWorkerTabCleanup('c-worker-1', cleanupClaim!)).toBe(true);
+
+    const mobile = await openAiToolWithSession(
+      'wfr_mobile_dormant_worker',
+      'read',
+      { paths: ['/anything'] },
+      metaSession,
+      httpSession
+    );
+    expect(textOfReply(mobile)).toContain('WORKER_SLEEPING');
+    expect(textOfReply(mobile)).toContain('Nothing was run');
+    expect(textOfReply(mobile)).not.toMatch(/unknown root|not found/i);
+  });
+
+  it('does not turn retained dormant history into a global identity fence for an ordinary unplaceable call', async () => {
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    finishAgent(worker.caller, 'park durable worker history');
+    expect(releaseQuiescentRun()).toBe(true);
+
+    // This is the mobile-client shape: a real connector request id, but no browser page that can
+    // ever map it to a conversation. Retained history must not make that permanent global state
+    // deny self-contained ordinary tools. The read reaches its real handler (and fails only
+    // because this test endpoint intentionally has no approved roots).
+    const reply = await ordinaryWithRequestId('wfr_unplaceable_mobile', 'read', { paths: ['/anything'] });
+    const text = textOfReply(reply);
+    expect(text).not.toContain('CALLER_IDENTITY_REQUIRED');
+    expect(text).not.toContain('WORKER_SLEEPING');
+    expect(text).toMatch(/unknown root|not found|approved/i);
+
+    const mobileRead = await openAiToolWithSession(
+      'wfr_unproven_mobile_read',
+      'read',
+      { paths: ['/anything'] },
+      'unrelated-mobile-meta',
+      'unrelated-mobile-http'
+    );
+    expect(textOfReply(mobileRead)).not.toMatch(/CALLER_IDENTITY_REQUIRED|WORKER_SLEEPING/);
+
+    const mobileExec = await openAiToolWithSession(
+      'wfr_unproven_mobile_exec',
+      'exec_command',
+      { cmd: 'echo ok', workdir: '/anything' },
+      'unrelated-mobile-meta',
+      'unrelated-mobile-http'
+    );
+    expect(textOfReply(mobileExec)).not.toMatch(/CALLER_IDENTITY_REQUIRED|WORKER_SLEEPING/);
+  });
+
+  it('fences a dormant worker whose exact identity arrives late before it can spawn a new run', async () => {
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    finishAgent(worker.caller, 'sleep before a late control call');
+    expect(releaseQuiescentRun()).toBe(true);
+    expect(swarmRunning()).toBe(false);
+
+    const requestId = 'wfr_dormant_worker_late_spawn';
+    const pending = agentsWithRequestId(requestId, 'spawn', { workers: [{ task: 'must never be created' }] });
+    // The dispatcher did not know who called when the request entered. Prove the exact worker
+    // only while the agents handler is in callerNow()'s request-id evidence window.
     await new Promise((resolve) => setTimeout(resolve, 20));
     await recordChatObservations('c-worker-1', [
-      { kind: 'turn_start', time: Date.now(), turnId: 't-dormant-late' },
+      { kind: 'turn_start', time: Date.now(), turnId: 't-dormant-late-spawn' },
       {
         kind: 'tool_evidence',
         time: Date.now(),
-        turnId: 't-dormant-late',
-        calls: [{ messageId: 'm-dormant-late', tool: 'read', order: 0, answered: false, requestId }]
+        turnId: 't-dormant-late-spawn',
+        calls: [{ messageId: 'm-dormant-late-spawn', tool: 'agents', order: 0, answered: false, requestId }]
       }
     ]);
-    expect(textOfReply(await pending)).toContain('WORKER_SLEEPING');
+
+    const text = await pending;
+    expect(text).toContain('WORKER_SLEEPING');
+    expect(text).toContain('Nothing was run');
+    expect(swarmRunning()).toBe(false);
+    expect(pendingWorkerSpawns()).toEqual([]);
+    expect(swarmStateForCaller(prime).agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
+      state: 'sleeping',
+      conversationId: 'c-worker-1'
+    });
   });
 
   it('delivers and acknowledges a parked prime inbox by exact conversation without adopting another history', async () => {

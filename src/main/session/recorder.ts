@@ -5,12 +5,14 @@
  * and result. The Chrome extension reports canonical ChatGPT message observations, turn
  * lifecycle, visible page-native activity, errors, and request-id evidence.
  *
- * Tool ownership has one path only: normalized HTTP x-request-id -> ChatGPT
- * message.metadata.request_id -> conversationId. The correlation registry records that
- * exact proof. ConversationId then maps to a session and, independently, to swarm role.
- * If the exact request cannot be proven, the call goes to Unattributed activity. No
- * tool-name, timing, visible-row, active-tab, generation, or agent-payload heuristic may
- * choose an owner.
+ * First-use tool ownership has one authority path: normalized HTTP x-request-id -> ChatGPT
+ * message.metadata.request_id -> conversationId. The correlation registry records that exact
+ * proof. On current ChatGPT, that same proven PC call may also bind the non-model-controlled
+ * `(surface, openai/session + x-openai-session)` pair for this Electron process, allowing the
+ * same conversation's mobile call to recover its conversationId without a browser page. The
+ * session pair never bootstraps itself and is not reconstructed from history after restart.
+ * If neither proof resolves the call, it goes to Unattributed activity. No tool-name, timing,
+ * visible-row, active-tab, generation, user-agent, or agent-payload heuristic may choose an owner.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -64,6 +66,9 @@ import {
 } from './correlation.js';
 import { resumeOpeningChat } from './resume-gate.js';
 import { summarizeToolCall } from './summarize.js';
+import { learnOpenAiSession, type OpenAiSessionEvidence } from './openai-session.js';
+import { adoptWorkspaceForRequest } from '../workspace.js';
+import { noteExecOwner } from '../codex/ownership.js';
 
 interface LiveConversation {
   conversationId: string;
@@ -1044,6 +1049,10 @@ export interface ToolCallInput {
   requestId?: string | null;
   /** Exact conversation already proven for this request by the dispatcher, when available. */
   conversationId?: string | null;
+  /** How the dispatcher proved conversationId. Defaults to request_id for existing call sites. */
+  attribution?: 'request_id' | 'openai_session';
+  /** Hashed ChatGPT vendor-session evidence for late page-proof learning; raw values never enter the recorder. */
+  openAiSession?: OpenAiSessionEvidence;
 }
 
 /** Writing runs one at a time, so the log keeps call order. See recordToolCall. */
@@ -1077,10 +1086,11 @@ export function recordToolCall(input: ToolCallInput): Promise<ToolCallRecord | n
   if (input.conversationId) {
     const live = conversations.get(input.conversationId);
     const correlation = input.requestId ? requestCorrelation(input.requestId) : null;
+    const attribution = input.attribution ?? 'request_id';
     const target: Target = {
       conversationId: input.conversationId,
       sessionId: correlation?.conversationId === input.conversationId ? correlation.sessionId : null,
-      attribution: 'request_id',
+      attribution,
       turnId: live?.turnId ?? null
     };
     if (input.bind) bindAgentConversation(input.bind, input.conversationId);
@@ -1112,6 +1122,19 @@ export function recordToolCall(input: ToolCallInput): Promise<ToolCallRecord | n
             `request attribution: no page evidence for ${input.requestId} within ` +
               `${REQUEST_ID_GRACE_MS}ms; filing ${input.tool} under Unattributed activity`
           );
+        }
+        if (conversationId && input.openAiSession) {
+          // The dispatcher may have finished before Fiber delivered the exact request-id mate.
+          // This recorder grace window is already the canonical late-proof path; seed mobile
+          // continuity here too so a fast PC read/exec can still enable the next phone call.
+          learnOpenAiSession(input.openAiSession, conversationId);
+        }
+        if (conversationId) {
+          adoptWorkspaceForRequest(input.requestId ?? null, conversationId);
+          const processId = Number(input.evidence?.processSessionId ?? NaN);
+          if (input.tool === 'exec_command' && Number.isInteger(processId) && processId > 0) {
+            noteExecOwner(processId, conversationId);
+          }
         }
         if (input.bind && conversationId) bindAgentConversation(input.bind, conversationId);
         return {
@@ -1195,7 +1218,12 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
       attribution: target.attribution,
       requestId: input.requestId ?? null,
       conversationId: target.conversationId,
-      attributionMethod: target.conversationId && input.requestId ? 'request_id' : 'unattributed',
+      attributionMethod:
+        target.conversationId && target.attribution === 'openai_session'
+          ? 'openai_session'
+          : target.conversationId && input.requestId
+            ? 'request_id'
+            : 'unattributed',
       args: await storeText(sessionId, safeJson(redactArgs(input.tool, input.args)), MAX_TOOL_ARGS_CHARS),
       result: await storeText(sessionId, resultText, MAX_TOOL_RESULT_CHARS),
       outcome: input.outcome,

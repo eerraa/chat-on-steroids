@@ -590,7 +590,22 @@ async function findUiLocked(
   if (!Number.isInteger(snapshotId) || snapshotId < 1) {
     throw new ComputerError('The desktop helper returned UI elements without a valid snapshot identity.');
   }
-  const windowId = Number(reply['window']);
+  // Standalone `find_ui` replies carry the HWND as `window: number`, while the combined
+  // `snapshot` transaction used by getWindowState carries the full WindowInfo object in the
+  // same field. The caller already knows the exact HWND in that combined path; prefer it rather
+  // than coercing the object with Number(), which becomes NaN -> JSON null -> PowerShell int64 0
+  // when a later click_ref/set_value is sent to the helper.
+  const replyWindow = reply['window'];
+  const windowId =
+    opts.window ??
+    (typeof replyWindow === 'number'
+      ? replyWindow
+      : replyWindow && typeof replyWindow === 'object'
+        ? Number((replyWindow as Record<string, unknown>)['id'])
+        : Number(replyWindow));
+  if (!Number.isInteger(windowId) || windowId <= 0) {
+    throw new ComputerError('The desktop helper returned UI elements without a valid window identity.');
+  }
   logInfo(
     `desktop uia window_snapshot=${snapshotId} visited=${Number(reply['visited']) || 0} returned=${raw.length} truncated=${reply['truncated'] === true}`
   );
