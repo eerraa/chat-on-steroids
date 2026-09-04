@@ -13,10 +13,56 @@
  * adopt such a session and an anonymous call cannot touch a proven-owned session.
  */
 
-import { requestCorrelation } from '../session/correlation.js';
+import { onRequestCorrelationProven, requestCorrelation } from '../session/correlation.js';
 
 /** Owners, keyed by the process id `exec_command` handed back as `session_id`. */
 const owners = new Map<number, string | null>();
+/** Running sessions opened before this exact request's page proof arrived. */
+const pendingByRequest = new Map<string, Set<number>>();
+const pendingRequestByProcess = new Map<number, string>();
+const MAX_PENDING_EXEC_REQUESTS = 256;
+
+function unlinkPendingProcess(processId: number): void {
+  const requestId = pendingRequestByProcess.get(processId);
+  if (!requestId) return;
+  pendingRequestByProcess.delete(processId);
+  const processes = pendingByRequest.get(requestId);
+  if (!processes) return;
+  processes.delete(processId);
+  if (processes.size === 0) pendingByRequest.delete(requestId);
+}
+
+/**
+ * Retains exact request/process pairing until browser correlation arrives.
+ * The process remains anonymous meanwhile, so this cannot widen terminal authority.
+ */
+export function rememberExecOwnerForRequest(requestId: string | null | undefined, processId: number | null): void {
+  if (!requestId || requestId.length > 200 || processId === null || !Number.isInteger(processId) || processId <= 0) return;
+  unlinkPendingProcess(processId);
+  if (!pendingByRequest.has(requestId) && pendingByRequest.size >= MAX_PENDING_EXEC_REQUESTS) {
+    const oldest = pendingByRequest.keys().next().value as string | undefined;
+    if (oldest) {
+      for (const held of pendingByRequest.get(oldest) ?? []) pendingRequestByProcess.delete(held);
+      pendingByRequest.delete(oldest);
+    }
+  }
+  const processes = pendingByRequest.get(requestId) ?? new Set<number>();
+  processes.add(processId);
+  pendingByRequest.set(requestId, processes);
+  pendingRequestByProcess.set(processId, requestId);
+}
+
+onRequestCorrelationProven((correlation) => {
+  const processes = pendingByRequest.get(correlation.requestId);
+  if (!processes) return;
+  pendingByRequest.delete(correlation.requestId);
+  for (const processId of processes) {
+    pendingRequestByProcess.delete(processId);
+    // A process that ended/recycled has no row; a process that acquired another exact owner must
+    // never be overwritten. Only the anonymous owner this request itself created is promotable.
+    if (owners.get(processId) === null) owners.set(processId, correlation.conversationId);
+  }
+});
 
 /**
  * The conversation behind an in-flight MCP request, when it is already proven.
@@ -35,12 +81,14 @@ export function provenConversation(requestId: string | null, conversationId: str
 /** Records the conversation that opened a still-running exec session. */
 export function noteExecOwner(processId: number | null, conversationId: string | null): void {
   if (processId === null) return;
+  if (conversationId !== null) unlinkPendingProcess(processId);
   owners.set(processId, conversationId);
 }
 
 /** Drops a session's owner once it can no longer be written to. */
 export function forgetExecOwner(processId: number | null): void {
   if (processId === null) return;
+  unlinkPendingProcess(processId);
   owners.delete(processId);
 }
 
@@ -87,4 +135,6 @@ export function moveExecConversationOwners(fromConversationId: string, toConvers
 /** Test seam: the registry is process-global state with no natural lifetime boundary. */
 export function resetExecOwnershipForTests(): void {
   owners.clear();
+  pendingByRequest.clear();
+  pendingRequestByProcess.clear();
 }

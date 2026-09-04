@@ -72,4 +72,52 @@ describe('extension popup continuity status', () => {
     expect(pips).toEqual(['pip on', 'pip on']);
     dom.window.close();
   });
+
+  it('prominently tells the user to reload a ChatGPT tab whose recorder is stale or absent', async () => {
+    const [html, source] = await Promise.all([
+      fs.readFile(path.join(process.cwd(), 'extension', 'popup.html'), 'utf8'),
+      fs.readFile(path.join(process.cwd(), 'extension', 'popup.js'), 'utf8')
+    ]);
+    const dom = new JSDOM(html, { url: 'chrome-extension://cos/popup.html', runScripts: 'outside-only' });
+    const status = {
+      connected: true,
+      paired: true,
+      compatible: true,
+      port: 8765,
+      extensionVersion: '2.0.2',
+      extensionProtocol: 11,
+      appVersion: '2.0.2'
+    };
+    const tabStatus = {
+      isChat: true,
+      recorder: false,
+      tab: 9,
+      epoch: 2,
+      bound: false,
+      terminal: false,
+      pending: 0,
+      pendingAll: 0,
+      conversationId: 'aaaaaaaa-bbbb-cccc-dddd-ffffffffffff',
+      delivery: null,
+      page: null
+    };
+    const runtime = {
+      sendMessage: async (message: { type?: string }) =>
+        message.type === 'status' ? status : message.type === 'tabStatus' ? tabStatus : { ok: true }
+    };
+    const storage = { local: { get: async () => ({}), set: async () => undefined } };
+    Object.defineProperty(dom.window, 'chrome', { configurable: true, value: { runtime, storage } });
+
+    dom.window.eval(source);
+    await new Promise((resolve) => dom.window.setTimeout(resolve, 0));
+    await new Promise((resolve) => dom.window.setTimeout(resolve, 0));
+
+    expect(dom.window.document.querySelector('#r-rec')?.className).toBe('row no');
+    expect(dom.window.document.querySelector('#d-rec')?.textContent).toBe('reload');
+    const alert = dom.window.document.querySelector<HTMLElement>('#alert');
+    expect(alert?.hidden).toBe(false);
+    expect(alert?.textContent).toContain('Reload this ChatGPT tab');
+    expect(alert?.textContent).toContain('cannot be attributed');
+    dom.window.close();
+  });
 });

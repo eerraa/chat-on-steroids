@@ -83,9 +83,11 @@ import {
 import { readOverflowText } from '../session/store.js';
 import type { StoredText } from '../../shared/session.js';
 import {
+  forgetPendingOpenAiSessionsForRequest,
   learnOpenAiSession,
   OPENAI_SESSION_META_KEY,
   openAiMetaSessionDigest,
+  rememberOpenAiSessionForRequest,
   resolveOpenAiSession,
   type OpenAiSessionEvidence
 } from '../session/openai-session.js';
@@ -296,6 +298,7 @@ function adoptPageConversation(
   const learned = context.openAiSession
     ? learnOpenAiSession(context.openAiSession, conversationId)
     : { status: 'missing' as const, error: null };
+  forgetPendingOpenAiSessionsForRequest(context.caller.requestId);
   // Retirement revokes *session continuity*, not the stronger exact browser request-id proof.
   // Keep the retired key blocked, but let the page prove its own conversation and fall through
   // to the normal worker/continuation fences below. Ambiguity is different: two contradictory
@@ -482,6 +485,9 @@ async function dispatchTracked(
   // require identity wait for their own exact mate. Ordinary absolute reads/execs never wait.
   const pageConversationId = callerConversation(name, startedAt, requestId);
   const sessionResolution = resolveOpenAiSession(context.openAiSession ?? { surface, metaDigest: null, httpDigest: null });
+  if (!pageConversationId && !sessionResolution.conversationId && !sessionResolution.error) {
+    rememberOpenAiSessionForRequest(requestId, context.openAiSession ?? { surface, metaDigest: null, httpDigest: null });
+  }
   let identityError = sessionResolution.error;
   if (pageConversationId) {
     // Exact browser evidence is the strongest source. It still makes an ambiguous session fail

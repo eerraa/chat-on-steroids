@@ -20,6 +20,7 @@ import type { SurfaceId } from '../mcp/surfaces.js';
 export const OPENAI_SESSION_META_KEY = 'openai/session';
 const MAX_SESSION_VALUE_CHARS = 1024;
 const MAX_SESSION_KEYS = 8192;
+const MAX_PENDING_REQUESTS = 8192;
 
 export interface OpenAiSessionEvidence {
   surface: SurfaceId;
@@ -41,6 +42,16 @@ type SessionEntry = BoundEntry | BlockedEntry;
 
 const bySession = new Map<string, SessionEntry>();
 const keysByConversation = new Map<string, Set<string>>();
+/**
+ * Exact MCP request id -> hashed vendor-session evidence waiting for page proof.
+ *
+ * This closes the gap where request-id proof arrives only after the recorder's bounded grace
+ * window. The durable attribution repair can move the old call later, but without retaining
+ * these already-hashed values the app could no longer teach mobile continuity from that same
+ * exact proof. Nothing raw or durable is stored here, and request ids are bounded like the
+ * learned-session registry itself.
+ */
+const pendingByRequest = new Map<string, OpenAiSessionEvidence[]>();
 
 function digest(source: 'meta' | 'http', value: unknown): string | null {
   if (typeof value !== 'string' || value.length === 0 || value.length > MAX_SESSION_VALUE_CHARS) return null;
@@ -60,6 +71,50 @@ function keyOf(evidence: OpenAiSessionEvidence): string | null {
   // the HTTP copy a real corroborating boundary rather than optional decoration: a caller that
   // can manufacture only one vendor field never reaches learned conversation authority.
   return evidence.metaDigest && evidence.httpDigest ? `${evidence.surface}\0${evidence.metaDigest}` : null;
+}
+
+function pendingEvidenceKey(evidence: OpenAiSessionEvidence): string | null {
+  if (!evidence.metaDigest || !evidence.httpDigest) return null;
+  return `${evidence.surface}\0${evidence.metaDigest}\0${evidence.httpDigest}`;
+}
+
+/** Retains only hashed continuity evidence until this exact request id gets page proof. */
+export function rememberOpenAiSessionForRequest(
+  requestId: string | null | undefined,
+  evidence: OpenAiSessionEvidence
+): void {
+  if (!requestId || requestId.length > 200) return;
+  const evidenceKey = pendingEvidenceKey(evidence);
+  if (!evidenceKey) return;
+  const held = pendingByRequest.get(requestId) ?? [];
+  if (held.some((item) => pendingEvidenceKey(item) === evidenceKey)) return;
+  if (!pendingByRequest.has(requestId) && pendingByRequest.size >= MAX_PENDING_REQUESTS) {
+    const oldest = pendingByRequest.keys().next().value as string | undefined;
+    if (oldest) pendingByRequest.delete(oldest);
+  }
+  held.push({ ...evidence });
+  pendingByRequest.set(requestId, held.slice(-4));
+}
+
+/**
+ * Spends pending evidence only after the ordinary request-id registry proves the conversation.
+ * Multiple surfaces may share one workflow request id, so learn every distinct retained pair.
+ */
+export function learnPendingOpenAiSessionsForRequest(requestId: string, conversationId: string): number {
+  const held = pendingByRequest.get(requestId);
+  pendingByRequest.delete(requestId);
+  if (!held || !conversationId) return 0;
+  let learned = 0;
+  for (const evidence of held) {
+    const result = learnOpenAiSession(evidence, conversationId);
+    if (result.status === 'stored' || result.status === 'same') learned += 1;
+  }
+  return learned;
+}
+
+/** Contradictory request-id evidence can never safely seed continuity. */
+export function forgetPendingOpenAiSessionsForRequest(requestId: string | null | undefined): void {
+  if (requestId) pendingByRequest.delete(requestId);
 }
 
 function unlink(key: string, conversationId: string): void {
@@ -173,4 +228,5 @@ export function retireOpenAiSessionsForConversation(conversationId: string | nul
 export function resetOpenAiSessionsForTests(): void {
   bySession.clear();
   keysByConversation.clear();
+  pendingByRequest.clear();
 }

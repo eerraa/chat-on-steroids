@@ -621,6 +621,46 @@ export function evidenceWindow(production: number): number {
  * tool/time/generation guess.
  */
 const REQUEST_ID_GRACE_MS = evidenceWindow(15_000);
+const MAX_REQUEST_EVIDENCE_WAITS = 8192;
+/**
+ * One exact workflow request id gets one bounded negative evidence window.
+ *
+ * ChatGPT legitimately reuses one request id for dozens of sequential tool calls. If its page
+ * recorder is absent (for example an unreloaded tab after an extension update), waiting and
+ * logging the same negative fact for every call produces pages of identical warnings. Keep the
+ * resolved miss request-scoped; a later exact correlation always wins the synchronous lookup
+ * below and deterministic repair moves earlier calls without guessing.
+ */
+const requestEvidenceWaits = new Map<string, Promise<ReturnType<typeof requestCorrelation>>>();
+
+function requestEvidence(requestId: string, firstTool: string): Promise<ReturnType<typeof requestCorrelation>> {
+  const immediate = requestCorrelation(requestId);
+  if (immediate || requestCorrelationConflicted(requestId)) {
+    requestEvidenceWaits.delete(requestId);
+    return Promise.resolve(immediate);
+  }
+  const existing = requestEvidenceWaits.get(requestId);
+  if (existing) return existing;
+  if (requestEvidenceWaits.size >= MAX_REQUEST_EVIDENCE_WAITS) {
+    const oldest = requestEvidenceWaits.keys().next().value as string | undefined;
+    if (oldest) requestEvidenceWaits.delete(oldest);
+  }
+  const pending = awaitRequestCorrelation(requestId, REQUEST_ID_GRACE_MS).then((correlation) => {
+    if (correlation) {
+      requestEvidenceWaits.delete(requestId);
+      return correlation;
+    }
+    logWarn(
+      `request attribution: no page evidence for ${requestId} within ${REQUEST_ID_GRACE_MS}ms; ` +
+        `this workflow is being filed under Unattributed activity (first unresolved tool: ${firstTool}). ` +
+        'If it came from an already-open PC ChatGPT tab after an extension update, reload that tab. ' +
+        'A page-less mobile call remains unattributed until this conversation has been proven once by a live PC recorder.'
+    );
+    return null;
+  });
+  requestEvidenceWaits.set(requestId, pending);
+  return pending;
+}
 
 /**
  * Late exact request-id evidence can arrive after a call already fell into Unattributed.
@@ -740,6 +780,7 @@ function noteCallEvidence(
   const warnedConflicts = new Set<string>();
   for (const [index, call] of evidencedCalls.entries()) {
     const result = results[index]!;
+    requestEvidenceWaits.delete(call.requestId);
     if (result === 'conflict') {
       if (!alreadyConflicted.has(call.requestId) && !warnedConflicts.has(call.requestId)) {
         warnedConflicts.add(call.requestId);
@@ -1111,18 +1152,8 @@ export function recordToolCall(input: ToolCallInput): Promise<ToolCallRecord | n
   // request after the MCP handler already completed, but no different request/page state can
   // ever satisfy it. Chrome-off or unmatched modern ids therefore end in Unattributed.
   const attributing = input.requestId
-    ? awaitRequestCorrelation(input.requestId, REQUEST_ID_GRACE_MS).then((correlation) => {
+    ? requestEvidence(input.requestId, input.tool).then((correlation) => {
         const conversationId = correlation?.conversationId ?? null;
-        // Say which request id gave up, not just that something did. `unattributed` is the
-        // one outcome whose cause always lives in the browser half of the join, so the log
-        // has to carry the id that the page never confirmed — it is the only handle anyone
-        // has for matching this against what the extension believed it sent.
-        if (!conversationId) {
-          logWarn(
-            `request attribution: no page evidence for ${input.requestId} within ` +
-              `${REQUEST_ID_GRACE_MS}ms; filing ${input.tool} under Unattributed activity`
-          );
-        }
         if (conversationId && input.openAiSession) {
           // The dispatcher may have finished before Fiber delivered the exact request-id mate.
           // This recorder grace window is already the canonical late-proof path; seed mobile
@@ -1849,6 +1880,7 @@ export function resetRecorderForTests(): void {
   }
   attributionRepairRequested = false;
   attributionRepairChain = Promise.resolve();
+  requestEvidenceWaits.clear();
   agentConversationLookup = () => null;
   agentBinder = () => undefined;
   if (notifyTimer) {

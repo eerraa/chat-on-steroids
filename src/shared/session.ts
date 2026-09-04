@@ -30,7 +30,7 @@ export const TURN_OUTCOME_LABELS: Record<TurnOutcome, string> = {
   stopped: 'stopped by the user',
   interrupted: 'interrupted before it finished',
   stalled: 'stalled — no visible progress',
-  unknown: 'ended for an unknown reason'
+  unknown: 'completion unknown — success or failure was not proven'
 };
 
 /**

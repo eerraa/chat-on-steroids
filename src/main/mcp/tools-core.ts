@@ -51,7 +51,8 @@ import {
   execOwnershipDenied,
   forgetExecOwner,
   noteExecOwner,
-  provenConversation
+  provenConversation,
+  rememberExecOwnerForRequest
 } from '../codex/ownership.js';
 import {
   UnifiedExecError,
@@ -779,6 +780,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
                 }
               }
               noteExecOwner(output.processId, owner);
+              if (!owner) rememberExecOwnerForRequest(currentCaller().requestId, output.processId);
             }
             const responseText = execCommandResponseText(output);
             // A search that found nothing exits 1 and has not failed. Recording it as an

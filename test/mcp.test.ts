@@ -47,7 +47,12 @@ import {
 import { observeRequestCorrelation } from '../src/main/session/correlation.js';
 import { flushRecorder } from '../src/main/session/recorder.js';
 import { resetOpenAiSessionsForTests, retireOpenAiSessionsForConversation } from '../src/main/session/openai-session.js';
-import { execOwner, noteExecOwner, resetExecOwnershipForTests } from '../src/main/codex/ownership.js';
+import {
+  execOwner,
+  noteExecOwner,
+  rememberExecOwnerForRequest,
+  resetExecOwnershipForTests
+} from '../src/main/codex/ownership.js';
 import { unifiedExecManager } from '../src/main/codex/manager.js';
 import { locateRipgrep } from '../src/main/ripgrep.js';
 import { IS_WINDOWS, makeTempDir, removeTempDir, writeTree } from './helpers.js';
@@ -1027,6 +1032,48 @@ describe('ChatGPT openai/session continuity at the MCP boundary', () => {
       'tools/call',
       { name: 'read', arguments: { paths: ['lib/util.ts'] } },
       { requestId: 'wfr_openai_late_mobile', metaSession, httpSession }
+    );
+    expect(failed(mobile), textOf(mobile)).toBe(false);
+    expect(textOf(mobile)).toContain('export const helper = 1;');
+  });
+
+  it('still learns continuity when exact PC page evidence arrives after the recorder grace window', async () => {
+    ctx.caps = withCaps({ read: true });
+    const conversationId = 'conversation-openai-session-after-grace';
+    const session = await createSession({ conversationId, title: 'Late-after-grace OpenAI session proof' });
+    const metaSession = 'meta-session-after-grace';
+    const httpSession = 'http-session-after-grace';
+    const requestId = 'wfr_openai_after_grace_pc_proof';
+
+    const pc = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'read', arguments: { paths: ['/workspace/src/app.ts'] } },
+      { requestId, metaSession, httpSession }
+    );
+    expect(failed(pc), textOf(pc)).toBe(false);
+
+    // Test configuration shortens the production 15s recorder grace to 1.5s. Let that window
+    // genuinely expire before page proof appears: deterministic repair may move the old call,
+    // and the retained hashed vendor-session evidence must still teach the next mobile call.
+    await new Promise((resolve) => setTimeout(resolve, 1_650));
+    expect(
+      observeRequestCorrelation({
+        requestId,
+        conversationId,
+        sessionId: session.id,
+        messageId: 'message-openai-after-grace-pc-proof',
+        tool: 'read',
+        observedAt: Date.now()
+      })
+    ).toBe('stored');
+    await flushRecorder();
+
+    const mobile = await openAiModern(
+      'core',
+      'tools/call',
+      { name: 'read', arguments: { paths: ['lib/util.ts'] } },
+      { requestId: 'wfr_openai_after_grace_mobile', metaSession, httpSession }
     );
     expect(failed(mobile), textOf(mobile)).toBe(false);
     expect(textOf(mobile)).toContain('export const helper = 1;');
@@ -3425,6 +3472,21 @@ describe('exec sessions belong to the chat that opened them', () => {
       { name, arguments: args },
       requestId ? { 'x-request-id': `${requestId}/att1` } : {}
     );
+
+  it('promotes only the anonymous running session staged by a late exact request proof', () => {
+    const requestId = 'wfr_execown_late_pending';
+    const processId = 876543;
+    const unrelated = 876544;
+    noteExecOwner(processId, null);
+    noteExecOwner(unrelated, null);
+    rememberExecOwnerForRequest(requestId, processId);
+
+    expect(execOwner(processId)).toBeNull();
+    expect(execOwner(unrelated)).toBeNull();
+    expect(prove(requestId, 'conv-execown-late')).toBe('stored');
+    expect(execOwner(processId)).toBe('conv-execown-late');
+    expect(execOwner(unrelated)).toBeNull();
+  });
 
   it('refuses write_stdin from a chat that does not own the session, and keeps serving the one that does', async () => {
     expect(prove('wfr_execown_opener', 'conv-execown-opener')).toBe('stored');

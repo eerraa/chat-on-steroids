@@ -2096,8 +2096,16 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const id = conversationId(body['conversationId']);
     const turnId = typeof body['turnId'] === 'string' ? body['turnId'].slice(0, 200) : '';
     const clientId = typeof body['clientId'] === 'string' ? body['clientId'].slice(0, 100) : '';
+    const recoveryRaw = body['recovery'];
+    const recovery =
+      recoveryRaw === 'failed' || recoveryRaw === 'stalled' || recoveryRaw === 'unknown'
+        ? recoveryRaw
+        : undefined;
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
     if (!turnId) return json(res, 400, { error: 'bad_turn_id' }, origin);
+    if (recoveryRaw !== undefined && recovery === undefined) {
+      return json(res, 400, { error: 'bad_recovery_reason' }, origin);
+    }
     // Checked here as well as in the page, because the page's copy of the setting is a poll
     // old and this is the request that spends somebody's OpenRouter credit.
     if (!goalActiveFor(id)) return json(res, 409, { error: 'goal_disabled' }, origin);
@@ -2115,7 +2123,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     let draft;
     try {
-      draft = startGoalDraft({ sessionId, conversationId: id, turnId, clientId });
+      draft = startGoalDraft({ sessionId, conversationId: id, turnId, clientId, recovery });
     } catch (err) {
       if (err instanceof Error && err.message === 'goal_owned_elsewhere') {
         return json(

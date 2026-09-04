@@ -86,7 +86,13 @@
   /** Fractional layout/scroll metrics can leave an exact visual bottom a sub-pixel away. */
   const PRESENTATION_BOTTOM_EPSILON_PX = 2;
   const STATUS_MS = 15_000;
-  /** Longer than any honest tool call: past this a silent turn is called stalled. */
+  /**
+   * Long-silence diagnostic threshold.
+   *
+   * Wall clock alone never proves success or failure. It may trigger diagnostics, near-threshold
+   * compaction, or an explicit completion-unknown recovery *after* ChatGPT also stops exposing an
+   * active generation, but it never becomes a successful/failed terminal verdict by itself.
+   */
   const STALL_MS = 10 * 60 * 1000;
   /** A stalled turn may rescue through Auto Compact once it is within 10% of the normal line. */
   const AUTO_COMPACTION_STALL_RATIO = 0.9;
@@ -1376,9 +1382,6 @@
     if (fiberPresent && answerText(turn).length > 0 && fiberQuietTerminal(turn)) {
       return { outcome: 'completed' };
     }
-    if (turnStartedAt > 0 && Date.now() - lastChangeAt > STALL_MS) {
-      return { outcome: 'stalled', detail: 'no visible output and no progress for ten minutes' };
-    }
     return { outcome: 'unknown' };
   }
 
@@ -1887,7 +1890,11 @@
       // identity. DOM rows alone are presentation and never mint durable page_tool ids.
       if (!stallReported && Date.now() - lastChangeAt > STALL_MS) {
         stallReported = true;
-        emit({ kind: 'chat_error', text: 'No visible progress for ten minutes. The turn is still marked as generating.', turnId });
+        emit({
+          kind: 'chat_error',
+          text: 'No visible progress for ten minutes. ChatGPT still marks this turn as generating; CoS is keeping it open and is not treating the timeout as success or failure.',
+          turnId
+        });
       }
     }
 
@@ -1926,9 +1933,11 @@
       // A user stop also overrides the outcome captured on the first quiet observation.
       if (userStopped) quietOutcome = { outcome: 'stopped' };
       const result = quietOutcome || endOutcome(quietTurn || turn);
-      // `unknown` means exactly "nothing proves the turn ended". A real
-      // answer/error/interrupt closes after the settle window, and ten minutes of genuine
-      // silence upgrades itself to `stalled` through endOutcome().
+      // `unknown` means exactly "nothing proves success or failure". A real
+      // answer/error/interrupt closes after the settle window. A long-silent turn whose native
+      // generating control then stays gone also gets a durable boundary, but only as `unknown`:
+      // this is the crash/server-delay recovery case, not permission to claim the work failed or
+      // completed. Goal Mode can then issue its app-owned read-only reconciliation instruction.
       // ChatGPT also flips `data-interrupted=true` transiently between tool/reasoning phases.
       // Session 2026-08-19-86fa06c9 proved it: that marker closed a turn as interrupted and
       // the same website turn emitted commentary 9 ms later, followed by MCP calls for almost
@@ -1942,15 +1951,27 @@
       // interrupted outcome for the record, while no longer forcing the user to type another
       // message merely to prove the already-finished turn ended.
       const corroboratedTerminalBoundary = markerOnlyInterrupted && Boolean(fiberQuietTerminal(quietTurn || turn));
+      const completionUnknownAfterStall =
+        result.outcome === 'unknown' &&
+        turnStartedAt > 0 &&
+        Date.now() - lastChangeAt > STALL_MS &&
+        quietFor >= TURN_SETTLE_MS;
+      const terminalResult = completionUnknownAfterStall
+        ? {
+            outcome: 'unknown',
+            detail: 'ChatGPT stopped exposing an active generation after prolonged inactivity; completion was not proven'
+          }
+        : result;
       if (
         userStopped ||
-        ((result.outcome !== 'unknown' && (!markerOnlyInterrupted || corroboratedTerminalBoundary)) && quietFor >= TURN_SETTLE_MS)
+        completionUnknownAfterStall ||
+        ((terminalResult.outcome !== 'unknown' && (!markerOnlyInterrupted || corroboratedTerminalBoundary)) && quietFor >= TURN_SETTLE_MS)
       ) {
         // The turn the end is about is the one that was on screen when it went quiet.
         // Re-reading it here would pick up whatever ChatGPT has rendered since, which during
         // a settle window can be a different section entirely.
         const ended = quietTurn || turn;
-        finishGeneration(ended, result);
+        finishGeneration(ended, terminalResult);
       }
     }
 
@@ -7809,8 +7830,13 @@
   /** How long a ready draft waits for a composer somebody else is using. */
   const GOAL_TYPING_WINDOW_MS = 2 * 60_000;
 
-  /** The turn endings worth writing a next message about. See noteGoalTurn for the rest. */
+  /** The turn endings whose final answer is trustworthy enough for ordinary Goal drafting. */
   const GOAL_CONTINUABLE = new Set(['completed', 'interrupted']);
+  /**
+   * These outcomes may continue only through the app-owned reconciliation prompt. Their partial
+   * prose is never sent to the Goal model as though it were a trustworthy account of what ran.
+   */
+  const GOAL_RECOVERABLE = new Set(['failed', 'stalled', 'unknown']);
 
   /** How long a specific goal may be. Matches MAX_GOAL_OBJECTIVE_CHARS in src/shared/goal.ts. */
   const MAX_OBJECTIVE_CHARS = 4000;
@@ -7844,9 +7870,10 @@
    */
   function noteGoalTurn(ended, outcome, endedTurnId) {
     if (!endedTurnId || !goalUsable()) return;
-    // Not a turn to continue from. `stopped` is the user's own hand on the stop button and
-    // is exactly the turn they are about to say something about themselves; `failed` and
-    // `stalled` describe a turn whose text cannot be trusted to say where the work got to.
+    // A user stop is the one outcome automation must never answer: the user explicitly took
+    // control. Failed/stalled/unknown are different. Their prose is untrusted, but unattended
+    // coding still needs a safe recovery path, so they get a fixed reconciliation instruction
+    // rather than a model-authored continuation based on partial text.
     //
     // `interrupted` used to be refused with them, and that was wrong. It does not mean the
     // user stopped anything — endOutcome() reaches it only when `userStopped` is false — it
@@ -7855,7 +7882,8 @@
     // ended `interrupted` with "ChatGPT marked the turn interrupted", the answers said in
     // as many words that work was still unfinished, and the loop declined every one of them
     // without drawing anything, so from outside it looked like a feature that never ran.
-    if (!GOAL_CONTINUABLE.has(outcome)) return;
+    const recoverable = GOAL_RECOVERABLE.has(outcome);
+    if (!GOAL_CONTINUABLE.has(outcome) && !recoverable) return;
     // A compaction owns this turn: its answer is the brief, not a message to reply to, and
     // the chat is about to be replaced anyway.
     if (compactCapture || nativeBusy || (job && job.busy)) return;
@@ -7870,7 +7898,52 @@
     // failed focus request must not stop the draft. Claim goalTurnId first so the visibility
     // change caused by focusing cannot re-enter this turn and request/focus it twice.
     void ask({ type: 'goal_focus', conversationId, turnId: endedTurnId }).catch(() => undefined);
-    void watchGoalTurn(ended, endedTurnId);
+    if (recoverable) void watchGoalRecovery(ended, endedTurnId, outcome);
+    else void watchGoalTurn(ended, endedTurnId);
+  }
+
+  /**
+   * Waits for local execution to settle before asking the app for a completion-unknown recovery.
+   *
+   * The recovery message is intentionally fixed by the app and starts with read-only/status
+   * reconciliation. This wait is what prevents a slow local mutation from being followed by a
+   * second model turn that could blindly repeat it just because ChatGPT's own response stalled.
+   */
+  async function watchGoalRecovery(ended, forTurn, recovery) {
+    goalBusy = true;
+    goalPhase = 'settling';
+    const forId = conversationId;
+    const forEpoch = epoch;
+    const current = () => alive && conversationId === forId && epoch === forEpoch && goalTurnId === forTurn;
+    try {
+      const deadline = Date.now() + GOAL_WATCH_MS;
+      let activity = briefActivityMark(ended);
+      let stableSince = Date.now();
+      while (Date.now() < deadline) {
+        await sleep(GOAL_POLL_MS);
+        if (!current()) return;
+        if (generating) return void (goalPhase = '');
+        if (compactCapture || nativeBusy || (job && job.busy)) return void (goalPhase = '');
+        if (!goalUsable()) return void (goalPhase = '');
+        const nextActivity = briefActivityMark(ended);
+        const pending = await peekPendingTools();
+        if (!current()) return;
+        const busy = CLF_DOM.generating() || pending === null || pending > 0;
+        if (busy || nextActivity !== activity) {
+          activity = nextActivity;
+          stableSince = Date.now();
+          continue;
+        }
+        if (Date.now() - stableSince < GOAL_STABLE_MS) continue;
+        await requestGoalDraft(forTurn, current, recovery);
+        return;
+      }
+      goalError = 'the uncertain turn never reached a safe reconciliation boundary';
+    } finally {
+      goalBusy = false;
+      renderControl();
+      injectStage();
+    }
   }
 
   /**
@@ -7930,7 +8003,9 @@
       }
     }
     if (result.outcome === 'unknown') return;
-    if (!GOAL_CONTINUABLE.has(result.outcome)) return void clearResumeGoalPending();
+    if (!GOAL_CONTINUABLE.has(result.outcome) && !GOAL_RECOVERABLE.has(result.outcome)) {
+      return void clearResumeGoalPending();
+    }
 
     // Stable across a content-script reload, and deliberately a local generation-style id rather
     // than a website message id. The app's /goal/draft idempotency therefore sees one turn even
@@ -8011,11 +8086,16 @@
   }
 
   /** Asks the app to draft the next user message. The answer arrives on the activity feed. */
-  async function requestGoalDraft(forTurn, current) {
+  async function requestGoalDraft(forTurn, current, recovery = null) {
     goalPhase = 'requesting';
     goalTypingSince = 0;
     injectStage();
-    const reply = await ask({ type: 'goal_draft', conversationId, turnId: forTurn });
+    const reply = await ask({
+      type: 'goal_draft',
+      conversationId,
+      turnId: forTurn,
+      ...(GOAL_RECOVERABLE.has(recovery) ? { recovery } : {})
+    });
     if (!current()) return;
     if (!reply || reply.ok !== true) {
       // The phase is kept rather than collapsed into `failed`: it names the step that

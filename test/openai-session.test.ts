@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import {
   learnOpenAiSession,
+  rememberOpenAiSessionForRequest,
   openAiHttpSessionDigest,
   openAiMetaSessionDigest,
   resetOpenAiSessionsForTests,
@@ -9,6 +10,7 @@ import {
   retireOpenAiSessionsForConversation,
   type OpenAiSessionEvidence
 } from '../src/main/session/openai-session.js';
+import { observeRequestCorrelation, resetCorrelationRegistryForTests } from '../src/main/session/correlation.js';
 
 function evidence(surface: 'core' | 'desktop', meta: string, http = `${meta}-http`): OpenAiSessionEvidence {
   return {
@@ -18,7 +20,10 @@ function evidence(surface: 'core' | 'desktop', meta: string, http = `${meta}-htt
   };
 }
 
-beforeEach(() => resetOpenAiSessionsForTests());
+beforeEach(() => {
+  resetOpenAiSessionsForTests();
+  resetCorrelationRegistryForTests();
+});
 
 describe('ChatGPT openai/session continuity', () => {
   it('learns only a proven mapping and later restores the same conversation', () => {
@@ -29,6 +34,26 @@ describe('ChatGPT openai/session continuity', () => {
     expect(learnOpenAiSession(x, 'conversation-a')).toMatchObject({ status: 'stored', error: null });
     expect(resolveOpenAiSession(x)).toEqual({ conversationId: 'conversation-a', error: null });
     expect(resolveOpenAiSession(y)).toEqual({ conversationId: null, error: null });
+  });
+
+  it('learns pending hashed continuity when exact page proof arrives after the recorder grace window', () => {
+    const x = evidence('core', 'late-session');
+    const requestId = 'wfr_pending_openai_session_late';
+    rememberOpenAiSessionForRequest(requestId, x);
+    expect(resolveOpenAiSession(x)).toEqual({ conversationId: null, error: null });
+
+    expect(
+      observeRequestCorrelation({
+        requestId,
+        conversationId: 'conversation-late-proof',
+        sessionId: 'session-late-proof',
+        messageId: 'message-late-proof',
+        tool: 'read',
+        observedAt: Date.now()
+      })
+    ).toBe('stored');
+
+    expect(resolveOpenAiSession(x)).toEqual({ conversationId: 'conversation-late-proof', error: null });
   });
 
   it('requires both the MCP meta session and its HTTP counterpart', () => {

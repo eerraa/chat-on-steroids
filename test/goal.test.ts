@@ -344,6 +344,36 @@ describe('what leaves this machine', () => {
     expect(calls).toBe(0);
   });
 
+  it('uses an app-owned reconciliation draft for completion-unknown recovery without calling OpenRouter', async () => {
+    const session = await createSession({ title: 'goal recovery', conversationId: 'c-goal-recovery' });
+    const fetch = vi.fn(async () => {
+      throw new Error('recovery must not call OpenRouter');
+    });
+    globalThis.fetch = fetch as never;
+
+    const first = goal.startGoalDraft({
+      sessionId: session.id,
+      conversationId: 'c-goal-recovery',
+      turnId: 'g-recovery-1',
+      recovery: 'unknown'
+    });
+    expect(first.stage).toBe('ready');
+    expect(first.reply).toBe(goal.GOAL_RECOVERY_REPLY);
+    expect(first.reply).toContain('reconcile the actual current local state');
+    expect(first.reply).toContain('Do not blindly repeat any mutation');
+    expect(fetch).not.toHaveBeenCalled();
+
+    // The recovery send has the same per-turn idempotency fence as an ordinary Goal draft.
+    const again = goal.startGoalDraft({
+      sessionId: session.id,
+      conversationId: 'c-goal-recovery',
+      turnId: 'g-recovery-1',
+      recovery: 'unknown'
+    });
+    expect(again.token).toBe(first.token);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it('keeps the conclusion of an over-long message instead of clipping away the newest result', async () => {
     const session = await createSession({ title: 'goal', conversationId: 'c-goal-long' });
     const conclusion = 'FINAL RESULT: the regression is fixed and every focused test is green';

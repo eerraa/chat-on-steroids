@@ -4140,6 +4140,40 @@ describe('the goal loop over the bridge', () => {
     expect(reply.body.error).toBe('bad_turn_id');
   });
 
+  it('returns a fixed recovery draft for an allowlisted completion-unknown reason and refuses arbitrary reasons', async () => {
+    await pair();
+    const conversationId = 'cafe0006-0000-4000-8000-000000000006';
+    await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [{ kind: 'user_message', time: Date.now(), text: 'continue the unattended build', messageId: 'm-goal-recovery' }]
+      }
+    });
+
+    const fetch = vi.fn(async () => {
+      throw new Error('fixed recovery must not call OpenRouter');
+    });
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = fetch as never;
+    try {
+      const recovered = await request('POST', '/goal/draft', {
+        body: { conversationId, turnId: 'g-recovery', recovery: 'unknown', clientId: 'goal-recovery-tab' }
+      });
+      expect(recovered.status).toBe(200);
+      expect(recovered.body.goal).toMatchObject({ turnId: 'g-recovery', stage: 'ready' });
+      expect(recovered.body.goal.reply).toContain('reconcile the actual current local state');
+      expect(fetch).not.toHaveBeenCalled();
+
+      const invalid = await request('POST', '/goal/draft', {
+        body: { conversationId, turnId: 'g-invalid-recovery', recovery: 'probably_done' }
+      });
+      expect(invalid.status).toBe(400);
+      expect(invalid.body.error).toBe('bad_recovery_reason');
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
   /** Nothing to continue from is not the same as a failure to continue. */
   it('refuses a chat this app has never recorded', async () => {
     await pair();

@@ -448,7 +448,27 @@ export interface StartGoalDraftInput {
   turnId: string;
   /** Browser-tab ownership fence. Omitted only by direct/legacy callers. */
   clientId?: string;
+  /**
+   * A previous ChatGPT turn ended without a trustworthy completion result.
+   *
+   * Recovery never asks the Goal model to infer what happened from partial prose. Instead the
+   * app hands ChatGPT one fixed reconciliation instruction: inspect actual local state first,
+   * never replay an uncertain mutation blindly, then continue from what is proven.
+   */
+  recovery?: GoalRecoveryReason;
 }
+
+export type GoalRecoveryReason = 'failed' | 'stalled' | 'unknown';
+
+/**
+ * App-owned crash/server-delay recovery instruction.
+ *
+ * This is deliberately not editable Goal policy. It is a safety protocol for an irreversible
+ * browser-side retry boundary: after an uncertain turn, the next model invocation must reconcile
+ * local truth before it is allowed to continue the user's objective.
+ */
+export const GOAL_RECOVERY_REPLY =
+  'The previous ChatGPT turn ended without a trustworthy completion result. Before any further write, patch, send, commit, or other mutation, reconcile the actual current local state with read-only/status checks and determine which actions from that turn really completed. Do not blindly repeat any mutation whose result is uncertain. Preserve existing user or other-agent changes, then continue the existing task from the verified state.';
 
 /**
  * Starts one draft for one finished turn, or hands back the one that already exists.
@@ -478,6 +498,7 @@ export function startGoalDraft(input: StartGoalDraftInput): GoalDraftView {
     drafts.delete(input.conversationId);
   }
   const settings = getConfig().goal;
+  const recovery = input.recovery ?? null;
   const draft: GoalDraft = {
     token: `goal-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
     conversationId: input.conversationId,
@@ -487,21 +508,25 @@ export function startGoalDraft(input: StartGoalDraftInput): GoalDraftView {
     objective: goalObjectiveFor(input.conversationId),
     clientId,
     turnId: input.turnId,
-    stage: 'sending',
+    stage: recovery ? 'ready' : 'sending',
     model: settings.model,
-    text: '',
-    reply: '',
+    text: recovery ? GOAL_RECOVERY_REPLY : '',
+    reply: recovery ? GOAL_RECOVERY_REPLY : '',
     error: null,
     startedAt: Date.now(),
-    settledAt: 0,
+    settledAt: recovery ? Date.now() : 0,
     acknowledged: false,
     work: null,
     abort: null
   };
   drafts.set(input.conversationId, draft);
-  draft.work = run(draft).catch((err: Error) => {
-    settle(draft, 'failed', `goal_failed: ${err.message}`);
-  });
+  if (recovery) {
+    logInfo(`goal: prepared completion-unknown recovery for ${input.conversationId} after ${recovery}`);
+  } else {
+    draft.work = run(draft).catch((err: Error) => {
+      settle(draft, 'failed', `goal_failed: ${err.message}`);
+    });
+  }
   return view(draft);
 }
 

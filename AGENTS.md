@@ -471,6 +471,10 @@ therefore usable only as **learned continuity**, under these rules:
   proved that same conversation; an unseen mobile session has no caller authority;
 - raw values are hashed immediately and stay only in process memory — no recorder, diagnostic,
   durable state or model-visible schema/result contains them;
+- while one exact request id is still waiting for page proof, those hashed values may remain in a
+  bounded process-local pending map. If proof arrives after the recorder's grace window,
+  `correlation.ts` consumes that pending evidence and learns continuity then; deterministic repair
+  and mobile learning therefore share the same late exact proof instead of diverging;
 - app restart revokes the learned map because cross-app-restart stability has not been measured;
 - contradictory proof makes the key sticky-ambiguous for that process; never last-writer-wins;
 - learned continuity proves the **conversation only**. A page-less mobile call has no authority
@@ -486,6 +490,16 @@ therefore usable only as **learned continuity**, under these rules:
 worker payload, user agent, `openai/subject`, or arrival order. If proof is missing the safe state is **Unattributed**,
 no workspace, or refusal for identity-sensitive work. Guessing is worse than losing
 attribution: it routes commands, files, messages and history into the *wrong* chat.
+
+One workflow request id can cover dozens of sequential tool calls. Its missing-page verdict is
+therefore also request-scoped: `recorder.ts` spends the 15s negative evidence window once, caches
+that miss in bounded process memory, and logs one actionable warning rather than one warning per
+tool. A later exact correlation always outranks the cached miss and triggers deterministic repair.
+If an already-open ChatGPT tab survived an extension update without a real page reload, its old
+content script intentionally self-quiesces and can produce exactly this symptom: MCP work succeeds
+but no browser session/request evidence exists. The popup must say **Reload this ChatGPT tab**;
+the app warning must name the same recovery. Do not "fix" that condition by active-tab attribution
+or by hot-injecting a new recorder into the stale document.
 
 This one chain explains symptoms that look unrelated — worker `WORKER_IDENTITY_LOST`, calls
 piling into Unattributed, false worker stalls, wrong or absent project cwd, terminal
@@ -676,7 +690,11 @@ Automatic compaction is context management, not a generic stall watchdog: a smal
 quiet must not be churned into a replacement conversation. But the local token estimate omits
 ChatGPT's hidden/system context, so an exact ten-minute stall **near the configured line** is an
 emergency context-pressure signal and may spend the same one-shot slightly early. Keep that rescue
-floor conservative (currently 90% of the configured threshold). ChatGPT Stop is one-way. Once the
+floor conservative (currently 90% of the configured threshold). **Elapsed time is never a turn
+success/failure verdict.** While ChatGPT still exposes a live generation, ten-minute silence is
+diagnostic only. If that generation later disappears without exact success/failure evidence, store
+`unknown` (completion not proven), never infer semantic failure from the clock alone. ChatGPT Stop
+is one-way. Once the
 page has clicked the native Stop control for compaction it must retain ownership until that stop is
 actually visible (or the chat changes); a timer may change the UI wording, but it must never claim
 "nothing happened" and abandon a stop that ChatGPT can still honour later.
@@ -827,12 +845,16 @@ message not keyed by conversation: a New Chat has no id until the message is sen
 holds nothing, streams nothing and is awaited by the page, which then binds the goal to the real
 id once ChatGPT issues one.
 
-**Turn outcomes the loop answers.** `completed` and `interrupted`, and no others. `interrupted`
-is not the user stopping anything — `endOutcome()` reaches it only when `userStopped` is false —
-it is ChatGPT closing its own turn early, which is the case the loop exists for. It was refused
-alongside `stopped`/`failed`/`stalled` until 2026-08-25, and silently: session
-A retained live regression shows four consecutive prime turns ending `interrupted` with answers
-that said work was unfinished, none of which drew anything at all.
+**Turn outcomes the loop answers.** Ordinary model-authored continuation is still only
+`completed` and `interrupted`. `interrupted` is not the user stopping anything — `endOutcome()`
+reaches it only when `userStopped` is false — it is ChatGPT closing its own turn early, which is the
+case the loop exists for. `stopped` remains a hard user-takeover boundary and automation says
+nothing. `failed`, legacy `stalled`, and `unknown` are **completion-unknown recovery**, not ordinary
+Goal input: their partial prose is never sent to OpenRouter as a trustworthy account of what ran.
+The page first waits until local tools/native work are verifiably settled, then the app supplies one
+fixed reconciliation prompt telling ChatGPT to inspect read-only/status truth, never blindly repeat
+an uncertain mutation, preserve other work, and continue only from the reconciled state. The fixed
+recovery draft uses the same per-turn token/ACK idempotency as an ordinary Goal draft.
 
 **Renderer/IPC.** `renderer/main.ts` is setup/permissions/connection/activity;
 `renderer/chat.ts` is session timeline, handoff, swarm. To add a capability: narrow

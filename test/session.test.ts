@@ -1686,6 +1686,34 @@ describe('canonical recorder 1.8', () => {
     }
   });
 
+  it('waits only once for page evidence shared by one unmatched workflow request id', async () => {
+    vi.useFakeTimers();
+    try {
+      const requestId = `wfr_missing_shared_${Date.now()}`;
+      const warnings = () =>
+        getLog().filter(
+          (entry) => entry.level === 'warn' && entry.message.includes(`no page evidence for ${requestId}`)
+        ).length;
+      const before = warnings();
+
+      const first = tool(requestId, Date.now());
+      await vi.advanceTimersByTimeAsync(15_100);
+      expect((await first)?.attributionMethod).toBe('unattributed');
+      expect(warnings()).toBe(before + 1);
+
+      const timersBeforeSecond = vi.getTimerCount();
+      const second = tool(requestId, Date.now());
+      // The first negative result is request-scoped. A later call in the same ChatGPT workflow
+      // must not start another 15-second timer or emit another identical warning.
+      expect(vi.getTimerCount()).toBe(timersBeforeSecond);
+      await vi.advanceTimersByTimeAsync(15_100);
+      expect((await second)?.attributionMethod).toBe('unattributed');
+      expect(warnings()).toBe(before + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('rejects URL/Fiber conversation conflicts instead of choosing either identity', async () => {
     const now = Date.now();
     await sessionForConversation('conv-url-identity');

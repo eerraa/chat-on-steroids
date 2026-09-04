@@ -5933,7 +5933,7 @@ describe('a stop button that goes missing while the turn is still running', () =
     live.hook.observe();
     await settle();
     expect(emitted(live.sent, 'chat_error').map((entry) => entry.event.text)).not.toContain(
-      'No visible progress for ten minutes. The turn is still marked as generating.'
+      'No visible progress for ten minutes. ChatGPT still marks this turn as generating; CoS is keeping it open and is not treating the timeout as success or failure.'
     );
   });
 
@@ -5953,8 +5953,33 @@ describe('a stop button that goes missing while the turn is still running', () =
     live.hook.observe();
     await settle();
     expect(emitted(live.sent, 'chat_error').map((entry) => entry.event.text)).toContain(
-      'No visible progress for ten minutes. The turn is still marked as generating.'
+      'No visible progress for ten minutes. ChatGPT still marks this turn as generating; CoS is keeping it open and is not treating the timeout as success or failure.'
     );
+    expect(emitted(live.sent, 'turn_end')).toHaveLength(0);
+  });
+
+  it('records completion unknown, never stalled, when a long-silent turn later loses its generating control', async () => {
+    live = await harness();
+    startGenerating(live.document);
+    assistantTurn(live.document, 'turn-provider-delay-unknown', []);
+    live.hook.observe();
+    await settle();
+
+    live.advance(live.hook.STALL_MS + 1);
+    stopGenerating(live.document);
+    live.hook.observe();
+    await settle();
+    live.advance(live.hook.TURN_SETTLE_MS);
+    live.hook.observe();
+    await settle();
+
+    const ends = emitted(live.sent, 'turn_end');
+    expect(ends).toHaveLength(1);
+    expect(ends[0]!.event).toMatchObject({
+      outcome: 'unknown',
+      detail: 'ChatGPT stopped exposing an active generation after prolonged inactivity; completion was not proven'
+    });
+    expect(ends.some((entry) => entry.event.outcome === 'stalled')).toBe(false);
   });
 
   /**
@@ -11521,15 +11546,58 @@ describe('the goal loop', () => {
   });
 
   /**
-   * A stopped, interrupted or failed turn is exactly the turn a user is about to say
-   * something about themselves. Only a completed answer is one to continue from.
+   * A visible provider/transport failure is not trustworthy prose to continue from, but it is
+   * also not a reason to strand an unattended Goal run. The page asks for the app-owned
+   * reconciliation draft rather than sending the failed text to the Goal model.
    */
-  it('says nothing about a turn that did not finish', async () => {
-    live = await harness(`https://chatgpt.com/c/${CHAT}`, goalReplies());
+  it('requests fixed reconciliation after a turn fails instead of trusting its partial text', async () => {
+    let request: Record<string, any> | null = null;
+    live = await harness(`https://chatgpt.com/c/${CHAT}`, {
+      ...goalReplies(),
+      goal_draft: (message: Record<string, any>) => {
+        request = message;
+        return goalReplies().goal_draft();
+      }
+    });
     await live.hook.pullActivity();
     // ChatGPT's own transport-failure wording, which is how a broken turn ends.
     await answerATurn(live, 'Something went wrong while generating the response.');
-    expect(drafts(live)).toEqual([]);
+    expect(drafts(live)).toHaveLength(1);
+    expect(request).toMatchObject({ conversationId: CHAT, recovery: 'failed', turnId: expect.any(String) });
+  });
+
+  it('reconciles a completion-unknown server delay only after local tools are settled', async () => {
+    let pendingTools = 1;
+    const requests: Array<Record<string, any>> = [];
+    live = await harness(`https://chatgpt.com/c/${CHAT}`, {
+      ...goalReplies(),
+      activity: () => feed(null, pendingTools)(),
+      goal_draft: (message: Record<string, any>) => {
+        requests.push(message);
+        return goalReplies().goal_draft();
+      }
+    });
+    await live.hook.pullActivity();
+
+    startGenerating(live.document);
+    assistantTurn(live.document, 'turn-goal-provider-delay', []);
+    live.hook.observe();
+    await settle();
+    live.advance(live.hook.STALL_MS + 1);
+    stopGenerating(live.document);
+    live.hook.observe();
+    await settle();
+    live.advance(live.hook.TURN_SETTLE_MS);
+    live.hook.observe();
+    await settle(600);
+
+    expect(emitted(live.sent, 'turn_end').at(-1)?.event.outcome).toBe('unknown');
+    expect(requests).toEqual([]);
+
+    pendingTools = 0;
+    await settle(1000);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ conversationId: CHAT, recovery: 'unknown', turnId: expect.any(String) });
   });
 
   /** An answer with nothing in it gives the model nothing to continue from. */

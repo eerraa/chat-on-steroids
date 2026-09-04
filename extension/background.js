@@ -2282,7 +2282,12 @@ const HANDLERS = {
       body: JSON.stringify({
         conversationId,
         turnId: String(message.turnId || ''),
-        clientId: String(source.tab)
+        clientId: String(source.tab),
+        ...(
+          message.recovery === 'failed' || message.recovery === 'stalled' || message.recovery === 'unknown'
+            ? { recovery: message.recovery }
+            : {}
+        )
       })
     });
     return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };

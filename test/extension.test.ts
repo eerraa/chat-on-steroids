@@ -2182,6 +2182,47 @@ describe('extension observation journal', () => {
     ]);
   });
 
+  it('forwards only an allowlisted completion-unknown recovery reason to the Goal bridge', async () => {
+    const conversationId = '22222222-3333-4444-5555-777777777777';
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const seen: Array<Record<string, unknown>> = [];
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/goal/draft') {
+        seen.push(JSON.parse(String(init.body || '{}')));
+        return response(200, { goal: { stage: 'ready' } });
+      }
+      return response(200, { sessionId: 'session', entries: [], stream: [], nextSince: 0 });
+    });
+    const worker = loadWorker({ local, session, fetch });
+
+    await worker.send(
+      { type: 'goal_draft', conversationId, turnId: 'generation-recovery', recovery: 'unknown' },
+      73
+    );
+    await worker.send(
+      { type: 'goal_draft', conversationId, turnId: 'generation-bad-recovery', recovery: 'probably_done' },
+      73
+    );
+
+    expect(seen).toEqual([
+      expect.objectContaining({
+        conversationId,
+        turnId: 'generation-recovery',
+        clientId: '73',
+        recovery: 'unknown'
+      }),
+      expect.objectContaining({
+        conversationId,
+        turnId: 'generation-bad-recovery',
+        clientId: '73'
+      })
+    ]);
+    expect(seen[1]).not.toHaveProperty('recovery');
+  });
+
   it('raises only the exact owned Goal tab and never opens a duplicate', async () => {
     const conversationId = '22222222-3333-4444-5555-666666666666';
     const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });

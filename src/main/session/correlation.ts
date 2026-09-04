@@ -17,6 +17,10 @@
 
 import { readDurable, writeDurableSoon } from '../durable.js';
 import { listAllSessions, readRecentEvents } from './store.js';
+import {
+  forgetPendingOpenAiSessionsForRequest,
+  learnPendingOpenAiSessionsForRequest
+} from './openai-session.js';
 
 export interface RequestCorrelation {
   requestId: string;
@@ -53,8 +57,32 @@ const CORRELATIONS_STATE_VERSION = 4;
 
 const byRequest = new Map<string, HeldCorrelation>();
 const waiters = new Map<string, Set<() => void>>();
+const provenListeners = new Set<(correlation: RequestCorrelation) => void>();
 let restored = false;
 let restoring: Promise<void> | null = null;
+
+/**
+ * Process-local consumers of newly proven exact request ownership.
+ *
+ * Convenience/continuation state such as workspace and a still-running terminal may have been
+ * staged while the request was unproved. They are not part of correlation authority, so they
+ * subscribe here rather than making this registry import those higher layers and create cycles.
+ */
+export function onRequestCorrelationProven(listener: (correlation: RequestCorrelation) => void): () => void {
+  provenListeners.add(listener);
+  return () => provenListeners.delete(listener);
+}
+
+function notifyProven(correlation: RequestCorrelation): void {
+  for (const listener of provenListeners) {
+    try {
+      listener({ ...correlation });
+    } catch {
+      // Correlation remains authority even if a convenience-state promotion fails. Consumers
+      // must degrade to no workspace/no terminal adoption rather than block or roll back proof.
+    }
+  }
+}
 
 interface PersistedCorrelation {
   requestId: string;
@@ -265,6 +293,11 @@ export function observeRequestCorrelations(
   const results = inputs.map((input) => {
     const previousObservedAt = byRequest.get(input.requestId)?.value?.observedAt;
     const result = merge(input);
+    if (result === 'conflict') forgetPendingOpenAiSessionsForRequest(input.requestId);
+    else {
+      learnPendingOpenAiSessionsForRequest(input.requestId, input.conversationId);
+      notifyProven(input);
+    }
     // A same-owner observation can still advance durable freshness/order. Persist that too so
     // an app restart cannot resurrect the pre-refresh eviction order.
     if (result !== 'same' || (previousObservedAt !== undefined && input.observedAt > previousObservedAt)) changed = true;

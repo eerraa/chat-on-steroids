@@ -32,6 +32,7 @@ import path from 'node:path';
 import { rawPromises as fs } from './rawfs.js';
 import type { Root } from '../shared/types.js';
 import { currentCall } from './mcp/call-context.js';
+import { onRequestCorrelationProven } from './session/correlation.js';
 
 /** How long a learned workspace survives without being used or renewed. */
 const WORKSPACE_TTL_MS = 12 * 60 * 60 * 1000;
@@ -162,6 +163,13 @@ export function adoptWorkspaceForRequest(requestId: string | null | undefined, c
   setWorkspaceFor(`chat:${conversationId}`, { virtual: pending.virtual, real: pending.real });
   return true;
 }
+
+// Exact page proof can arrive after the recorder's own evidence window. Promote the absolute-path
+// workspace staged by that exact request immediately when correlation becomes authoritative; no
+// other request, active tab or timing signal can claim it.
+onRequestCorrelationProven((correlation) => {
+  adoptWorkspaceForRequest(correlation.requestId, correlation.conversationId);
+});
 
 /**
  * Gives a new worker the prime's workspace to start from.
